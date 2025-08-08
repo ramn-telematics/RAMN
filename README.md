@@ -1,3 +1,34 @@
+# RAMN Telematics Fork
+
+> **Note**: This is a fork of the original [RAMN (Resistant Automotive Miniature Network)](https://github.com/ToyotaInfoTech/RAMN) project, maintained by RAMN Telematics.
+
+## About This Fork
+
+This fork focuses specifically on extending the base RAMN firmware with telematics capabilities. Our development is centered on:
+
+- **Custom ECU D Firmware**: Specialized firmware designed to interface with RAMN Telematics add-on hardware [RAMN-Telematics-Add-On](https://github.com/ramn-telematics/RAMN-add-on-hardware)
+- **Extended Network Features**: Additional protocols and communication methods for simulating automotive telematics systems
+- **Firmware Integration**: Enhanced firmware support for external telematics modules
+
+## Relationship to Upstream
+
+We maintain active development of telematics-focused firmware features while staying compatible with the upstream RAMN project. Our goal is to contribute successful firmware enhancements back to the main RAMN project when they provide value to the broader community.
+
+## Repository Structure
+
+This repository contains the original RAMN firmware with telematics extensions:
+- Modified ECU D firmware variants for telematics integration
+- Documentation for firmware-specific telematics features
+- Integration guides for external telematics hardware
+
+**Note**: The companion telematics add-on hardware designs are maintained in a separate repository: [RAMN-Telematics-add-on-HW](https://github.com/RAMN-Telematics/RAMN-Telematics-add-on-HW)
+
+---
+
+*The following is the original RAMN README:*
+
+---
+
 # RAMN
 
 <img src="https://ramn.readthedocs.io/en/latest/_images/ramn_simple_setup.jpg" width="600">
