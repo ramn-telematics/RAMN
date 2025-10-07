@@ -178,6 +178,8 @@
 // Enable SPI (for LED control)
 #define ENABLE_SPI
 
+#define ENABLE_UART
+
 #define ENABLE_UDS_REPROGRAMMING
 #define ENABLE_UDS
 #define ENABLE_J1979
@@ -223,7 +225,8 @@
 // Use big endian for CAN brake/steering/accelerator sensors instead of ARM Little Endian.
 #define USE_BIG_ENDIAN_CAN
 
-#ifndef TARGET_ECUA
+
+#ifndef TARGET_ECUA || defined(TARGET_ECUD)
 // Use Hardware CAN filters (Up to 28 standard IDs, 8 extended IDs).
 // If this is enabled, you need to update ECU RX filters when you want to add CAN IDs to the network.
 #define USE_HARDWARE_CAN_FILTERS

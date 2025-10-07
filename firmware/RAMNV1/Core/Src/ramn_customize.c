@@ -43,6 +43,38 @@ void 	RAMN_CUSTOM_Init(uint32_t tick)
 // This function is called from a task using an intermediary CAN buffer, so it does not need to return quickly.
 void	RAMN_CUSTOM_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
+#ifdef ENABLE_UART
+	char buf[128];
+	int offset = 0;
+	
+	// Get payload size
+	uint8_t payloadSize = DLCtoUINT8(pHeader->DataLength);
+	
+	// Format: ID, Length, Data bytes
+	offset = snprintf(buf, sizeof(buf), "CAN RX - ID: 0x%lX, Len: %d, Data: ", 
+	                 pHeader->Identifier, payloadSize);
+	
+	// Add data bytes in hex
+	if (offset > 0 && offset < sizeof(buf))
+	{
+		for (uint8_t i = 0; i < payloadSize && i < 64; i++)
+		{
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "%02X ", data[i]);
+			if (offset >= sizeof(buf) - 3) break;
+		}
+		
+		// Add newline
+		if (offset < sizeof(buf) - 2)
+		{
+			buf[offset++] = '\r';
+			buf[offset++] = '\n';
+			buf[offset] = '\0';
+		}
+		
+		RAMN_UART_SendStringFromTask(buf);
+	}
+#endif
+	
 	// Fields that you may want to use:
 	// pHeader->Identifier: (11-bit val for standard, 29-bit for extended)
 	// pHeader->IdType: FDCAN_STANDARD_ID or FDCAN_EXTENDED_ID
