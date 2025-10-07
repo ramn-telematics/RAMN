@@ -43,9 +43,10 @@ void 	RAMN_CUSTOM_Init(uint32_t tick)
 // This function is called from a task using an intermediary CAN buffer, so it does not need to return quickly.
 void	RAMN_CUSTOM_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
-#ifdef ENABLE_UART
+#ifdef ENABLE_SPI
 	char buf[128];
 	int offset = 0;
+	extern SPI_HandleTypeDef hspi2;
 	
 	// Get payload size
 	uint8_t payloadSize = DLCtoUINT8(pHeader->DataLength);
@@ -71,7 +72,10 @@ void	RAMN_CUSTOM_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const
 			buf[offset] = '\0';
 		}
 		
-		RAMN_UART_SendStringFromTask(buf);
+		// Send via SPI
+		HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_RESET);
+		HAL_SPI_Transmit(&hspi2, (uint8_t*)buf, offset, 100);
+		HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
 	}
 #endif
 	
