@@ -173,9 +173,9 @@
 #if defined(TARGET_ECUD)
 #define ENABLE_MINICTF
 #define ENABLE_ADC
-#define EXPANSION_BODY
+//#define EXPANSION_BODY  // Disabled - using custom expansion board instead
 
-// Enable SPI (for LED control)
+// Enable SPI (for custom expansion board)
 #define ENABLE_SPI
 
 #define ENABLE_UART
@@ -188,7 +188,7 @@
 #define RTR_DEMO_ID 0x703
 
 // How long to light up ECU D's LEDs at startup. Set to 0 to skip test.
-#define LED_TEST_DURATION_MS 3000U
+#define LED_TEST_DURATION_MS 0U  // Disabled - no LEDs on custom expansion board
 #endif
 
 // Common configuration ------------------------------------------------------

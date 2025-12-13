@@ -15,6 +15,7 @@
  */
 
 #include "ramn_spi.h"
+#include "ramn_customize.h"  // For RAMN_CUSTOM_SPI_TxCpltCallback and spiTransmitBusy
 
 #ifdef ENABLE_SPI
 static SPI_HandleTypeDef* hspi;
@@ -39,9 +40,20 @@ void RAMN_SPI_Init(SPI_HandleTypeDef* handler, osThreadId_t* pTask)
 // Callback for End of SPI transmission
 void HAL_SPI_TxCpltCallback (SPI_HandleTypeDef * hspi)
 {
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	vTaskNotifyGiveFromISR(*pSPITask,&xHigherPriorityTaskWoken);
-	portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+	// Check if this is a custom expansion board transmission (from ramn_customize.c)
+	// The custom code calls RAMN_CUSTOM_SPI_TxCpltCallback which handles chip select and flags
+	if (spiTransmitBusy == True)
+	{
+		// Custom expansion board DMA completion
+		RAMN_CUSTOM_SPI_TxCpltCallback();
+	}
+	else
+	{
+		// Screen DMA completion (original behavior)
+		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+		vTaskNotifyGiveFromISR(*pSPITask,&xHigherPriorityTaskWoken);
+		portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+	}
 }
 
 static HAL_StatusTypeDef SPI_WriteData_DMA(const uint8_t *data, uint16_t nbytes)
