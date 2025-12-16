@@ -56,6 +56,16 @@ void HAL_SPI_TxCpltCallback (SPI_HandleTypeDef * hspi)
 	}
 }
 
+// Callback for End of SPI transmit-receive (simultaneous TX/RX DMA)
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+	// This is called when HAL_SPI_TransmitReceive_DMA completes
+	// Used for bidirectional communication with ESP32 (polling for CAN messages)
+	// Forward to custom handler in ramn_customize.c
+	extern void RAMN_CUSTOM_SPI_TxRxCpltCallback(void);
+	RAMN_CUSTOM_SPI_TxRxCpltCallback();
+}
+
 static HAL_StatusTypeDef SPI_WriteData_DMA(const uint8_t *data, uint16_t nbytes)
 {
 	HAL_StatusTypeDef result;

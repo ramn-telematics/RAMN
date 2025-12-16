@@ -70,8 +70,11 @@ void RAMN_CUSTOM_ReceiveUART(uint8_t buf[], uint16_t buf_size);
 #endif
 
 #ifdef ENABLE_SPI
-// SPI DMA completion callback for custom expansion board (called from ramn_spi.c)
+// SPI DMA TX completion callback for custom expansion board (called from ramn_spi.c)
 void RAMN_CUSTOM_SPI_TxCpltCallback(void);
+
+// SPI DMA TX/RX completion callback for ESP32 polling (called from ramn_spi.c)
+void RAMN_CUSTOM_SPI_TxRxCpltCallback(void);
 
 // Flag indicating custom expansion board SPI transmission is in progress
 // Used by ramn_spi.c to distinguish between screen and custom board DMA completions

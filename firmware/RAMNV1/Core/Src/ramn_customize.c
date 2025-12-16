@@ -51,7 +51,7 @@ static volatile uint32_t tim6val = 0;
 
 #define SPI_TX_BUFFER_SIZE 1024  // Each buffer: ~10 CAN-FD or ~40 standard CAN messages
 
-// Double buffers
+// Double buffers for TX (CAN → ESP32)
 static uint8_t spiTxBufferA[SPI_TX_BUFFER_SIZE];
 static uint8_t spiTxBufferB[SPI_TX_BUFFER_SIZE];
 
@@ -69,9 +69,44 @@ static volatile uint32_t spiTxLastFlushTick = 0;  // volatile: accessed from mul
 #define SPI_FLUSH_INTERVAL_MS 10
 #define SPI_BUFFER_FLUSH_THRESHOLD 896  // Flush when 128 bytes remain
 
-// SPI transmission statistics and error tracking (following RAMN pattern)
+// ============================================================================
+// BIDIRECTIONAL SPI: ESP32 POLLING STATE MACHINE
+// ============================================================================
+#define SPI_POLL_INTERVAL_MS 100  // Configurable: poll ESP32 every 100ms (adjust as needed)
+#define SPI_POLL_TIMEOUT_MS 50    // Max wait for ESP32 response
+#define SPI_RX_BUFFER_SIZE 80     // Max response: 1+1+4+1+1+64+1 = 73 bytes + 7 byte processing delay
+
+// Poll state machine
+typedef enum {
+	SPI_POLL_IDLE,              // Not polling
+	SPI_POLL_REQUESTED,         // Poll request sent, waiting for response
+	SPI_POLL_COMPLETE,          // Response received, ready to process
+	SPI_POLL_TIMEOUT            // Response timeout, skip this poll
+} SPI_PollState_t;
+
+static volatile SPI_PollState_t spiPollState = SPI_POLL_IDLE;
+static volatile uint32_t spiPollRequestTick = 0;
+static volatile uint32_t spiLastPollTick = 0;
+
+// RX buffer for ESP32 responses (double buffer for safety)
+static uint8_t spiRxBufferA[SPI_RX_BUFFER_SIZE];
+static uint8_t spiRxBufferB[SPI_RX_BUFFER_SIZE];
+static uint8_t* volatile activeRxBuffer = spiRxBufferA;
+static uint8_t* volatile processRxBuffer = spiRxBufferB;
+
+// Poll request message with padding for full-duplex SPI
+// Format: [LEN][START][DUMMY][CHECKSUM] followed by dummy bytes
+// SPI must clock out bytes to receive bytes, so we send SPI_RX_BUFFER_SIZE bytes total
+#define POLL_REQUEST_HEADER_SIZE 4
+static uint8_t pollTxBuffer[SPI_RX_BUFFER_SIZE] = {
+	0x02, 0xBB, 0x00, 0xBB,  // Poll request header
+	// Rest initialized to 0x00 (dummy bytes for RX clocking)
+};
+
+// SPI transmission and polling statistics (following RAMN pattern)
 typedef struct
 {
+	// TX stats (CAN → ESP32)
 	volatile uint32_t spiTxRequestCnt;     // Number of CAN messages requested for SPI transmission
 	volatile uint32_t spiTxSentCnt;        // Number of successful SPI transmissions (batch count)
 	volatile uint32_t spiTxBytesSent;      // Total bytes successfully transmitted over SPI
@@ -80,6 +115,16 @@ typedef struct
 	volatile uint32_t spiBufferFlushCnt;   // Number of times buffer was flushed
 	volatile uint32_t spiBufferSwapCnt;    // Number of buffer swaps
 	volatile HAL_StatusTypeDef lastSpiError; // Last SPI error code
+
+	// RX stats (ESP32 → CAN)
+	volatile uint32_t spiRxPollCnt;           // Number of polls sent to ESP32
+	volatile uint32_t spiRxCompleteCnt;       // Successful RX completions
+	volatile uint32_t spiRxTimeoutCnt;        // Response timeouts
+	volatile uint32_t spiRxErrorCnt;          // DMA start errors
+	volatile uint32_t spiRxInvalidCnt;        // Invalid responses from ESP32
+	volatile uint32_t spiRxChecksumErrorCnt;  // Checksum failures
+	volatile uint32_t spiRxCANQueuedCnt;      // CAN messages queued successfully
+	volatile uint32_t spiRxCANQueueFailCnt;   // CAN queue failures
 } RAMN_SPI_Stats_t;
 
 static RAMN_SPI_Stats_t spiStats = {0};
@@ -89,16 +134,25 @@ void 	RAMN_CUSTOM_Init(uint32_t tick)
 {
 	loopCounter = 0;
 #ifdef ENABLE_SPI
+	// Initialize TX buffers
 	activeBufferPos = 0;
 	flushBufferSize = 0;
 	spiTransmitBusy = False;
 	spiTxLastFlushTick = tick;
+
+	// Initialize RX polling
+	spiPollState = SPI_POLL_IDLE;
+	spiLastPollTick = tick;
+
+	// Zero-initialize RX buffers (prevent garbage on first poll)
+	RAMN_memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
+	RAMN_memset(spiRxBufferB, 0, SPI_RX_BUFFER_SIZE);
 #endif
 }
 
 #ifdef ENABLE_SPI
 // ============================================================================
-// DMA-BASED SPI FLUSH WITH ATOMIC BUFFER SWAP
+// DMA-BASED SPI FLUSH WITH ATOMIC BUFFER SWAP (CAN → ESP32)
 // ============================================================================
 // This function implements a lock-free buffer swap and DMA transmission:
 // 1. Atomically swap activeBuffer <-> flushBuffer (single critical section ~1µs)
@@ -191,6 +245,200 @@ void RAMN_CUSTOM_SPI_TxCpltCallback(void)
 	// Clear busy flag - allow next flush
 	spiTransmitBusy = False;
 }
+
+// ============================================================================
+// SPI DMA TRANSMIT-RECEIVE COMPLETE CALLBACK FOR ESP32 POLLING
+// ============================================================================
+// This callback is triggered when HAL_SPI_TransmitReceive_DMA completes.
+// It is called FROM the HAL_SPI_TxRxCpltCallback in ramn_spi.c
+// WARNING: Called from ISR context - keep it fast!
+// ============================================================================
+void RAMN_CUSTOM_SPI_TxRxCpltCallback(void)
+{
+	// This is called when simultaneous TX/RX DMA completes (polling operation)
+
+	if (spiPollState == SPI_POLL_REQUESTED)
+	{
+		// Successfully received response from ESP32
+		spiPollState = SPI_POLL_COMPLETE;
+
+		// De-assert chip select
+		HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
+
+		// Update statistics
+		spiStats.spiRxCompleteCnt++;
+	}
+}
+
+// ============================================================================
+// REQUEST POLL FROM ESP32 (NON-BLOCKING)
+// ============================================================================
+// This function initiates a TransmitReceive DMA operation:
+// - Sends poll request to ESP32
+// - Simultaneously receives response into RX buffer
+// - Returns immediately (DMA handles the transfer)
+// ============================================================================
+static RAMN_Bool_t RequestESP32Poll(void)
+{
+	extern SPI_HandleTypeDef hspi2;
+	HAL_StatusTypeDef status;
+
+	// Check if SPI bus is busy (CAN→SPI transmission in progress)
+	if (spiTransmitBusy == True)
+		return False;  // Try again later
+
+	// Check if we're already waiting for a response
+	if (spiPollState != SPI_POLL_IDLE)
+		return False;  // Already polling
+
+	// Swap RX buffers (similar to TX double-buffer pattern)
+	taskENTER_CRITICAL();
+	uint8_t* temp = activeRxBuffer;
+	activeRxBuffer = processRxBuffer;
+	processRxBuffer = temp;
+	spiPollState = SPI_POLL_REQUESTED;
+	spiPollRequestTick = xTaskGetTickCount();
+	spiStats.spiRxPollCnt++;
+	taskEXIT_CRITICAL();
+
+	// Start simultaneous TX/RX DMA operation
+	HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_RESET);
+	status = HAL_SPI_TransmitReceive_DMA(&hspi2,
+	                                      pollTxBuffer,
+	                                      activeRxBuffer,
+	                                      SPI_RX_BUFFER_SIZE);
+
+	if (status != HAL_OK)
+	{
+		// DMA start failed - reset state
+		HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
+
+		taskENTER_CRITICAL();
+		spiPollState = SPI_POLL_IDLE;
+		spiStats.spiRxErrorCnt++;
+		taskEXIT_CRITICAL();
+
+		return False;
+	}
+
+	return True;  // Poll request sent successfully
+}
+
+// ============================================================================
+// PROCESS ESP32 POLL RESPONSE
+// ============================================================================
+// Parse the response from ESP32 and queue CAN messages
+// Expected format: [LEN][0xCC][CAN_ID_0-3][DLC][FLAGS][DATA...][CHECKSUM]
+// Empty response (no data): [0x02][0xCC][0x00][0xCC]
+//
+// CONSTRAINT: Maximum ONE CAN message per poll
+// Max size: 73 bytes (1+1+4+1+1+64+1)
+//
+// SPI FULL-DUPLEX NOTE:
+// Due to SPI full-duplex operation, ESP32's response doesn't start at byte 0.
+// We scan for the 0xCC marker to find where the response begins.
+// ============================================================================
+static void ProcessESP32Response(void)
+{
+	uint8_t* rxBuf = processRxBuffer;
+	uint16_t responseStart = 0;
+	RAMN_Bool_t foundResponse = False;
+
+	// Scan buffer for response marker (0xCC)
+	for (uint16_t i = 0; i < SPI_RX_BUFFER_SIZE - 2; i++)
+	{
+		if (rxBuf[i] == 0xCC)
+		{
+			// Found 0xCC - check if previous byte could be valid length
+			// Valid length: 2 (empty response) to 72 (max CAN message)
+			if (i > 0 && rxBuf[i-1] >= 2 && rxBuf[i-1] <= 72)
+			{
+				responseStart = i - 1;  // LENGTH byte is before 0xCC
+				foundResponse = True;
+				break;
+			}
+		}
+	}
+
+	if (!foundResponse)
+	{
+		// No valid response found - ESP32 has no data to send
+		return;
+	}
+
+	// Process response starting from found location
+	uint8_t* response = &rxBuf[responseStart];
+	uint8_t msgLen = response[0];
+
+	// Check for empty response (no CAN message from ESP32)
+	if (msgLen == 2 && response[1] == 0xCC && response[2] == 0x00)
+		return;  // Valid empty response - no action needed
+
+	// Validate message structure (minimum 8 bytes for a CAN message)
+	if (msgLen < 8 || response[1] != 0xCC)
+	{
+		spiStats.spiRxInvalidCnt++;
+		return;  // Invalid response
+	}
+
+	// Verify checksum (XOR of all bytes from 0xCC through CHECKSUM should be 0)
+	uint8_t checksum = 0;
+	for (uint8_t i = 1; i <= msgLen; i++)
+		checksum ^= response[i];
+
+	if (checksum != 0)
+	{
+		spiStats.spiRxChecksumErrorCnt++;
+		return;  // Checksum mismatch
+	}
+
+	// Parse CAN message from ESP32 response
+	FDCAN_TxHeaderTypeDef header;
+	uint8_t data[64];
+	RAMN_memset(data, 0, sizeof(data));  // Zero-initialize payload
+
+	// Extract CAN ID (big-endian)
+	uint32_t canId = ((uint32_t)response[2] << 24) |
+	                 ((uint32_t)response[3] << 16) |
+	                 ((uint32_t)response[4] << 8)  |
+	                 ((uint32_t)response[5]);
+
+	uint8_t dlc = response[6];
+	uint8_t flags = response[7];
+
+	// Build CAN header
+	header.Identifier = canId;
+	header.IdType = (flags & 0x01) ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
+	header.TxFrameType = (flags & 0x02) ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
+	header.DataLength = dlc;
+	header.BitRateSwitch = FDCAN_BRS_OFF;
+	header.FDFormat = FDCAN_CLASSIC_CAN;
+	header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+
+	// Copy payload
+	uint8_t payloadSize = DLCtoUINT8(dlc);
+	if (payloadSize > 0 && payloadSize <= 64)
+	{
+		// Ensure we don't read past msgLen
+		uint8_t maxPayload = (msgLen >= 8) ? (msgLen - 7) : 0;  // msgLen includes all fields except itself
+		if (payloadSize > maxPayload)
+			payloadSize = maxPayload;
+
+		for (uint8_t i = 0; i < payloadSize; i++)
+			data[i] = response[8 + i];
+	}
+
+	// Queue to CAN transmit buffer (non-blocking)
+	if (RAMN_FDCAN_SendMessage(&header, data) == RAMN_OK)
+	{
+		spiStats.spiRxCANQueuedCnt++;
+	}
+	else
+	{
+		spiStats.spiRxCANQueueFailCnt++;
+	}
+}
+
 #endif
 
 // ============================================================================
@@ -359,6 +607,50 @@ void RAMN_CUSTOM_Update(uint32_t tick)
 	// Code here is executed every 10ms
 
 #ifdef ENABLE_SPI
+	// ========================================================================
+	// ESP32 POLLING STATE MACHINE (NON-BLOCKING)
+	// ========================================================================
+	// This state machine polls the ESP32 for pending CAN messages to transmit
+	// All operations are non-blocking to maintain real-time CAN performance
+	// ========================================================================
+
+	switch (spiPollState)
+	{
+		case SPI_POLL_IDLE:
+			// Check if it's time to poll ESP32
+			if ((tick - spiLastPollTick) >= SPI_POLL_INTERVAL_MS)
+			{
+				if (RequestESP32Poll())
+				{
+					spiLastPollTick = tick;
+					// State changed to SPI_POLL_REQUESTED by RequestESP32Poll
+				}
+			}
+			break;
+
+		case SPI_POLL_REQUESTED:
+			// Waiting for DMA completion (handled by callback)
+			// Check for timeout
+			if ((tick - spiPollRequestTick) >= SPI_POLL_TIMEOUT_MS)
+			{
+				spiPollState = SPI_POLL_TIMEOUT;
+				spiStats.spiRxTimeoutCnt++;
+				HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
+			}
+			break;
+
+		case SPI_POLL_COMPLETE:
+			// Response received - process it
+			ProcessESP32Response();
+			spiPollState = SPI_POLL_IDLE;
+			break;
+
+		case SPI_POLL_TIMEOUT:
+			// Timeout occurred - reset and try again next interval
+			spiPollState = SPI_POLL_IDLE;
+			break;
+	}
+
 	// Periodically flush SPI buffer to ensure messages don't get stuck
 	// This handles low CAN traffic scenarios where buffer doesn't fill up
 	// LOCK-FREE: Just read tick and call flush (no critical sections!)
@@ -383,15 +675,21 @@ void RAMN_CUSTOM_Update(uint32_t tick)
 		// Uncomment the block below to enable periodic stats reporting via UART
 		/*
 #ifdef ENABLE_UART
-		char statsBuf[128];
+		char statsBuf[256];
 		snprintf(statsBuf, sizeof(statsBuf),
-		         "SPI Stats - Req:%lu Sent:%lu Bytes:%lu Err:%lu Ovr:%lu Flush:%lu\r\n",
+		         "SPI TX - Req:%lu Sent:%lu Bytes:%lu Err:%lu Ovr:%lu Flush:%lu\r\n"
+		         "SPI RX - Poll:%lu OK:%lu Timeout:%lu Invalid:%lu Queued:%lu\r\n",
 		         spiStats.spiTxRequestCnt,
 		         spiStats.spiTxSentCnt,
 		         spiStats.spiTxBytesSent,
 		         spiStats.spiTxErrorCnt,
 		         spiStats.spiBufferOverrunCnt,
-		         spiStats.spiBufferFlushCnt);
+		         spiStats.spiBufferFlushCnt,
+		         spiStats.spiRxPollCnt,
+		         spiStats.spiRxCompleteCnt,
+		         spiStats.spiRxTimeoutCnt,
+		         spiStats.spiRxInvalidCnt,
+		         spiStats.spiRxCANQueuedCnt);
 		RAMN_UART_SendStringFromTask(statsBuf);
 #endif
 		*/
