@@ -72,7 +72,7 @@ static volatile uint32_t spiTxLastFlushTick = 0;  // volatile: accessed from mul
 // ============================================================================
 // BIDIRECTIONAL SPI: ESP32 POLLING STATE MACHINE
 // ============================================================================
-#define SPI_POLL_INTERVAL_MS 100  // Configurable: poll ESP32 every 100ms (adjust as needed)
+#define SPI_POLL_INTERVAL_MS 1000  // Configurable: poll ESP32 every 100ms (adjust as needed)
 #define SPI_POLL_TIMEOUT_MS 50    // Max wait for ESP32 response
 #define SPI_RX_BUFFER_SIZE 80     // Max response: 1+1+4+1+1+64+1 = 73 bytes + 7 byte processing delay
 
@@ -633,6 +633,10 @@ void RAMN_CUSTOM_Update(uint32_t tick)
 			// Check for timeout
 			if ((tick - spiPollRequestTick) >= SPI_POLL_TIMEOUT_MS)
 			{
+				// CRITICAL: Abort the ongoing DMA transfer to prevent SPI peripheral from getting stuck
+				extern SPI_HandleTypeDef hspi2;
+				HAL_SPI_Abort(&hspi2);
+
 				spiPollState = SPI_POLL_TIMEOUT;
 				spiStats.spiRxTimeoutCnt++;
 				HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
