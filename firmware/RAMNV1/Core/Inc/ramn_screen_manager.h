@@ -36,6 +36,7 @@
 #include "ramn_screen_canmonitor.h"
 #include "ramn_screen_stats.h"
 #include "ramn_screen_canlog.h"
+#include "ramn_screen_regcode.h"
 
 // Number of screens
 #define 	SCREEN_COUNT 	(sizeof(screens) / sizeof(screens[0]))

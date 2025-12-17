@@ -23,7 +23,7 @@
 // Current screen
 static RAMNScreen_t *currentScreen = NULL;
 
-// Array of all possible screens
+// Array of all possible screens (navigable via joystick)
 static RAMNScreen_t* screens[] = {
 		&ScreenSaver,
 		&ScreenCANMonitor,
@@ -36,6 +36,7 @@ static RAMNScreen_t* screens[] = {
 		&ScreenUDS
 #endif
 }; //TODO: move to flash (?)
+// Note: ScreenRegCode is not in this array - it's only accessible via CAN trigger
 
 // Private functions ---------------------
 
@@ -107,6 +108,12 @@ void RAMN_SCREENMANAGER_Update(uint32_t tick)
 	}
 #endif
 
+	// Force to move to the RegCode screen if a registration code was received.
+	if ((RAMN_SCREENREGCODE_DisplayRequested != 0U) && (currentScreen != &ScreenRegCode))
+	{
+		switchScreen(&ScreenRegCode);
+	}
+
 	joystickEvent = RAMN_Joystick_Pop();
 
 	while (joystickEvent != JOYSTICK_EVENT_NONE)
@@ -150,6 +157,22 @@ void RAMN_SCREENMANAGER_Update(uint32_t tick)
 
 void RAMN_SCREENMANAGER_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
+	// Check for registration code trigger (similar to how UDS/CHIP8 are triggered externally)
+	if ((pHeader->Identifier == REGCODE_CAN_ID) &&
+	    (pHeader->IdType == FDCAN_STANDARD_ID) &&
+	    (pHeader->FDFormat == FDCAN_CLASSIC_CAN) &&
+	    (pHeader->RxFrameType == FDCAN_DATA_FRAME) &&
+	    (pHeader->DataLength >= FDCAN_DLC_BYTES_4))
+	{
+		if (data != NULL) {
+			// Call the regcode screen's handler directly
+			if (ScreenRegCode.ProcessRxCANMessage != NULL) {
+				ScreenRegCode.ProcessRxCANMessage(pHeader, data, tick);
+			}
+		}
+	}
+
+	// Process for currently active screen
 	if (currentScreen != NULL) {
 		if (currentScreen->ProcessRxCANMessage != NULL) currentScreen->ProcessRxCANMessage(pHeader, data, tick);
 	}
