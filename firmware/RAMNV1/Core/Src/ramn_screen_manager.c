@@ -113,6 +113,11 @@ void RAMN_SCREENMANAGER_Update(uint32_t tick)
 	{
 		switchScreen(&ScreenRegCode);
 	}
+	// If RegCode screen is active but no longer requested, switch back to default screen
+	else if ((RAMN_SCREENREGCODE_DisplayRequested == 0U) && (currentScreen == &ScreenRegCode))
+	{
+		switchScreen(DEFAULT_SCREEN);
+	}
 
 	joystickEvent = RAMN_Joystick_Pop();
 
@@ -157,6 +162,8 @@ void RAMN_SCREENMANAGER_Update(uint32_t tick)
 
 void RAMN_SCREENMANAGER_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
+	RAMN_Bool_t handled = False;
+
 	// Check for registration code trigger (similar to how UDS/CHIP8 are triggered externally)
 	if ((pHeader->Identifier == REGCODE_CAN_ID) &&
 	    (pHeader->IdType == FDCAN_STANDARD_ID) &&
@@ -168,12 +175,13 @@ void RAMN_SCREENMANAGER_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
 			// Call the regcode screen's handler directly
 			if (ScreenRegCode.ProcessRxCANMessage != NULL) {
 				ScreenRegCode.ProcessRxCANMessage(pHeader, data, tick);
+				handled = True;  // Mark as handled to avoid double processing
 			}
 		}
 	}
 
-	// Process for currently active screen
-	if (currentScreen != NULL) {
+	// Process for currently active screen (skip if already handled above)
+	if (!handled && currentScreen != NULL) {
 		if (currentScreen->ProcessRxCANMessage != NULL) currentScreen->ProcessRxCANMessage(pHeader, data, tick);
 	}
 }

@@ -23,11 +23,14 @@ volatile RAMN_Bool_t RAMN_SCREENREGCODE_DisplayRequested = False;
 
 // Timeout duration in milliseconds (10 seconds)
 #define REGCODE_TIMEOUT_MS 10000U
+// Cooldown period after timeout before accepting new codes (2 seconds)
+#define REGCODE_COOLDOWN_MS 2000U
 
 // Variables to store registration code and timing
 static uint32_t registrationCode = 0;
 static uint32_t screenActivatedTick = 0;
 static RAMN_Bool_t screenActive = False;
+static uint32_t lastTimeoutTick = 0;  // Track when last timeout occurred for cooldown
 
 // Private function to format 6-digit code with leading zeros
 static void formatRegCode(uint32_t code, char* buffer)
@@ -45,19 +48,40 @@ static void formatRegCode(uint32_t code, char* buffer)
 	buffer[6] = '\0';
 }
 
+// Draw large registration code using 2x scaled characters
+static void drawLargeRegCode(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, const char* code)
+{
+	uint16_t spacing = 36;  // Space between 2x scaled characters (32px char width + 4px gap)
+	for (int i = 0; i < 6 && code[i] != '\0'; i++)
+	{
+		RAMN_SPI_DrawLargeChar(x + (i * spacing), y, fgColor, bgColor, code[i], 2);
+	}
+}
+
+// Refresh version for updates without redrawing background
+static void refreshLargeRegCode(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, const char* code)
+{
+	uint16_t spacing = 36;  // Match the spacing from drawLargeRegCode
+	for (int i = 0; i < 6 && code[i] != '\0'; i++)
+	{
+		RAMN_SPI_DrawLargeChar(x + (i * spacing), y, fgColor, bgColor, code[i], 2);
+	}
+}
+
 static void SCREENREGCODE_Init()
 {
 	RAMN_SCREENUTILS_DrawBase();
 
 	// Draw title at top
-	RAMN_SPI_DrawString(40, 5, RAMN_SCREENUTILS_COLORTHEME.LIGHT, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, "Registration Code");
+	RAMN_SPI_DrawString(25, 5, RAMN_SCREENUTILS_COLORTHEME.LIGHT, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, "Registration Code");
 
 	// Draw initial placeholder or actual code
 	char codeBuffer[7];
 	formatRegCode(registrationCode, codeBuffer);
 
-	// Draw large code in center (using 3x scale or just larger positioning)
-	RAMN_SPI_DrawString(65, 70, RAMN_SCREENUTILS_COLORTHEME.WHITE, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, codeBuffer);
+	// Draw large code in center with better positioning
+	// 6 chars * 36px spacing = 216px total width, centered at 240px wide screen: (240-216)/2 = 12px offset
+	drawLargeRegCode(20, 80, RAMN_SCREENUTILS_COLORTHEME.WHITE, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, codeBuffer);
 
 	// Draw timeout indicator at bottom
 	RAMN_SPI_DrawString(30, 150, RAMN_SCREENUTILS_COLORTHEME.MEDIUM, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, "Auto-close in 10s");
@@ -71,36 +95,29 @@ static void SCREENREGCODE_Update(uint32_t tick)
 		screenActive = False;
 		RAMN_SCREENREGCODE_DisplayRequested = False;
 		registrationCode = 0;  // Purge the code from memory
+		lastTimeoutTick = tick;  // Record when timeout occurred for cooldown
 		// Clearing the DisplayRequested flag will cause screen manager to no longer
 		// force this screen to be active, allowing navigation away
 	}
 
-	// Update code display if needed (refresh every few loops)
-	if (RAMN_SCREENUTILS_LoopCounter % 5U == 0U)
+	// Update code display if needed (only while screen is active)
+	if (screenActive && (RAMN_SCREENUTILS_LoopCounter % 5U == 0U))
 	{
-		char codeBuffer[7];
-		formatRegCode(registrationCode, codeBuffer);
+		//char codeBuffer[7];
+		//formatRegCode(registrationCode, codeBuffer);
 
-		// Refresh the code display
-		RAMN_SPI_RefreshString(65, 70, RAMN_SCREENUTILS_COLORTHEME.WHITE, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, codeBuffer);
+		// Refresh the code display with large font
+		//refreshLargeRegCode(12, 60, RAMN_SCREENUTILS_COLORTHEME.WHITE, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, codeBuffer);
 
 		// Update remaining time
-		if (screenActive)
-		{
-			uint32_t elapsed = tick - screenActivatedTick;
-			uint32_t remaining = (REGCODE_TIMEOUT_MS - elapsed) / 1000U;
+		uint32_t elapsed = tick - screenActivatedTick;
+		uint32_t remaining = (REGCODE_TIMEOUT_MS - elapsed) / 1000U;
 
-			if (remaining <= 10)
-			{
-				char timeBuffer[20];
-				snprintf(timeBuffer, sizeof(timeBuffer), "Auto-close in %lus ", remaining);
-				RAMN_SPI_RefreshString(30, 150, RAMN_SCREENUTILS_COLORTHEME.MEDIUM, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, timeBuffer);
-			}
-		}
-		else
+		if (remaining <= 10)
 		{
-			// After timeout, show expired message
-			RAMN_SPI_RefreshString(30, 150, RAMN_SCREENUTILS_COLORTHEME.MEDIUM, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, "Code expired       ");
+			char timeBuffer[20];
+			snprintf(timeBuffer, sizeof(timeBuffer), "Auto-close in %lus ", remaining);
+			RAMN_SPI_RefreshString(30, 150, RAMN_SCREENUTILS_COLORTHEME.MEDIUM, RAMN_SCREENUTILS_COLORTHEME.BACKGROUND, timeBuffer);
 		}
 
 		RAMN_SCREENUTILS_DrawSubconsoleUpdate();
@@ -130,6 +147,18 @@ static void SCREENREGCODE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHead
 	// Note: Validation is done in screen manager before this is called
 	// We only get here if CAN ID matches and frame is valid
 
+	// Ignore messages if screen is already active (prevents timer resets)
+	if (screenActive)
+	{
+		return;
+	}
+
+	// Ignore messages during cooldown period after timeout (prevents immediate re-trigger)
+	if (lastTimeoutTick != 0 && (tick - lastTimeoutTick < REGCODE_COOLDOWN_MS))
+	{
+		return;
+	}
+
 	// Extract 32-bit registration code from bytes 0-3 (little-endian format, LSB first)
 	registrationCode = (uint32_t)data[0] |
 	                   ((uint32_t)data[1] << 8) |
@@ -145,6 +174,7 @@ static void SCREENREGCODE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHead
 	screenActive = True;
 	screenActivatedTick = tick;
 	RAMN_SCREENREGCODE_DisplayRequested = True;
+	lastTimeoutTick = 0;  // Clear cooldown timer when new code is accepted
 }
 
 RAMNScreen_t ScreenRegCode = {

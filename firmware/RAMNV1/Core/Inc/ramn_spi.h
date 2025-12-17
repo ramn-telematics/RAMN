@@ -93,6 +93,9 @@ void 	RAMN_SPI_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const u
 // Draws ONE character with specified background/foreground color.
 void 	RAMN_SPI_DrawChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr);
 
+// Draws a scaled character (scale=2 for 32x32, scale=3 for 48x48, etc.).
+void 	RAMN_SPI_DrawLargeChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr, uint8_t scale);
+
 // Draws a character WITHOUT spacing (for overwriting a string, this function assumes the background is already drawn).
 void 	RAMN_SPI_RefreshChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr);
 

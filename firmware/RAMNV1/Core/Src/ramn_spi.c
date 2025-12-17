@@ -276,6 +276,45 @@ void RAMN_SPI_DrawChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColo
 	SPI_WriteData_DMA((uint8_t*)&spiTxBuffer,2*16*16);
 }
 
+// Draws a scaled character (scale factor of 2x or 3x). Scale=2 draws 32x32, scale=3 draws 48x48.
+// Note: Maximum scale is limited by spiTxBuffer size (16*16=256 pixels). Scale=2 uses 4 transfers, scale=3 uses 9 transfers.
+void RAMN_SPI_DrawLargeChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr, uint8_t scale)
+{
+	if (scale < 1) scale = 1;
+	if (scale > 4) scale = 4; // Limit to prevent buffer overflow
+
+	uint8_t* array = (uint8_t*)&Font16.table[(chr - 0x20)*16*2];
+	uint16_t scaledSize = 16 * scale;
+
+	// Set the address window for the entire scaled character
+	SPI_SetAddrWindow(x, y, scaledSize, scaledSize);
+
+	// Process each row of the original 16x16 font
+	for (uint16_t row = 0; row < 16; row++)
+	{
+		// Get the 16-bit bitmap data for this row
+		uint16_t val = (uint16_t)(array[row*2]<<8) + (uint16_t)array[row*2+1];
+
+		// Each original row gets repeated 'scale' times vertically
+		for (uint8_t scaleY = 0; scaleY < scale; scaleY++)
+		{
+			// Process each bit/pixel in the row
+			for (uint16_t col = 0; col < 16; col++)
+			{
+				uint16_t color = (val & (1 << col)) ? fgColor : bgColor;
+
+				// Repeat each pixel 'scale' times horizontally
+				for (uint8_t scaleX = 0; scaleX < scale; scaleX++)
+				{
+					spiTxBuffer[(15-col)*scale + scaleX] = color;
+				}
+			}
+			// Send the scaled row
+			SPI_WriteData_DMA((uint8_t*)&spiTxBuffer, 2*scaledSize);
+		}
+	}
+}
+
 // Each char in the font array occupies 16*16. This function only draws the important part (11*14).
 void RAMN_SPI_RefreshChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr)
 {
