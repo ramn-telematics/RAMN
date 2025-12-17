@@ -33,7 +33,7 @@ static uint32_t loopCounter = 0;
 // Number of time RAMN_CUSTOM_TIM6ISR has been called (by default, time in s from boot)
 static volatile uint32_t tim6val = 0;
 
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 // ============================================================================
 // DOUBLE-BUFFER ARCHITECTURE FOR CAN-TO-SPI BRIDGE WITH DMA
 // ============================================================================
@@ -133,7 +133,7 @@ static RAMN_SPI_Stats_t spiStats = {0};
 void 	RAMN_CUSTOM_Init(uint32_t tick)
 {
 	loopCounter = 0;
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 	// Initialize TX buffers
 	activeBufferPos = 0;
 	flushBufferSize = 0;
@@ -150,7 +150,7 @@ void 	RAMN_CUSTOM_Init(uint32_t tick)
 #endif
 }
 
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 // ============================================================================
 // DMA-BASED SPI FLUSH WITH ATOMIC BUFFER SWAP (CAN → ESP32)
 // ============================================================================
@@ -461,7 +461,7 @@ static void ProcessESP32Response(void)
 // ============================================================================
 void	RAMN_CUSTOM_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 	uint8_t msgBuf[73];  // MsgLen + Start + ID(4) + Len + Flags + Data(64 max) + Checksum
 	uint8_t offset = 0;
 	uint8_t checksum = 0;
@@ -606,7 +606,7 @@ void RAMN_CUSTOM_Update(uint32_t tick)
 
 	// Code here is executed every 10ms
 
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 	// ========================================================================
 	// ESP32 POLLING STATE MACHINE (NON-BLOCKING)
 	// ========================================================================
@@ -674,7 +674,7 @@ void RAMN_CUSTOM_Update(uint32_t tick)
 	{
 		// Code here is executed every 1s
 
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 		// Optional: Report SPI statistics every second (similar to CAN error reporting)
 		// Uncomment the block below to enable periodic stats reporting via UART
 		/*

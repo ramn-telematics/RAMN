@@ -69,7 +69,7 @@ void RAMN_CUSTOM_PrepareTransmitDataI2C(uint8_t buf[], uint16_t buf_size);
 void RAMN_CUSTOM_ReceiveUART(uint8_t buf[], uint16_t buf_size);
 #endif
 
-#ifdef ENABLE_SPI
+#ifdef ENABLE_TELEMATICS
 // SPI DMA TX completion callback for custom expansion board (called from ramn_spi.c)
 void RAMN_CUSTOM_SPI_TxCpltCallback(void);
 

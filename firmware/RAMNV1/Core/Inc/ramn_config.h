@@ -178,6 +178,9 @@
 // Enable SPI (for custom expansion board)
 #define ENABLE_SPI
 
+// Enable telematics features (CAN-to-SPI bridge with ESP32)
+#define ENABLE_TELEMATICS
+
 #define ENABLE_UART
 
 #define ENABLE_UDS_REPROGRAMMING
