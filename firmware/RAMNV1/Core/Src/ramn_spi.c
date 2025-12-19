@@ -15,7 +15,9 @@
  */
 
 #include "ramn_spi.h"
-#include "ramn_customize.h"  // For RAMN_CUSTOM_SPI_TxCpltCallback and spiTransmitBusy
+#ifdef ENABLE_TELEMATICS
+#include "ramn_telematics.h"  // For RAMN_TELEMATICS_SPI_TxCpltCallback and spiTransmitBusy
+#endif
 
 #ifdef ENABLE_SPI
 static SPI_HandleTypeDef* hspi;
@@ -41,12 +43,12 @@ void RAMN_SPI_Init(SPI_HandleTypeDef* handler, osThreadId_t* pTask)
 void HAL_SPI_TxCpltCallback (SPI_HandleTypeDef * hspi)
 {
 #ifdef ENABLE_TELEMATICS
-	// Check if this is a custom expansion board transmission (from ramn_customize.c)
-	// The custom code calls RAMN_CUSTOM_SPI_TxCpltCallback which handles chip select and flags
+	// Check if this is a telematics board transmission (from ramn_telematics.c)
+	// The telematics code handles chip select and flags via RAMN_TELEMATICS_SPI_TxCpltCallback
 	if (spiTransmitBusy == True)
 	{
-		// Custom expansion board DMA completion
-		RAMN_CUSTOM_SPI_TxCpltCallback();
+		// Telematics expansion board DMA completion
+		RAMN_TELEMATICS_SPI_TxCpltCallback();
 	}
 	else
 #endif
@@ -64,9 +66,8 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
 	// This is called when HAL_SPI_TransmitReceive_DMA completes
 	// Used for bidirectional communication with ESP32 (polling for CAN messages)
-	// Forward to custom handler in ramn_customize.c
-	extern void RAMN_CUSTOM_SPI_TxRxCpltCallback(void);
-	RAMN_CUSTOM_SPI_TxRxCpltCallback();
+	// Forward to telematics handler in ramn_telematics.c
+	RAMN_TELEMATICS_SPI_TxRxCpltCallback();
 }
 #endif
 

@@ -75,10 +75,10 @@
 #define ENABLE_SCREEN
 
 // Enable Chip 8 engine.
-#define ENABLE_CHIP8
+//#define ENABLE_CHIP8
 
 // Enable USB MiniCTF challenges.
-#define ENABLE_MINICTF
+//#define ENABLE_MINICTF
 
 // Note that UDS programming does not work on microcontrollers with only 256 kb memory (e.g., reference ending with CCT6).
 #define ENABLE_UDS_REPROGRAMMING
@@ -171,7 +171,7 @@
 // CONFIGURATION OF ECU D ------------------------------------------------------
 
 #if defined(TARGET_ECUD)
-#define ENABLE_MINICTF
+//#define ENABLE_MINICTF
 #define ENABLE_ADC
 //#define EXPANSION_BODY  // Disabled - using custom expansion board instead
 
@@ -187,7 +187,7 @@
 #define ENABLE_UDS
 #define ENABLE_J1979
 //#define ENABLE_KWP
-#define ENABLE_XCP
+//#define ENABLE_XCP
 #define RTR_DEMO_ID 0x703
 
 // How long to light up ECU D's LEDs at startup. Set to 0 to skip test.
@@ -229,7 +229,7 @@
 #define USE_BIG_ENDIAN_CAN
 
 
-#ifndef TARGET_ECUA || defined(TARGET_ECUD)
+#if defined(TARGET_ECUC) || defined(TARGET_ECUB)
 // Use Hardware CAN filters (Up to 28 standard IDs, 8 extended IDs).
 // If this is enabled, you need to update ECU RX filters when you want to add CAN IDs to the network.
 #define USE_HARDWARE_CAN_FILTERS

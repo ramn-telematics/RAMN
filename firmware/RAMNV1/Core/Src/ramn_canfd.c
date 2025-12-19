@@ -302,7 +302,7 @@ static void FDCAN_Config(void)
 #endif
 
 	// Configure the Filters
-	if (HAL_FDCAN_ConfigGlobalFilter(hfdcan, FDCAN_REJECT , FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK) Error_Handler();
+	if (HAL_FDCAN_ConfigGlobalFilter(hfdcan, FDCAN_ACCEPT_IN_RX_FIFO0 , FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK) Error_Handler();
 
 	// Start the Peripheral
 	if (HAL_FDCAN_Start(hfdcan) != HAL_OK) Error_Handler();
