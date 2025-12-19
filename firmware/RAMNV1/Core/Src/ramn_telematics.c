@@ -55,8 +55,8 @@ static volatile uint32_t spiTxLastFlushTick = 0;  // volatile: accessed from mul
 // ============================================================================
 // BIDIRECTIONAL SPI: ESP32 POLLING STATE MACHINE
 // ============================================================================
-#define SPI_POLL_INTERVAL_MS 1000  // Configurable: poll ESP32 every 100ms (adjust as needed)
-#define SPI_POLL_TIMEOUT_MS 50    // Max wait for ESP32 response
+#define SPI_POLL_INTERVAL_MS 50   // Poll ESP32 every 50ms for responsive bidirectional communication
+#define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response (reduced for fast SPI bit rate)
 #define SPI_RX_BUFFER_SIZE 80     // Max response: 1+1+4+1+1+64+1 = 73 bytes + 7 byte processing delay
 
 // Poll state machine
@@ -70,6 +70,7 @@ typedef enum {
 static volatile SPI_PollState_t spiPollState = SPI_POLL_IDLE;
 static volatile uint32_t spiPollRequestTick = 0;
 static volatile uint32_t spiLastPollTick = 0;
+static volatile uint32_t spiLastPollAttemptTick = 0;  // Track last attempt (even if failed due to busy)
 
 // RX buffer for ESP32 responses (double buffer for safety)
 static uint8_t spiRxBufferA[SPI_RX_BUFFER_SIZE];
@@ -108,6 +109,9 @@ typedef struct
 	volatile uint32_t spiRxChecksumErrorCnt;  // Checksum failures
 	volatile uint32_t spiRxCANQueuedCnt;      // CAN messages queued successfully
 	volatile uint32_t spiRxCANQueueFailCnt;   // CAN queue failures
+	volatile uint32_t spiRxBusySkipCnt;       // Polls skipped due to SPI bus busy (TX in progress)
+	volatile uint32_t spiRxStateSkipCnt;      // Polls skipped due to wrong state (stuck in REQUESTED)
+	volatile uint32_t spiRxWatchdogResetCnt;  // Watchdog forced state resets
 } RAMN_SPI_Stats_t;
 
 static RAMN_SPI_Stats_t spiStats = {0};
@@ -133,6 +137,7 @@ void RAMN_TELEMATICS_Init(uint32_t tick)
 	// Initialize RX polling
 	spiPollState = SPI_POLL_IDLE;
 	spiLastPollTick = tick;
+	spiLastPollAttemptTick = tick;
 
 	// Zero-initialize RX buffers (prevent garbage on first poll)
 	RAMN_memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
@@ -240,22 +245,30 @@ void RAMN_TELEMATICS_SPI_TxCpltCallback(void)
 // This callback is triggered when HAL_SPI_TransmitReceive_DMA completes.
 // It is called FROM the HAL_SPI_TxRxCpltCallback in ramn_spi.c
 // WARNING: Called from ISR context - keep it fast!
+//
+// RACE CONDITION PROTECTION:
+// This callback can fire concurrently with the timeout handler in Update().
+// We use atomic state check and update to prevent corruption.
 // ============================================================================
 void RAMN_TELEMATICS_SPI_TxRxCpltCallback(void)
 {
 	// This is called when simultaneous TX/RX DMA completes (polling operation)
 
+	// CRITICAL: Always de-assert chip select first (safety measure)
+	// This ensures CS is released even if state is unexpected
+	HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
+
+	// Check state and update atomically to prevent race with timeout handler
 	if (spiPollState == SPI_POLL_REQUESTED)
 	{
 		// Successfully received response from ESP32
 		spiPollState = SPI_POLL_COMPLETE;
 
-		// De-assert chip select
-		HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
-
 		// Update statistics
 		spiStats.spiRxCompleteCnt++;
 	}
+	// If state != REQUESTED, this is likely a late callback after timeout
+	// CS is already de-asserted above, so no harm done
 }
 
 // ============================================================================
@@ -271,13 +284,19 @@ static RAMN_Bool_t RequestESP32Poll(void)
 	extern SPI_HandleTypeDef hspi2;
 	HAL_StatusTypeDef status;
 
-	// Check if SPI bus is busy (CAN→SPI transmission in progress)
-	if (spiTransmitBusy == True)
-		return False;  // Try again later
-
 	// Check if we're already waiting for a response
 	if (spiPollState != SPI_POLL_IDLE)
+	{
+		spiStats.spiRxStateSkipCnt++;
 		return False;  // Already polling
+	}
+
+	// Check if SPI bus is busy (CAN→SPI transmission in progress)
+	if (spiTransmitBusy == True)
+	{
+		spiStats.spiRxBusySkipCnt++;
+		return False;  // Try again later
+	}
 
 	// Swap RX buffers (similar to TX double-buffer pattern)
 	taskENTER_CRITICAL();
@@ -577,8 +596,17 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 			{
 				if (RequestESP32Poll())
 				{
+					// Poll request successful
 					spiLastPollTick = tick;
+					spiLastPollAttemptTick = tick;
 					// State changed to SPI_POLL_REQUESTED by RequestESP32Poll
+				}
+				else
+				{
+					// Poll failed (bus busy) - retry sooner by updating attempt time
+					// This allows faster retries when SPI becomes available
+					spiLastPollAttemptTick = tick;
+					// Don't update spiLastPollTick - will retry next Update() call
 				}
 			}
 			break;
@@ -592,9 +620,27 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 				extern SPI_HandleTypeDef hspi2;
 				HAL_SPI_Abort(&hspi2);
 
+				// De-assert chip select (critical - must happen even if abort fails)
+				HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
+
+				taskENTER_CRITICAL();
 				spiPollState = SPI_POLL_TIMEOUT;
 				spiStats.spiRxTimeoutCnt++;
+				taskEXIT_CRITICAL();
+			}
+			// SAFETY: Watchdog for extreme timeout (should never happen)
+			// If stuck in REQUESTED state for >100ms, force reset
+			else if ((tick - spiPollRequestTick) >= 100)
+			{
+				// Extreme timeout - force recovery
+				extern SPI_HandleTypeDef hspi2;
+				HAL_SPI_Abort(&hspi2);
 				HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
+
+				taskENTER_CRITICAL();
+				spiPollState = SPI_POLL_IDLE;  // Skip normal timeout handling
+				spiStats.spiRxWatchdogResetCnt++;
+				taskEXIT_CRITICAL();
 			}
 			break;
 
