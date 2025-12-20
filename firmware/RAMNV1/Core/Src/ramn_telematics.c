@@ -647,11 +647,21 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 		case SPI_POLL_COMPLETE:
 			// Response received - process it
 			ProcessESP32Response();
+
+			// CRITICAL: Zero out the processed buffer to prevent stale data
+			// Next poll will swap buffers, so we clear the one that will become activeRxBuffer
+			RAMN_memset(processRxBuffer, 0, SPI_RX_BUFFER_SIZE);
+
 			spiPollState = SPI_POLL_IDLE;
 			break;
 
 		case SPI_POLL_TIMEOUT:
 			// Timeout occurred - reset and try again next interval
+
+			// CRITICAL: Zero out the processed buffer to prevent stale data
+			// Next poll will swap buffers, so we clear the one that will become activeRxBuffer
+			RAMN_memset(processRxBuffer, 0, SPI_RX_BUFFER_SIZE);
+
 			spiPollState = SPI_POLL_IDLE;
 			break;
 	}
