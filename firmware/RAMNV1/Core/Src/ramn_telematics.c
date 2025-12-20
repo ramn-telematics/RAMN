@@ -16,6 +16,11 @@
 
 #include "ramn_telematics.h"
 #include "ramn_canfd.h"
+#include "ramn_uart.h"
+#include <stdio.h>
+
+// External reference to CAN TX queue
+extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
 
 // ============================================================================
 // DOUBLE-BUFFER ARCHITECTURE FOR CAN-TO-SPI BRIDGE WITH DMA
@@ -47,10 +52,23 @@ static uint8_t* volatile flushBuffer = spiTxBufferB;
 static volatile uint16_t flushBufferSize = 0;
 volatile RAMN_Bool_t spiTransmitBusy = False;  // Non-static: accessed from ramn_spi.c
 
+// ===== NEW SPI OWNER LOCK =====
+typedef enum {
+    SPI_OWNER_NONE = 0,
+    SPI_OWNER_TX,
+    SPI_OWNER_POLL
+} SPI_Owner_t;
+
+static volatile SPI_Owner_t spiOwner = SPI_OWNER_NONE;  // Tracks who owns SPI peripheral
+
 // Timing and thresholds
 static volatile uint32_t spiTxLastFlushTick = 0;  // volatile: accessed from multiple tasks
 #define SPI_FLUSH_INTERVAL_MS 10
 #define SPI_BUFFER_FLUSH_THRESHOLD 896  // Flush when 128 bytes remain
+
+// Stats printing interval
+#define SPI_STATS_PRINT_INTERVAL_MS 1000  // Print stats every 1 second
+static volatile uint32_t spiStatsLastPrintTick = 0;
 
 // ============================================================================
 // BIDIRECTIONAL SPI: ESP32 POLLING STATE MACHINE
@@ -69,6 +87,7 @@ typedef enum {
 
 static volatile SPI_PollState_t spiPollState = SPI_POLL_IDLE;
 static volatile uint32_t spiPollRequestTick = 0;
+static volatile uint32_t spiPollCompleteTick = 0;  // Track when state changed to COMPLETE
 static volatile uint32_t spiLastPollTick = 0;
 static volatile uint32_t spiLastPollAttemptTick = 0;  // Track last attempt (even if failed due to busy)
 
@@ -103,6 +122,8 @@ typedef struct
 	// RX stats (ESP32 → CAN)
 	volatile uint32_t spiRxPollCnt;           // Number of polls sent to ESP32
 	volatile uint32_t spiRxCompleteCnt;       // Successful RX completions
+	volatile uint32_t spiRxEmptyRespCnt;      // Empty responses (ESP32 has no data)
+	volatile uint32_t spiRxNoRespFoundCnt;    // No valid response marker found in buffer
 	volatile uint32_t spiRxTimeoutCnt;        // Response timeouts
 	volatile uint32_t spiRxErrorCnt;          // DMA start errors
 	volatile uint32_t spiRxInvalidCnt;        // Invalid responses from ESP32
@@ -122,6 +143,7 @@ static RAMN_SPI_Stats_t spiStats = {0};
 static void FlushSPIBuffer(void);
 static RAMN_Bool_t RequestESP32Poll(void);
 static void ProcessESP32Response(void);
+static void PrintSPIStats(void);
 
 // ============================================================================
 // INITIALIZATION
@@ -138,6 +160,9 @@ void RAMN_TELEMATICS_Init(uint32_t tick)
 	spiPollState = SPI_POLL_IDLE;
 	spiLastPollTick = tick;
 	spiLastPollAttemptTick = tick;
+
+	// Initialize stats printing
+	spiStatsLastPrintTick = tick;
 
 	// Zero-initialize RX buffers (prevent garbage on first poll)
 	RAMN_memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
@@ -162,6 +187,10 @@ static void FlushSPIBuffer(void)
 	HAL_StatusTypeDef status;
 	uint16_t bytesToSend = 0;
 	uint8_t* bufferToFlush = NULL;
+
+	// ===== NEW OWNERSHIP CHECK =====
+	if (spiOwner != SPI_OWNER_NONE)
+		return;  // SPI in use by TX or POLL
 
 	// Check if DMA transmission is already in progress
 	if (spiTransmitBusy == True)
@@ -192,6 +221,7 @@ static void FlushSPIBuffer(void)
 	activeBufferPos = 0;
 
 	// Mark SPI as busy BEFORE starting DMA
+	spiOwner = SPI_OWNER_TX;
 	spiTransmitBusy = True;
 
 	// Update statistics
@@ -211,10 +241,11 @@ static void FlushSPIBuffer(void)
 		HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
 
 		taskENTER_CRITICAL();
-		spiTransmitBusy = False;
-		spiStats.spiTxErrorCnt++;
-		spiStats.lastSpiError = status;
-		taskEXIT_CRITICAL();
+         spiTransmitBusy = False;
+         spiOwner = SPI_OWNER_NONE;
+         spiStats.spiTxErrorCnt++;
+         spiStats.lastSpiError = status;
+         taskEXIT_CRITICAL();
 	}
 	// If DMA started successfully, HAL_SPI_TxCpltCallback will handle cleanup
 }
@@ -237,6 +268,7 @@ void RAMN_TELEMATICS_SPI_TxCpltCallback(void)
 
 	// Clear busy flag - allow next flush
 	spiTransmitBusy = False;
+	spiOwner = SPI_OWNER_NONE;
 }
 
 // ============================================================================
@@ -263,6 +295,8 @@ void RAMN_TELEMATICS_SPI_TxRxCpltCallback(void)
 	{
 		// Successfully received response from ESP32
 		spiPollState = SPI_POLL_COMPLETE;
+		spiOwner = SPI_OWNER_NONE;
+		spiPollCompleteTick = xTaskGetTickCount();  // Record when we entered COMPLETE state
 
 		// Update statistics
 		spiStats.spiRxCompleteCnt++;
@@ -292,7 +326,7 @@ static RAMN_Bool_t RequestESP32Poll(void)
 	}
 
 	// Check if SPI bus is busy (CAN→SPI transmission in progress)
-	if (spiTransmitBusy == True)
+	if (spiOwner != SPI_OWNER_NONE)
 	{
 		spiStats.spiRxBusySkipCnt++;
 		return False;  // Try again later
@@ -304,6 +338,7 @@ static RAMN_Bool_t RequestESP32Poll(void)
 	activeRxBuffer = processRxBuffer;
 	processRxBuffer = temp;
 	spiPollState = SPI_POLL_REQUESTED;
+	spiOwner = SPI_OWNER_POLL;
 	spiPollRequestTick = xTaskGetTickCount();
 	spiStats.spiRxPollCnt++;
 	taskEXIT_CRITICAL();
@@ -322,6 +357,7 @@ static RAMN_Bool_t RequestESP32Poll(void)
 
 		taskENTER_CRITICAL();
 		spiPollState = SPI_POLL_IDLE;
+		spiOwner = SPI_OWNER_NONE;
 		spiStats.spiRxErrorCnt++;
 		taskEXIT_CRITICAL();
 
@@ -370,6 +406,7 @@ static void ProcessESP32Response(void)
 	if (!foundResponse)
 	{
 		// No valid response found - ESP32 has no data to send
+		spiStats.spiRxNoRespFoundCnt++;
 		return;
 	}
 
@@ -379,7 +416,10 @@ static void ProcessESP32Response(void)
 
 	// Check for empty response (no CAN message from ESP32)
 	if (msgLen == 2 && response[1] == 0xCC && response[2] == 0x00)
+	{
+		spiStats.spiRxEmptyRespCnt++;
 		return;  // Valid empty response - no action needed
+	}
 
 	// Validate message structure (minimum 8 bytes for a CAN message)
 	if (msgLen < 8 || response[1] != 0xCC)
@@ -574,6 +614,58 @@ void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, c
 }
 
 // ============================================================================
+// PRINT SPI STATISTICS TO UART
+// ============================================================================
+// Prints detailed SPI transmission and polling statistics over UART
+// Called periodically to monitor CAN-to-SPI bridge performance
+// ============================================================================
+static void PrintSPIStats(void)
+{
+#ifdef ENABLE_UART
+	char buffer[256];  // Reduced buffer size
+	int len;
+
+	// Capture stats atomically to prevent corruption during printing
+	taskENTER_CRITICAL();
+	RAMN_SPI_Stats_t statsSnapshot = spiStats;
+	SPI_PollState_t currentState = spiPollState;
+	taskEXIT_CRITICAL();
+
+	// Get CAN TX queue usage
+	size_t canTxQueueUsed = xStreamBufferBytesAvailable(CANTxDataStreamBufferHandle);
+	size_t canTxQueueFree = xStreamBufferSpacesAvailable(CANTxDataStreamBufferHandle);
+	size_t canTxQueueTotal = canTxQueueUsed + canTxQueueFree;
+	uint8_t canTxQueuePercent = (canTxQueueTotal > 0) ? ((canTxQueueUsed * 100) / canTxQueueTotal) : 0;
+
+	// State names for debugging
+	const char* stateNames[] = {"IDLE", "REQ", "DONE", "TO"};
+	const char* stateName = (currentState <= SPI_POLL_TIMEOUT) ? stateNames[currentState] : "UNK";
+
+	// Print compact stats on single line to reduce UART load
+	len = snprintf(buffer, sizeof(buffer),
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%\r\n",
+		statsSnapshot.spiTxRequestCnt,
+		statsSnapshot.spiTxSentCnt,
+		statsSnapshot.spiTxErrorCnt,
+		statsSnapshot.spiRxPollCnt,
+		statsSnapshot.spiRxCompleteCnt,
+		statsSnapshot.spiRxEmptyRespCnt,
+		statsSnapshot.spiRxNoRespFoundCnt,
+		statsSnapshot.spiRxBusySkipCnt + statsSnapshot.spiRxStateSkipCnt,
+		statsSnapshot.spiRxWatchdogResetCnt,
+		stateName,
+		statsSnapshot.spiRxCANQueuedCnt,
+		statsSnapshot.spiRxCANQueueFailCnt,
+		canTxQueuePercent);
+
+	if (len > 0 && len < (int)sizeof(buffer))
+	{
+		RAMN_UART_SendFromTask((uint8_t*)buffer, (uint32_t)len);
+	}
+#endif
+}
+
+// ============================================================================
 // PERIODIC UPDATE FUNCTION
 // ============================================================================
 // Called periodically from main task (does not need to return quickly)
@@ -588,6 +680,24 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 	// All operations are non-blocking to maintain real-time CAN performance
 	// ========================================================================
 
+	// WATCHDOG: Check if stuck in COMPLETE state for too long (should process immediately)
+	// This catches the case where Update() is being called but ProcessESP32Response() isn't running
+	if (spiPollState == SPI_POLL_COMPLETE && (tick - spiPollCompleteTick) >= 50)
+	{
+		// CRITICAL FIX: Process the response BEFORE resetting state
+		// Otherwise we skip response processing and the ESP32 queue backs up!
+		ProcessESP32Response();
+
+		// Clear the buffer to prevent stale data
+		RAMN_memset(processRxBuffer, 0, SPI_RX_BUFFER_SIZE);
+
+		// Now reset the state
+		taskENTER_CRITICAL();
+		spiStats.spiRxWatchdogResetCnt++;
+		spiPollState = SPI_POLL_IDLE;
+		taskEXIT_CRITICAL();
+	}
+
 	switch (spiPollState)
 	{
 		case SPI_POLL_IDLE:
@@ -597,15 +707,20 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 				if (RequestESP32Poll())
 				{
 					// Poll request successful
+					// CRITICAL: Protect timestamp writes from interrupts (prevent word-tearing/corruption)
+					taskENTER_CRITICAL();
 					spiLastPollTick = tick;
 					spiLastPollAttemptTick = tick;
+					taskEXIT_CRITICAL();
 					// State changed to SPI_POLL_REQUESTED by RequestESP32Poll
 				}
 				else
 				{
 					// Poll failed (bus busy) - retry sooner by updating attempt time
 					// This allows faster retries when SPI becomes available
+					taskENTER_CRITICAL();
 					spiLastPollAttemptTick = tick;
+					taskEXIT_CRITICAL();
 					// Don't update spiLastPollTick - will retry next Update() call
 				}
 			}
@@ -617,29 +732,16 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 			if ((tick - spiPollRequestTick) >= SPI_POLL_TIMEOUT_MS)
 			{
 				// CRITICAL: Abort the ongoing DMA transfer to prevent SPI peripheral from getting stuck
-				extern SPI_HandleTypeDef hspi2;
-				HAL_SPI_Abort(&hspi2);
+				//extern SPI_HandleTypeDef hspi2;
+				//HAL_SPI_Abort(&hspi2);
 
 				// De-assert chip select (critical - must happen even if abort fails)
 				HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
 
 				taskENTER_CRITICAL();
-				spiPollState = SPI_POLL_TIMEOUT;
+				spiPollState = SPI_POLL_IDLE;
+				spiOwner = SPI_OWNER_NONE;
 				spiStats.spiRxTimeoutCnt++;
-				taskEXIT_CRITICAL();
-			}
-			// SAFETY: Watchdog for extreme timeout (should never happen)
-			// If stuck in REQUESTED state for >100ms, force reset
-			else if ((tick - spiPollRequestTick) >= 100)
-			{
-				// Extreme timeout - force recovery
-				extern SPI_HandleTypeDef hspi2;
-				HAL_SPI_Abort(&hspi2);
-				HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_SET);
-
-				taskENTER_CRITICAL();
-				spiPollState = SPI_POLL_IDLE;  // Skip normal timeout handling
-				spiStats.spiRxWatchdogResetCnt++;
 				taskEXIT_CRITICAL();
 			}
 			break;
@@ -673,5 +775,12 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 	{
 		FlushSPIBuffer();  // Non-blocking, DMA-based
 		spiTxLastFlushTick = tick;
+	}
+
+	// Periodically print SPI statistics to UART for monitoring
+	if ((tick - spiStatsLastPrintTick) >= SPI_STATS_PRINT_INTERVAL_MS)
+	{
+		PrintSPIStats();
+		spiStatsLastPrintTick = tick;
 	}
 }
