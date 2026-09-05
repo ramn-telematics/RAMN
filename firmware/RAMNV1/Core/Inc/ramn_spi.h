@@ -109,7 +109,13 @@ void 	RAMN_SPI_RefreshString(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t 
 void 	RAMN_SPI_DrawUint32(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint32_t val);
 void 	RAMN_SPI_RefreshUint32(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint32_t val);
 
+// Opens a write window on the ST7789 at (x,y) with dimensions (w x h).
+// Must be followed by one or more calls to RAMN_SPI_WriteImageChunk().
+void 	RAMN_SPI_OpenImageWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
+// Writes a chunk of raw RGB565 pixel data into the currently open window.
+// len must be even and non-zero. Caller must ensure total bytes sent == 2*w*h.
+void 	RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len);
 
 #endif
 

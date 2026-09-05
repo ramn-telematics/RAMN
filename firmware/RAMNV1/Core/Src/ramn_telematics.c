@@ -15,9 +15,18 @@
  */
 
 #include "ramn_telematics.h"
+#include "ramn_config.h"
 #include "ramn_canfd.h"
 #include "ramn_uart.h"
 #include <stdio.h>
+
+// Define to enable UART debug output for SPI↔ESP32 communication.
+// Comment out to disable.
+#define TELEMATICS_SPI_DEBUG
+
+// Define to enable UART debug output for all outgoing CAN messages.
+// Comment out to disable.
+//#define TELEMATICS_CAN_DEBUG
 
 // External reference to CAN TX queue
 extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
@@ -73,9 +82,9 @@ static volatile uint32_t spiStatsLastPrintTick = 0;
 // ============================================================================
 // BIDIRECTIONAL SPI: ESP32 POLLING STATE MACHINE
 // ============================================================================
-#define SPI_POLL_INTERVAL_MS 50   // Poll ESP32 every 50ms for responsive bidirectional communication
-#define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response (reduced for fast SPI bit rate)
-#define SPI_RX_BUFFER_SIZE 80     // Max response: 1+1+4+1+1+64+1 = 73 bytes + 7 byte processing delay
+#define SPI_POLL_INTERVAL_MS 50   // Normal poll interval (ms) — reduced to 1 ms during streaming
+#define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response
+#define SPI_RX_BUFFER_SIZE 160    // Two packed messages per poll: 2×71 = 142 bytes + 18 padding
 
 // Poll state machine
 typedef enum {
@@ -90,6 +99,37 @@ static volatile uint32_t spiPollRequestTick = 0;
 static volatile uint32_t spiPollCompleteTick = 0;  // Track when state changed to COMPLETE
 static volatile uint32_t spiLastPollTick = 0;
 static volatile uint32_t spiLastPollAttemptTick = 0;  // Track last attempt (even if failed due to busy)
+
+// ============================================================================
+// IMAGE STREAMING STATE MACHINE
+// ============================================================================
+typedef enum { STREAM_IDLE, KEYFRAME_ACTIVE, KEYFRAME_SENT, DELTA_ACTIVE } StreamState_t;
+static StreamState_t streamState = STREAM_IDLE;
+
+// Keyframe tracking
+static uint16_t kfTotalChunks    = 0;
+static uint16_t kfChunksSent     = 0;
+static uint8_t  kfXOffset        = 0;
+static uint8_t  kfYOffset        = 0;
+static uint32_t kfAckWaitTick    = 0;
+#define KF_ACK_TIMEOUT_MS 2000U
+
+// Delta tracking
+static uint8_t     deltaFrameSeq          = 0;
+static uint8_t     deltaTileCount         = 0;
+static RAMN_Bool_t deltaFirstTileOfFrame  = False;
+static uint32_t    lastDeltaActivityTick  = 0;
+#define DELTA_IDLE_TIMEOUT_MS 2000U
+
+// ACK received from ECU A (set by RAMN_TELEMATICS_ProcessImageACK, read by Update)
+static volatile RAMN_Bool_t kfAckReceived = False;
+static volatile uint8_t     kfAckStatus   = 0x00U;
+
+// Dynamic poll interval: SPI_POLL_INTERVAL_MS when idle, 1 ms when streaming
+static uint32_t currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+
+// Image-mode poll request buffer: [0x03][0xBB][0x01][0xBA] + 156 dummy bytes
+static uint8_t pollImageTxBuffer[SPI_RX_BUFFER_SIZE];
 
 // RX buffer for ESP32 responses (double buffer for safety)
 static uint8_t spiRxBufferA[SPI_RX_BUFFER_SIZE];
@@ -167,6 +207,20 @@ void RAMN_TELEMATICS_Init(uint32_t tick)
 	// Zero-initialize RX buffers (prevent garbage on first poll)
 	RAMN_memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
 	RAMN_memset(spiRxBufferB, 0, SPI_RX_BUFFER_SIZE);
+
+	// Initialize image streaming state machine
+	streamState           = STREAM_IDLE;
+	currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+	kfAckReceived         = False;
+	deltaFirstTileOfFrame = False;
+	lastDeltaActivityTick = tick;
+
+	// Image-mode poll request: [0x03][0xBB][0x01][0xBA] + zero padding
+	RAMN_memset(pollImageTxBuffer, 0, SPI_RX_BUFFER_SIZE);
+	pollImageTxBuffer[0] = 0x03U;
+	pollImageTxBuffer[1] = 0xBBU;
+	pollImageTxBuffer[2] = 0x01U;
+	pollImageTxBuffer[3] = 0xB9U;
 }
 
 // ============================================================================
@@ -343,10 +397,23 @@ static RAMN_Bool_t RequestESP32Poll(void)
 	spiStats.spiRxPollCnt++;
 	taskEXIT_CRITICAL();
 
+	// Select poll request type: image-mode (0x01) when streaming, normal (0x00) otherwise
+	//uint8_t* txBuf = (streamState != STREAM_IDLE) ? pollImageTxBuffer : pollTxBuffer;
+
+	static uint8_t peek_counter = 0;
+	uint8_t* txBuf = pollTxBuffer;
+
+	if (streamState != STREAM_IDLE) {
+    	txBuf = pollImageTxBuffer;
+	} else if (++peek_counter >= 10) { // Every 10th poll, check for images
+    	txBuf = pollImageTxBuffer;
+    	peek_counter = 0;
+	}
+
 	// Start simultaneous TX/RX DMA operation
 	HAL_GPIO_WritePin(LCD_nCS_GPIO_Port, LCD_nCS_Pin, GPIO_PIN_RESET);
 	status = HAL_SPI_TransmitReceive_DMA(&hspi2,
-	                                      pollTxBuffer,
+	                                      txBuf,
 	                                      activeRxBuffer,
 	                                      SPI_RX_BUFFER_SIZE);
 
@@ -381,108 +448,408 @@ static RAMN_Bool_t RequestESP32Poll(void)
 // Due to SPI full-duplex operation, ESP32's response doesn't start at byte 0.
 // We scan for the 0xCC marker to find where the response begins.
 // ============================================================================
+// ============================================================================
+// HELPER: Build and send a CAN-FD frame for image streaming
+// ============================================================================
+static void SendImageCANFrame(uint32_t canId, uint32_t dlc,
+                               RAMN_Bool_t brs, const uint8_t* data)
+{
+	FDCAN_TxHeaderTypeDef h;
+	h.Identifier          = canId;
+	h.IdType              = FDCAN_STANDARD_ID;
+	h.TxFrameType         = FDCAN_DATA_FRAME;
+	h.DataLength          = dlc;
+	h.BitRateSwitch       = brs ? FDCAN_BRS_ON : FDCAN_BRS_OFF;
+	h.FDFormat            = FDCAN_FD_CAN;
+	h.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+	h.MessageMarker       = 0U;
+	h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+
+	RAMN_Result_t result = RAMN_FDCAN_SendMessage(&h, data);
+	if (result == RAMN_OK)
+		spiStats.spiRxCANQueuedCnt++;
+	else
+		spiStats.spiRxCANQueueFailCnt++;
+
+#ifdef TELEMATICS_CAN_DEBUG
+	{
+		uint8_t payLen = DLCtoUINT8(dlc);
+		// Print first 8 bytes of payload in one shot — same style as SPI debug
+		char canBuf[96];
+		int  canLen = snprintf(canBuf, sizeof(canBuf),
+		    "CAN TX: ID=0x%03lX BRS=%d len=%u %s | %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+		    (unsigned long)canId, (int)(brs == True), payLen,
+		    (result == RAMN_OK) ? "OK" : "FAIL",
+		    (payLen > 0U) ? data[0] : 0U, (payLen > 1U) ? data[1] : 0U,
+		    (payLen > 2U) ? data[2] : 0U, (payLen > 3U) ? data[3] : 0U,
+		    (payLen > 4U) ? data[4] : 0U, (payLen > 5U) ? data[5] : 0U,
+		    (payLen > 6U) ? data[6] : 0U, (payLen > 7U) ? data[7] : 0U);
+		if (canLen > 0) RAMN_UART_SendFromTask((uint8_t*)canBuf, (uint32_t)canLen);
+	}
+#endif
+}
+
+// ============================================================================
+// PROCESS ESP32 POLL RESPONSE — up to 2 messages per 160-byte poll
+// ============================================================================
+// Protocol: [LEN][0xCC][TYPE][...payload...][CHK]
+//   TYPE 0x00 : CAN forward (ID at bytes 3-6, DLC at 7, FLAGS at 8, data at 9+)
+//   TYPE 0x01 : IMG_START   keyframe begin
+//   TYPE 0x02 : IMG_CHUNK   keyframe pixel data (RLE)
+//   TYPE 0x03 : IMG_END     keyframe complete
+//   TYPE 0x04 : IMG_ABORT   abort current keyframe
+//   TYPE 0x10 : DELTA_FRAME one RLE tile chunk
+//   TYPE 0x11 : DELTA_FRAME_END signals end of one delta frame
+// Empty response: LEN=2, [0xCC][0x00][CHK]
+// ============================================================================
 static void ProcessESP32Response(void)
 {
-	uint8_t* rxBuf = processRxBuffer;
-	uint16_t responseStart = 0;
-	RAMN_Bool_t foundResponse = False;
+	uint8_t* rxBuf  = processRxBuffer;
+	uint16_t offset = 0;
 
-	// Scan buffer for response marker (0xCC)
-	for (uint16_t i = 0; i < SPI_RX_BUFFER_SIZE - 2; i++)
+#ifdef TELEMATICS_SPI_DEBUG
+	// Print first 16 raw bytes of every poll response
+	char dbgBuf[80];
+	int  dbgLen = snprintf(dbgBuf, sizeof(dbgBuf),
+	    "SPI RX: %02X %02X %02X %02X %02X %02X %02X %02X "
+	             "%02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+	    rxBuf[0],  rxBuf[1],  rxBuf[2],  rxBuf[3],
+	    rxBuf[4],  rxBuf[5],  rxBuf[6],  rxBuf[7],
+	    rxBuf[8],  rxBuf[9],  rxBuf[10], rxBuf[11],
+	    rxBuf[12], rxBuf[13], rxBuf[14], rxBuf[15]);
+	if (dbgLen > 0) RAMN_UART_SendFromTask((uint8_t*)dbgBuf, (uint32_t)dbgLen);
+#endif
+
+	for (int msgNum = 0; msgNum < 2; msgNum++)
 	{
-		if (rxBuf[i] == 0xCC)
+		// Scan from current offset for a 0xCC marker preceded by a valid LEN byte
+		RAMN_Bool_t found     = False;
+		uint16_t    respStart = 0;
+
+		for (uint16_t i = offset; i < SPI_RX_BUFFER_SIZE - 1U; i++)
 		{
-			// Found 0xCC - check if previous byte could be valid length
-			// Valid length: 2 (empty response) to 72 (max CAN message)
-			if (i > 0 && rxBuf[i-1] >= 2 && rxBuf[i-1] <= 72)
+			if (rxBuf[i] == 0xCCU && i > 0U)
 			{
-				responseStart = i - 1;  // LENGTH byte is before 0xCC
-				foundResponse = True;
-				break;
+				uint8_t candidateLen = rxBuf[i - 1U];
+				if (candidateLen >= 2U && candidateLen <= 80U &&
+				    (i - 1U + 1U + candidateLen) <= SPI_RX_BUFFER_SIZE)
+				{
+					respStart = i - 1U;
+					found     = True;
+					break;
+				}
 			}
 		}
-	}
 
-	if (!foundResponse)
-	{
-		// No valid response found - ESP32 has no data to send
-		spiStats.spiRxNoRespFoundCnt++;
-		return;
-	}
+		if (!found)
+		{
+			if (msgNum == 0)
+			{
+				spiStats.spiRxNoRespFoundCnt++;
+#ifdef TELEMATICS_SPI_DEBUG
+				RAMN_UART_SendStringFromTask("SPI: no 0xCC marker found\r\n");
+#endif
+			}
+			break;
+		}
 
-	// Process response starting from found location
-	uint8_t* response = &rxBuf[responseStart];
-	uint8_t msgLen = response[0];
+		uint8_t* msg    = &rxBuf[respStart];
+		uint8_t  msgLen = msg[0];
 
-	// Check for empty response (no CAN message from ESP32)
-	if (msgLen == 2 && response[1] == 0xCC && response[2] == 0x00)
-	{
-		spiStats.spiRxEmptyRespCnt++;
-		return;  // Valid empty response - no action needed
-	}
+		// Advance offset past this message for the next iteration
+		offset = respStart + 1U + msgLen;
 
-	// Validate message structure (minimum 8 bytes for a CAN message)
-	if (msgLen < 8 || response[1] != 0xCC)
-	{
+		// Empty response: type 0x00 with LEN=2
+		if (msgLen == 2U && msg[1] == 0xCCU && msg[2] == 0x00U)
+		{
+			spiStats.spiRxEmptyRespCnt++;
+			continue;
+		}
+
+		// Require at least [0xCC][TYPE][CHK] = 3 bytes in the payload
+		if (msgLen < 3U || msg[1] != 0xCCU)
+		{
+			spiStats.spiRxInvalidCnt++;
+			continue;
+		}
+
+		// Verify XOR checksum over bytes msg[1]..msg[msgLen]
+		uint8_t chk = 0U;
+		for (uint8_t k = 1U; k <= msgLen; k++) chk ^= msg[k];
+		if (chk != 0U)
+		{
+			spiStats.spiRxChecksumErrorCnt++;
+#ifdef TELEMATICS_SPI_DEBUG
+			char chkBuf[64];
+			int  chkLen = snprintf(chkBuf, sizeof(chkBuf),
+			    "SPI: chk fail at %u len=%u residue=0x%02X\r\n",
+			    respStart, msgLen, chk);
+			if (chkLen > 0) RAMN_UART_SendFromTask((uint8_t*)chkBuf, (uint32_t)chkLen);
+#endif
+			continue;
+		}
+
+		uint8_t msgType = msg[2];
+
+#ifdef TELEMATICS_SPI_DEBUG
+		{
+			char typeBuf[48];
+			int  typeLen = snprintf(typeBuf, sizeof(typeBuf),
+			    "SPI: msg%d at %u len=%u type=0x%02X\r\n",
+			    msgNum, respStart, msgLen, msgType);
+			if (typeLen > 0) RAMN_UART_SendFromTask((uint8_t*)typeBuf, (uint32_t)typeLen);
+		}
+#endif
+
+		// ------------------------------------------------------------------
+		// TYPE 0x00: CAN forward — relay as classic CAN to the bus
+		// Format: [LEN][0xCC][0x00][ID3][ID2][ID1][ID0][DLC][FLAGS][DATA...][CHK]
+		// ------------------------------------------------------------------
+		if (msgType == 0x00U)
+		{
+			if (msgLen < 9U) { spiStats.spiRxInvalidCnt++; continue; }
+
+			uint32_t canId = ((uint32_t)msg[3] << 24) | ((uint32_t)msg[4] << 16) |
+			                 ((uint32_t)msg[5] << 8)  |  (uint32_t)msg[6];
+			uint8_t dlc   = msg[7];
+			uint8_t flags = msg[8];
+
+			FDCAN_TxHeaderTypeDef h;
+			h.Identifier          = canId;
+			h.IdType              = (flags & 0x01U) ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
+			h.TxFrameType         = (flags & 0x02U) ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
+			h.DataLength          = dlc;
+			h.BitRateSwitch       = FDCAN_BRS_OFF;
+			h.FDFormat            = FDCAN_CLASSIC_CAN;
+			h.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+			h.MessageMarker       = 0U;
+			h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+
+			uint8_t data[64];
+			RAMN_memset(data, 0, sizeof(data));
+			uint8_t payLen = DLCtoUINT8(dlc);
+			uint8_t maxPay = (msgLen >= 9U) ? (msgLen - 8U) : 0U;
+			if (payLen > maxPay) payLen = maxPay;
+			for (uint8_t k = 0U; k < payLen; k++) data[k] = msg[9U + k];
+
+			RAMN_Result_t fwdResult = RAMN_FDCAN_SendMessage(&h, data);
+			if (fwdResult == RAMN_OK) spiStats.spiRxCANQueuedCnt++;
+			else spiStats.spiRxCANQueueFailCnt++;
+
+#ifdef TELEMATICS_CAN_DEBUG
+			{
+				char canBuf[96];
+				int  canLen = snprintf(canBuf, sizeof(canBuf),
+				    "CAN TX: ID=0x%03lX BRS=0 len=%u %s | %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+				    (unsigned long)canId, payLen,
+				    (fwdResult == RAMN_OK) ? "OK" : "FAIL",
+				    (payLen > 0U) ? data[0] : 0U, (payLen > 1U) ? data[1] : 0U,
+				    (payLen > 2U) ? data[2] : 0U, (payLen > 3U) ? data[3] : 0U,
+				    (payLen > 4U) ? data[4] : 0U, (payLen > 5U) ? data[5] : 0U,
+				    (payLen > 6U) ? data[6] : 0U, (payLen > 7U) ? data[7] : 0U);
+				if (canLen > 0) RAMN_UART_SendFromTask((uint8_t*)canBuf, (uint32_t)canLen);
+			}
+#endif
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// TYPE 0x01: IMG_START — start of a keyframe
+		// Format: [0x0A][0xCC][0x01][W_HI][W_LO][H_HI][H_LO][CH_HI][CH_LO][X_OFF][Y_OFF][CHK]
+		// ------------------------------------------------------------------
+		if (msgType == 0x01U)
+		{
+			if (msgLen < 10U) { spiStats.spiRxInvalidCnt++; continue; }
+
+			uint16_t w  = (uint16_t)((uint16_t)msg[4] | ((uint16_t)msg[3] << 8));
+			uint16_t h  = (uint16_t)((uint16_t)msg[6] | ((uint16_t)msg[5] << 8));
+			uint16_t ch = (uint16_t)((uint16_t)msg[8] | ((uint16_t)msg[7] << 8));
+			uint8_t  xo = msg[9];
+			uint8_t  yo = msg[10];
+
+			kfTotalChunks = ch;
+			kfChunksSent  = 0U;
+			kfXOffset     = xo;
+			kfYOffset     = yo;
+			streamState   = KEYFRAME_ACTIVE;
+			currentPollIntervalMs = 1U;
+
+			// Forward 0x300 IMG_START to ECU A
+			uint8_t canData[12];
+			canData[0]  = (uint8_t)(w & 0xFFU);
+			canData[1]  = (uint8_t)(w >> 8);
+			canData[2]  = (uint8_t)(h & 0xFFU);
+			canData[3]  = (uint8_t)(h >> 8);
+			canData[4]  = (uint8_t)(ch & 0xFFU);
+			canData[5]  = (uint8_t)(ch >> 8);
+			canData[6]  = xo;
+			canData[7]  = yo;
+			canData[8]  = 0x00U;
+			canData[9]  = 0x00U;
+			canData[10] = 0x01U;   // VERSION
+			uint8_t xorChk = 0U;
+			for (uint8_t k = 0U; k < 11U; k++) xorChk ^= canData[k];
+			canData[11] = xorChk;
+			SendImageCANFrame(IMG_CAN_ID_START, FDCAN_DLC_BYTES_12, False, canData);
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// TYPE 0x02: IMG_CHUNK — keyframe RLE pixel data
+		// Format: [LEN][0xCC][0x02][SEQ_HI][SEQ_LO][PAYLOAD_LEN][RLE...][CHK]
+		// ------------------------------------------------------------------
+		if (msgType == 0x02U)
+		{
+			if (streamState != KEYFRAME_ACTIVE) continue;
+			if (msgLen < 5U) { spiStats.spiRxInvalidCnt++; continue; }
+
+			uint8_t payLen = msg[5];
+			if (payLen == 0U || 6U + payLen > msgLen) { spiStats.spiRxInvalidCnt++; continue; }
+
+			// Forward as one or two 0x301 IMG_DATA frames (CAN-FD + BRS, DLC
+			// always 64). Each frame carries at most 61 real bytes — 64 minus
+			// a 3-byte header [SEQ_HI][SEQ_LO][REAL_LEN]. A full 64-byte SPI
+			// chunk needs TWO frames to cross without loss: sending it in one
+			// fixed-64 frame with a 2-byte header used to silently truncate
+			// the last 2 bytes of every full chunk (bug found 2026-09-01).
+			// REAL_LEN also lets ECU A recover the true byte count of the
+			// final, short chunk of a keyframe instead of assuming a fixed
+			// 62 and feeding its own zero-padding into the decoder as if it
+			// were real pixel data.
+			uint8_t srcOffset = 0U;
+			while (srcOffset < payLen)
+			{
+				uint8_t remaining = (uint8_t)(payLen - srcOffset);
+				uint8_t frameLen  = (remaining <= 61U) ? remaining : 61U;
+
+				uint8_t canData[64];
+				RAMN_memset(canData, 0, sizeof(canData));
+				canData[0] = msg[3];    // SEQ_HI
+				canData[1] = msg[4];    // SEQ_LO
+				canData[2] = frameLen;  // REAL_LEN -- true byte count carried in this frame
+				for (uint8_t k = 0U; k < frameLen; k++) canData[3U + k] = msg[6U + srcOffset + k];
+				SendImageCANFrame(IMG_CAN_ID_DATA, FDCAN_DLC_BYTES_64, True, canData);
+
+				srcOffset = (uint8_t)(srcOffset + frameLen);
+			}
+			kfChunksSent++;
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// TYPE 0x03: IMG_END — keyframe complete
+		// Format: [0x03][0xCC][0x03][CHK]
+		// ------------------------------------------------------------------
+		if (msgType == 0x03U)
+		{
+			if (streamState != KEYFRAME_ACTIVE) continue;
+
+			// Forward 0x302 IMG_END
+			uint8_t canData[8];
+			RAMN_memset(canData, 0, sizeof(canData));
+			canData[0] = (uint8_t)(kfChunksSent & 0xFFU);
+			canData[1] = (uint8_t)(kfChunksSent >> 8);
+			// CRC16 bytes (2-3) left as 0x00 — full CRC computation is optional
+			canData[4] = 0x00U;   // STATUS OK
+			SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_8, False, canData);
+
+			streamState   = KEYFRAME_SENT;
+			kfAckReceived = False;
+			kfAckWaitTick = xTaskGetTickCount();
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// TYPE 0x04: IMG_ABORT — abort current keyframe
+		// ------------------------------------------------------------------
+		if (msgType == 0x04U)
+		{
+			if (streamState == KEYFRAME_ACTIVE || streamState == KEYFRAME_SENT)
+			{
+				uint8_t canData[8];
+				RAMN_memset(canData, 0, sizeof(canData));
+				canData[4] = 0x01U;   // STATUS abort
+				SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_8, False, canData);
+			}
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// TYPE 0x10: DELTA_FRAME — one RLE chunk of a dirty tile
+		// Format: [LEN][0xCC][0x10][TILE_X][TILE_Y][TILE_SIZE][CHUNK_SEQ][PAYLOAD_LEN][RLE...][CHK]
+		// ------------------------------------------------------------------
+		if (msgType == 0x10U)
+		{
+			if (msgLen < 7U) { spiStats.spiRxInvalidCnt++; continue; }
+
+			uint8_t tileX    = msg[3];
+			uint8_t tileY    = msg[4];
+			uint8_t tileSize = msg[5];
+			uint8_t chunkSeq = msg[6];
+			uint8_t payLen   = msg[7];
+
+			if (payLen == 0U || 8U + payLen > msgLen) { spiStats.spiRxInvalidCnt++; continue; }
+
+			// Send DELTA_FRAME_START (0x304) before the first tile chunk of a frame
+			if (deltaFirstTileOfFrame == False && (chunkSeq & 0x7FU) == 0U)
+			{
+				deltaFirstTileOfFrame = True;
+				deltaFrameSeq++;
+				deltaTileCount = 0U;
+
+				uint8_t startData[8];
+				RAMN_memset(startData, 0, sizeof(startData));
+				startData[0] = deltaFrameSeq;
+				startData[1] = 0U;   // tile_count filled in DELTA_FRAME_END
+				SendImageCANFrame(DELTA_CAN_ID_FRAME_START, FDCAN_DLC_BYTES_8, False, startData);
+
+				if (streamState != DELTA_ACTIVE)
+				{
+					streamState           = DELTA_ACTIVE;
+					currentPollIntervalMs = 1U;
+				}
+			}
+
+			// Track tiles (each tile signals last chunk)
+			if (chunkSeq & 0x80U) deltaTileCount++;
+			lastDeltaActivityTick = xTaskGetTickCount();
+
+			// Forward as 0x305 DELTA_TILE_CHUNK (CAN-FD + BRS, DLC=64)
+			uint8_t canData[64];
+			RAMN_memset(canData, 0, sizeof(canData));
+			canData[0] = tileX;
+			canData[1] = tileY;
+			canData[2] = tileSize;
+			canData[3] = chunkSeq;
+			uint8_t copyLen = (payLen <= 59U) ? payLen : 59U;
+			canData[4] = copyLen;
+			for (uint8_t k = 0U; k < copyLen; k++) canData[5U + k] = msg[8U + k];
+			SendImageCANFrame(DELTA_CAN_ID_TILE_CHUNK, FDCAN_DLC_BYTES_64, True, canData);
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// TYPE 0x11: DELTA_FRAME_END — end of one delta frame
+		// Format: [0x04][0xCC][0x11][TILE_COUNT][CHK]
+		// ------------------------------------------------------------------
+		if (msgType == 0x11U)
+		{
+			// Forward 0x306 DELTA_FRAME_END
+			uint8_t canData[4];
+			canData[0] = deltaFrameSeq;
+			canData[1] = 0x00U;   // STATUS complete
+			canData[2] = 0x00U;
+			canData[3] = 0x00U;
+			SendImageCANFrame(DELTA_CAN_ID_FRAME_END, FDCAN_DLC_BYTES_4, False, canData);
+
+			deltaFirstTileOfFrame = False;   // ready for next delta frame's START
+			continue;
+		}
+
+		// Unknown type
 		spiStats.spiRxInvalidCnt++;
-		return;  // Invalid response
-	}
-
-	// Verify checksum (XOR of all bytes from 0xCC through CHECKSUM should be 0)
-	uint8_t checksum = 0;
-	for (uint8_t i = 1; i <= msgLen; i++)
-		checksum ^= response[i];
-
-	if (checksum != 0)
-	{
-		spiStats.spiRxChecksumErrorCnt++;
-		return;  // Checksum mismatch
-	}
-
-	// Parse CAN message from ESP32 response
-	FDCAN_TxHeaderTypeDef header;
-	uint8_t data[64];
-	RAMN_memset(data, 0, sizeof(data));  // Zero-initialize payload
-
-	// Extract CAN ID (big-endian)
-	uint32_t canId = ((uint32_t)response[2] << 24) |
-	                 ((uint32_t)response[3] << 16) |
-	                 ((uint32_t)response[4] << 8)  |
-	                 ((uint32_t)response[5]);
-
-	uint8_t dlc = response[6];
-	uint8_t flags = response[7];
-
-	// Build CAN header
-	header.Identifier = canId;
-	header.IdType = (flags & 0x01) ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
-	header.TxFrameType = (flags & 0x02) ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
-	header.DataLength = dlc;
-	header.BitRateSwitch = FDCAN_BRS_OFF;
-	header.FDFormat = FDCAN_CLASSIC_CAN;
-	header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-
-	// Copy payload
-	uint8_t payloadSize = DLCtoUINT8(dlc);
-	if (payloadSize > 0 && payloadSize <= 64)
-	{
-		// Ensure we don't read past msgLen
-		uint8_t maxPayload = (msgLen >= 8) ? (msgLen - 7) : 0;  // msgLen includes all fields except itself
-		if (payloadSize > maxPayload)
-			payloadSize = maxPayload;
-
-		for (uint8_t i = 0; i < payloadSize; i++)
-			data[i] = response[8 + i];
-	}
-
-	// Queue to CAN transmit buffer (non-blocking)
-	if (RAMN_FDCAN_SendMessage(&header, data) == RAMN_OK)
-	{
-		spiStats.spiRxCANQueuedCnt++;
-	}
-	else
-	{
-		spiStats.spiRxCANQueueFailCnt++;
 	}
 }
 
@@ -506,6 +873,15 @@ static void ProcessESP32Response(void)
 // ============================================================================
 void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
+	// Route IMG_ACK (0x303) from ECU A to the image stream handler
+	if (pHeader->Identifier == IMG_CAN_ID_ACK &&
+	    pHeader->IdType == FDCAN_STANDARD_ID &&
+	    pHeader->RxFrameType == FDCAN_DATA_FRAME)
+	{
+		RAMN_TELEMATICS_ProcessImageACK(pHeader, data, tick);
+		return;
+	}
+
 	uint8_t msgBuf[73];  // MsgLen + Start + ID(4) + Len + Flags + Data(64 max) + Checksum
 	uint8_t offset = 0;
 	uint8_t checksum = 0;
@@ -643,7 +1019,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, sizeof(buffer),
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -656,7 +1032,8 @@ static void PrintSPIStats(void)
 		stateName,
 		statsSnapshot.spiRxCANQueuedCnt,
 		statsSnapshot.spiRxCANQueueFailCnt,
-		canTxQueuePercent);
+		canTxQueuePercent, 
+		streamState == STREAM_IDLE ? 0 : (streamState == KEYFRAME_ACTIVE ? 1 : 2)); // Stream state indicator;
 
 	if (len > 0 && len < (int)sizeof(buffer))
 	{
@@ -702,7 +1079,7 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 	{
 		case SPI_POLL_IDLE:
 			// Check if it's time to poll ESP32
-			if ((tick - spiLastPollTick) >= SPI_POLL_INTERVAL_MS)
+			if ((tick - spiLastPollTick) >= currentPollIntervalMs)
 			{
 				if (RequestESP32Poll())
 				{
@@ -777,10 +1154,64 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 		spiTxLastFlushTick = tick;
 	}
 
+	// ========================================================================
+	// IMAGE STREAM STATE MANAGEMENT
+	// ========================================================================
+
+	// KEYFRAME_SENT: wait for ACK from ECU A (0x303), timeout after 2 s
+	if (streamState == KEYFRAME_SENT)
+	{
+		if (kfAckReceived == True)
+		{
+			kfAckReceived         = False;
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+		}
+		else if ((tick - kfAckWaitTick) >= KF_ACK_TIMEOUT_MS)
+		{
+			// ACK timed out — give up and return to idle
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+		}
+	}
+
+	// DELTA_ACTIVE: return to idle poll rate if no tile arrives within 2 s
+	if (streamState == DELTA_ACTIVE)
+	{
+		if ((tick - lastDeltaActivityTick) >= DELTA_IDLE_TIMEOUT_MS)
+		{
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+			deltaFirstTileOfFrame = False;
+		}
+	}
+
 	// Periodically print SPI statistics to UART for monitoring
 	if ((tick - spiStatsLastPrintTick) >= SPI_STATS_PRINT_INTERVAL_MS)
 	{
 		PrintSPIStats();
 		spiStatsLastPrintTick = tick;
 	}
+}
+
+// ============================================================================
+// PUBLIC: STREAM ACTIVE QUERY
+// ============================================================================
+RAMN_Bool_t RAMN_TELEMATICS_IsStreamActive(void)
+{
+	return (streamState != STREAM_IDLE) ? True : False;
+}
+
+// ============================================================================
+// PUBLIC: PROCESS IMG_ACK (0x303) FROM ECU A
+// Called from RAMN_TELEMATICS_ProcessRxCANMessage when ID == IMG_CAN_ID_ACK.
+// ============================================================================
+void RAMN_TELEMATICS_ProcessImageACK(const FDCAN_RxHeaderTypeDef* pHeader,
+                                     const uint8_t* data, uint32_t tick)
+{
+	(void)pHeader;
+	(void)tick;
+	if (streamState != KEYFRAME_SENT) return;
+	kfAckStatus   = (data != NULL) ? data[0] : 0xFFU;
+	kfAckReceived = True;
 }

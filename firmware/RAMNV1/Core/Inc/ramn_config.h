@@ -375,6 +375,15 @@
 
 
 
+// Image streaming CAN IDs — ECU D → ECU A (free range 0x200–0x54F)
+#define IMG_CAN_ID_START          0x300U  // Keyframe start        (CAN-FD)
+#define IMG_CAN_ID_DATA           0x301U  // Keyframe data chunks  (CAN-FD + BRS)
+#define IMG_CAN_ID_END            0x302U  // Keyframe end          (CAN-FD)
+#define IMG_CAN_ID_ACK            0x303U  // Keyframe ACK          (ECU A → ECU D, Classic)
+#define DELTA_CAN_ID_FRAME_START  0x304U  // Delta frame start     (CAN-FD)
+#define DELTA_CAN_ID_TILE_CHUNK   0x305U  // Delta tile chunk      (CAN-FD + BRS)
+#define DELTA_CAN_ID_FRAME_END    0x306U  // Delta frame end       (CAN-FD)
+
 // Check for bad configurations --------------------------------------
 
 #ifdef ENABLE_CDC

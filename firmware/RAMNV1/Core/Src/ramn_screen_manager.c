@@ -108,6 +108,17 @@ void RAMN_SCREENMANAGER_Update(uint32_t tick)
 	}
 #endif
 
+	// Force to move to the Image streaming screen if a keyframe/delta is active.
+	if ((RAMN_SCREENIMAGE_DisplayRequested != 0U) && (currentScreen != &ScreenImage))
+	{
+		switchScreen(&ScreenImage);
+	}
+	// If Image screen is active but no longer requested, switch back to default screen
+	else if ((RAMN_SCREENIMAGE_DisplayRequested == 0U) && (currentScreen == &ScreenImage))
+	{
+		switchScreen(DEFAULT_SCREEN);
+	}
+
 	// Force to move to the RegCode screen if a registration code was received.
 	if ((RAMN_SCREENREGCODE_DisplayRequested != 0U) && (currentScreen != &ScreenRegCode))
 	{
@@ -164,8 +175,18 @@ void RAMN_SCREENMANAGER_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
 {
 	RAMN_Bool_t handled = False;
 
+	// Route image streaming CAN IDs (0x300–0x306) directly to ScreenImage
+	if (pHeader->Identifier >= IMG_CAN_ID_START && pHeader->Identifier <= DELTA_CAN_ID_FRAME_END &&
+	    pHeader->IdType == FDCAN_STANDARD_ID &&
+	    pHeader->RxFrameType == FDCAN_DATA_FRAME)
+	{
+		if (data != NULL && ScreenImage.ProcessRxCANMessage != NULL)
+			ScreenImage.ProcessRxCANMessage(pHeader, data, tick);
+		handled = True;
+	}
+
 	// Check for registration code trigger (similar to how UDS/CHIP8 are triggered externally)
-	if ((pHeader->Identifier == REGCODE_CAN_ID) &&
+	if (!handled && (pHeader->Identifier == REGCODE_CAN_ID) &&
 	    (pHeader->IdType == FDCAN_STANDARD_ID) &&
 	    (pHeader->FDFormat == FDCAN_CLASSIC_CAN) &&
 	    (pHeader->RxFrameType == FDCAN_DATA_FRAME) &&

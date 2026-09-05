@@ -259,6 +259,17 @@ void RAMN_SPI_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const ui
 	}
 }
 
+void RAMN_SPI_OpenImageWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
+{
+	SPI_SetAddrWindow(x, y, w, h);
+}
+
+void RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len)
+{
+	if (len == 0 || (len & 1U)) return;
+	SPI_WriteData_DMA(data, len);
+}
+
 // Each char in the font array occupies 16*16 (with data that is always 0). This function draws all the font data (16*16).
 void RAMN_SPI_DrawChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr)
 {
