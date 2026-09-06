@@ -55,7 +55,11 @@ static void feed(const uint8_t *bytes, size_t n)
     memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
     memcpy(spiRxBufferA, bytes, n);
     processRxBuffer = spiRxBufferA;
+#ifdef TELEMATICS_HAS_STREAM_STATE
+    /* Only exists once image streaming landed. Guarded so this same file can
+       be compiled against a pre-image-stream revision as a control. */
     streamState = STREAM_IDLE;
+#endif
     ProcessESP32Response();
 }
 

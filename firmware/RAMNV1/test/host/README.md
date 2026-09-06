@@ -48,3 +48,25 @@ Add a `case_*()` function, call it from `main()`. Use `CHECK` for behaviour
 that must hold now, `CHECK_BUG` for a defect you are recording but not fixing
 in this change — with a note saying *why* it fails, so the next reader does
 not have to re-derive it.
+
+## Bisecting a regression
+
+The same suite can be run against an older revision of the module:
+
+```sh
+make control REV=776ee66
+```
+
+If a `CHECK_BUG` reports **`NOW PASSING`** at `REV`, the defect did not exist
+there — it is a regression introduced later. If it still reports `KNOWN BUG`,
+it predates `REV`.
+
+Result for the six defects recorded here, against `776ee66` (the last
+revision before image streaming, confirmed working on hardware):
+
+```
+15 checks | 0 hard failures | 0 known bugs confirmed | 6 markers to remove
+```
+
+All six pass there and fail on `d128bdf`, so all six arrived with the image
+streaming change — none is pre-existing.
