@@ -75,10 +75,10 @@
 #define ENABLE_SCREEN
 
 // Enable Chip 8 engine.
-#define ENABLE_CHIP8
+//#define ENABLE_CHIP8
 
 // Enable USB MiniCTF challenges.
-#define ENABLE_MINICTF
+//#define ENABLE_MINICTF
 
 // Note that UDS programming does not work on microcontrollers with only 256 kb memory (e.g., reference ending with CCT6).
 #define ENABLE_UDS_REPROGRAMMING
@@ -171,22 +171,27 @@
 // CONFIGURATION OF ECU D ------------------------------------------------------
 
 #if defined(TARGET_ECUD)
-#define ENABLE_MINICTF
+//#define ENABLE_MINICTF
 #define ENABLE_ADC
-#define EXPANSION_BODY
+//#define EXPANSION_BODY  // Disabled - using custom expansion board instead
 
-// Enable SPI (for LED control)
+// Enable SPI (for custom expansion board)
 #define ENABLE_SPI
+
+// Enable telematics features (CAN-to-SPI bridge with ESP32)
+#define ENABLE_TELEMATICS
+
+#define ENABLE_UART
 
 #define ENABLE_UDS_REPROGRAMMING
 #define ENABLE_UDS
 #define ENABLE_J1979
 //#define ENABLE_KWP
-#define ENABLE_XCP
+//#define ENABLE_XCP
 #define RTR_DEMO_ID 0x703
 
 // How long to light up ECU D's LEDs at startup. Set to 0 to skip test.
-#define LED_TEST_DURATION_MS 3000U
+#define LED_TEST_DURATION_MS 0U  // Disabled - no LEDs on custom expansion board
 #endif
 
 // Common configuration ------------------------------------------------------
@@ -223,7 +228,8 @@
 // Use big endian for CAN brake/steering/accelerator sensors instead of ARM Little Endian.
 #define USE_BIG_ENDIAN_CAN
 
-#ifndef TARGET_ECUA
+
+#if defined(TARGET_ECUC) || defined(TARGET_ECUB)
 // Use Hardware CAN filters (Up to 28 standard IDs, 8 extended IDs).
 // If this is enabled, you need to update ECU RX filters when you want to add CAN IDs to the network.
 #define USE_HARDWARE_CAN_FILTERS
@@ -368,6 +374,15 @@
 #endif
 
 
+
+// Image streaming CAN IDs — ECU D → ECU A (free range 0x200–0x54F)
+#define IMG_CAN_ID_START          0x300U  // Keyframe start        (CAN-FD)
+#define IMG_CAN_ID_DATA           0x301U  // Keyframe data chunks  (CAN-FD + BRS)
+#define IMG_CAN_ID_END            0x302U  // Keyframe end          (CAN-FD)
+#define IMG_CAN_ID_ACK            0x303U  // Keyframe ACK          (ECU A → ECU D, Classic)
+#define DELTA_CAN_ID_FRAME_START  0x304U  // Delta frame start     (CAN-FD)
+#define DELTA_CAN_ID_TILE_CHUNK   0x305U  // Delta tile chunk      (CAN-FD + BRS)
+#define DELTA_CAN_ID_FRAME_END    0x306U  // Delta frame end       (CAN-FD)
 
 // Check for bad configurations --------------------------------------
 

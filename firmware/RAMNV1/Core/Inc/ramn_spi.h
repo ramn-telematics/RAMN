@@ -93,6 +93,9 @@ void 	RAMN_SPI_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const u
 // Draws ONE character with specified background/foreground color.
 void 	RAMN_SPI_DrawChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr);
 
+// Draws a scaled character (scale=2 for 32x32, scale=3 for 48x48, etc.).
+void 	RAMN_SPI_DrawLargeChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr, uint8_t scale);
+
 // Draws a character WITHOUT spacing (for overwriting a string, this function assumes the background is already drawn).
 void 	RAMN_SPI_RefreshChar(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint8_t chr);
 
@@ -106,7 +109,13 @@ void 	RAMN_SPI_RefreshString(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t 
 void 	RAMN_SPI_DrawUint32(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint32_t val);
 void 	RAMN_SPI_RefreshUint32(uint16_t x, uint16_t y, uint16_t fgColor, uint16_t bgColor, uint32_t val);
 
+// Opens a write window on the ST7789 at (x,y) with dimensions (w x h).
+// Must be followed by one or more calls to RAMN_SPI_WriteImageChunk().
+void 	RAMN_SPI_OpenImageWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
+// Writes a chunk of raw RGB565 pixel data into the currently open window.
+// len must be even and non-zero. Caller must ensure total bytes sent == 2*w*h.
+void 	RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len);
 
 #endif
 

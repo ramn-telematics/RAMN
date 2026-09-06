@@ -63,6 +63,9 @@
 #ifdef ENABLE_UART
 #include "ramn_uart.h"
 #endif
+#ifdef ENABLE_TELEMATICS
+#include "ramn_telematics.h"
+#endif
 #include "usb_device.h"
 #include "usbd_gsusb_if.h"
 /* USER CODE END Includes */
@@ -1599,6 +1602,9 @@ void RAMN_ReceiveCANFunc(void *argument)
 			RAMN_CTF_ProcessRxCANMessage(&CANRxHeader, CANRxData, xTaskGetTickCount());
 #endif
 			RAMN_CUSTOM_ProcessRxCANMessage(&CANRxHeader, CANRxData, xTaskGetTickCount());
+#ifdef ENABLE_TELEMATICS
+			RAMN_TELEMATICS_ProcessRxCANMessage(&CANRxHeader, CANRxData, xTaskGetTickCount());
+#endif
 
 #if defined(ENABLE_CDC)
 			if (RAMN_USB_Config.slcanOpened)
@@ -1789,6 +1795,9 @@ void RAMN_PeriodicTaskFunc(void *argument)
 	RAMN_CTF_Init(xTaskGetTickCount());
 #endif
 	RAMN_CUSTOM_Init(xTaskGetTickCount());
+#ifdef ENABLE_TELEMATICS
+	RAMN_TELEMATICS_Init(xTaskGetTickCount());
+#endif
 	HAL_TIM_Base_Start_IT(&htim6); 	// Enable custom function timer
 	HAL_TIM_Base_Start(&htim16); 	// Enable custom measurement timer
 
@@ -1825,6 +1834,9 @@ void RAMN_PeriodicTaskFunc(void *argument)
 #endif
 		}
 		RAMN_CUSTOM_Update(xLastWakeTime);
+#ifdef ENABLE_TELEMATICS
+		RAMN_TELEMATICS_Update(xLastWakeTime);
+#endif
 
 #if defined(ENABLE_DIAG)
 		RAMN_DIAG_Update(xLastWakeTime);
