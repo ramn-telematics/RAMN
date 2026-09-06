@@ -1,0 +1,50 @@
+# Host tests
+
+Firmware logic tested on a normal machine with `gcc` — no ARM toolchain, no
+board, no CAN bus.
+
+```sh
+cd firmware/RAMNV1/test/host && make
+```
+
+## What it covers
+
+`test_telematics_spi.c` drives the ESP32 → STM32 poll-response decode path in
+`ramn_telematics.c`. The assertion surface is `RAMN_FDCAN_SendMessage`:
+`fakes.c` records every frame the firmware tries to put on the vehicle bus, so
+each test says *given these SPI bytes, this must reach the bus*.
+
+## How it is wired
+
+The test `#include`s `ramn_telematics.c` directly. `ProcessESP32Response` is
+`static`, reads a file-static RX buffer, and ends in a HAL call, so it cannot
+be reached any other way without first refactoring code that can only be
+verified on hardware. The ESP32 repo's `image_stream` host test uses the same
+approach.
+
+`stubs/` replaces `main.h`, `ramn_canfd.h`, `ramn_telematics.h` and
+`ramn_uart.h` with the minimum the module needs: the FDCAN types and enum
+values, the RAMN scalar types, and the FreeRTOS surface. The enum values are
+copied from the real STM32L5 HAL headers — if they drift, the tests lie, so
+change them only against the HAL source.
+
+`ramn_config.h` is **not** stubbed. The real one is on the include path so CAN
+ID definitions cannot drift from the firmware.
+
+## Two rules that keep findings honest
+
+**Fixtures are built, never hand-written.** `build_can_response()` computes
+MSGLEN and the checksum. A hand-typed checksum that happens to be wrong is
+indistinguishable from a firmware bug, and costs an hour before you notice.
+
+**Known bugs are `CHECK_BUG`, not comments.** A `CHECK_BUG` that fails prints
+`KNOWN BUG` and does not fail the build. A `CHECK_BUG` that *passes* **fails
+the build**, telling you the defect is fixed and the marker must go. A marker
+cannot silently outlive the bug it documents.
+
+## Adding a case
+
+Add a `case_*()` function, call it from `main()`. Use `CHECK` for behaviour
+that must hold now, `CHECK_BUG` for a defect you are recording but not fixing
+in this change — with a note saying *why* it fails, so the next reader does
+not have to re-derive it.
