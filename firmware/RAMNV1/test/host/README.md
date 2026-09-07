@@ -70,3 +70,24 @@ revision before image streaming, confirmed working on hardware):
 
 All six pass there and fail on `d128bdf`, so all six arrived with the image
 streaming change — none is pre-existing.
+
+
+## ECU A: the image receive path
+
+```sh
+make ecua      # just this suite
+make           # both
+```
+
+`test_screen_image.c` compiles `ramn_screen_image.c` white-box and asserts on
+`RAMN_SPI_WriteImageChunk` — exactly the pixel bytes that would reach the
+ST7789. That is the only question worth asking about a decoder: for these CAN
+frames, what lands on the panel?
+
+Two `CHECK_BUG` markers record the same defect at two scales. ECU A decodes
+each 0x301 frame independently, but the ESP32 RLE-encodes the whole image as
+one stream and cuts it at fixed offsets, so blocks straddle frame boundaries
+and cannot be rejoined. `RLE_Decode` itself is correct — it reproduces every
+golden vector — so this is an architecture problem, not a decoder bug. The fix
+is to reassemble before decoding (charter A-05); when it lands, both markers
+start passing and the harness will fail the build asking for their removal.

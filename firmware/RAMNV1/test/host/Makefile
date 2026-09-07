@@ -14,15 +14,31 @@ CFLAGS   := -std=c11 -g -O0 -Wall -Wextra \
 BIN      := run_tests
 SRCS     := test_telematics_spi.c test_conformance.c fakes.c harness.c
 
-.PHONY: all clean
-all: $(BIN)
+# ECU A's image receive path is a separate binary: it compiles a different
+# module white-box, and two files cannot each #include a .c into one link.
+BIN_A    := run_tests_ecua
+SRCS_A   := test_screen_image.c fakes_screen.c fakes.c harness.c
+# ENABLE_SCREEN comes from the real ramn_config.h for an ECU A build, so it is
+# not defined here -- doing so shadows the project's own definition.
+CFLAGS_A := $(CFLAGS) -Wno-unused-but-set-variable
+
+.PHONY: all clean ecud ecua
+all: ecud ecua
+
+ecud: $(BIN)
 	./$(BIN)
+
+ecua: $(BIN_A)
+	./$(BIN_A)
 
 $(BIN): $(SRCS) $(wildcard stubs/*.h) $(CORE)/Src/ramn_telematics.c
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
+$(BIN_A): $(SRCS_A) $(wildcard stubs/*.h) $(CORE)/Src/ramn_screen_image.c
+	$(CC) $(CFLAGS_A) -o $@ $(SRCS_A)
+
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(BIN_A)
 
 # Run this same suite against an older revision of the module under test, to
 # check whether a failure is a regression or was always broken:
