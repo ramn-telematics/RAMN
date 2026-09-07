@@ -22,6 +22,15 @@
 #if !defined(RAMN_RLE_VECTOR_COUNT) || !defined(RAMN_PIPE_VECTOR_COUNT)
 #error "vendored ramn_test_vectors.h predates the RLE or pipeline vectors -- refresh it"
 #endif
+/* A header whose macros all exist but hold old values walks straight past an
+   #ifdef guard. This one carried RAMN_PIPE_SPI_CHUNK_PAYLOAD 64 after the
+   protocol moved to 61, so this suite sent 64-byte payloads, the 0x301
+   handler clamped each to 61, and three bytes of every chunk vanished --
+   presenting as a decoder fault for as long as it took to look. Check the
+   relationship the protocol guarantees, not just that the names are defined. */
+#if RAMN_PIPE_SPI_CHUNK_PAYLOAD != RAMN_PIPE_CAN_FRAME_PAYLOAD
+#error "vendored vectors predate the 61-byte chunk: one chunk must be one CAN frame"
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Fixture builders                                                     */
@@ -161,9 +170,9 @@ static void case_a_split_block_across_frames(void)
        offsets, so a block can begin in one frame and end in the next. This
        decoder decodes each frame independently, so it cannot rejoin them.
 
-       Marked as a known defect: the assertion states what a correct receiver
-       would produce. When reassembly lands, this starts passing and the
-       harness will say so. */
+       RLE_DecodeStream carries the half-read block across the boundary, so
+       the control byte in frame 0 and its pixel bytes in frame 1 are one
+       run. */
     reset_state();
     send_img_start(240, 240, 2, 100);
 
@@ -175,10 +184,11 @@ static void case_a_split_block_across_frames(void)
     send_img_data(1, second, 2, 102);
     drain(103);
 
-    CHECK_BUG(fake_screen_len == 4, "the split run still produces two pixels",
-              "each frame is RLE_Decode'd on its own, so the control byte is"
-              " dropped and the pixel bytes are read as a literal header."
-              " Fix is to reassemble the stream before decoding (A-05).");
+    CHECK(fake_screen_len == 4, "the split run still produces two pixels");
+    if (fake_screen_len >= 4) {
+        const uint8_t want[4] = {0xAB, 0xCD, 0xAB, 0xCD};
+        CHECK(memcmp(fake_screen, want, 4) == 0, "and they are the right pixels");
+    }
 }
 
 static void case_a_whole_keyframe(void)
@@ -223,10 +233,11 @@ static void case_a_whole_keyframe(void)
     }
     drain(203);
 
-    CHECK_BUG(fake_screen_len == sizeof raw, "one full screen of pixels reaches the panel",
-              "per-frame decoding loses every block that straddles a chunk"
-              " boundary; measured at roughly two thirds of a screen, most of"
-              " it misaligned. Fix is reassembly before decode (A-05).");
+    CHECK(RLE_StreamMidBlock(&kfStream) == False,
+          "the stream ends on a block boundary, with nothing half-read");
+
+    CHECK(fake_screen_len == sizeof raw, "one full screen of pixels reaches the panel");
+    CHECK(memcmp(fake_screen, raw, sizeof raw) == 0, "and every pixel is the right one");
 }
 
 int main(void)

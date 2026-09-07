@@ -31,10 +31,10 @@ ecud: $(BIN)
 ecua: $(BIN_A)
 	./$(BIN_A)
 
-$(BIN): $(SRCS) $(wildcard stubs/*.h) $(CORE)/Src/ramn_telematics.c
+$(BIN): $(SRCS) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_telematics.c
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
-$(BIN_A): $(SRCS_A) $(wildcard stubs/*.h) $(CORE)/Src/ramn_screen_image.c
+$(BIN_A): $(SRCS_A) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_screen_image.c
 	$(CC) $(CFLAGS_A) -o $@ $(SRCS_A)
 
 clean:

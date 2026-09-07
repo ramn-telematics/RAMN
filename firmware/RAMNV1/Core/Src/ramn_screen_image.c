@@ -116,8 +116,10 @@ static uint16_t tilePendingW    = 0;
 static uint16_t tilePendingH    = 0;
 
 // Static decode buffer for keyframe ring-buffer drain — avoids large stack frame.
-// Worst case: 62 RLE bytes → ~20 repeat-runs × 128 repetitions × 2 bytes = 5120 bytes.
-#define KF_DECODE_BUF_SIZE  5200U
+// Worst case: one run carried in from the previous frame (128 px = 256 bytes),
+// plus 61 RLE bytes of this one = 20 repeat-runs × 128 repetitions × 2 bytes
+// = 5120. 5376 total; round up.
+#define KF_DECODE_BUF_SIZE  5440U
 static uint8_t kfDecodeBuf[KF_DECODE_BUF_SIZE];
 
 // ============================================================================
@@ -129,6 +131,118 @@ static uint8_t kfDecodeBuf[KF_DECODE_BUF_SIZE];
 // Operates on raw bytes, not pixels. Tiles are always even-byte-sized.
 // Returns number of bytes written to dst.
 // ============================================================================
+// ---------------------------------------------------------------------------
+// Streaming decoder: one RLE stream spread across many CAN frames
+// ---------------------------------------------------------------------------
+//
+// A keyframe is RLE-encoded as ONE stream over the whole image and only then
+// cut into fixed-size chunks, so a block routinely begins in one frame and
+// ends in the next: measured on a real 240x240 keyframe, 211 of 286 chunk
+// boundaries have a block straddling them.
+//
+// Decoding each frame on its own therefore cannot work, and fails quietly --
+// a run whose control byte ends one frame produces nothing from that frame,
+// and its two pixel bytes are read as a literal header at the start of the
+// next. Roughly two thirds of a screen came out, most of it misaligned.
+//
+// This carries the partial block across the boundary instead. State is one
+// control byte, at most two pixel bytes, and two counters -- not a copy of the
+// stream, which matters because ECU A has no framebuffer and decodes straight
+// to the panel.
+//
+// Emission is resumable in both directions: if dst fills mid-run the remaining
+// repetitions stay in runLeft and come out on the next call, before any new
+// source byte is read.
+
+typedef struct {
+    uint16_t runLeft;   // pixel repetitions still to emit
+    uint16_t litLeft;   // literal bytes still to copy
+    uint16_t runCount;  // repetitions this run will emit once its pixel arrives
+    uint8_t  pix[2];    // the run's pixel, as much of it as has arrived
+    uint8_t  pixHave;   // 0..2
+    uint8_t  awaitPix;  // a run control byte was read; its pixel has not
+} RleStream_t;
+
+static RleStream_t kfStream;
+
+static void RLE_StreamReset(RleStream_t* s)
+{
+    s->runLeft = 0U;
+    s->litLeft = 0U;
+    s->runCount = 0U;
+    s->pix[0] = 0U;
+    s->pix[1] = 0U;
+    s->pixHave = 0U;
+    s->awaitPix = 0U;
+}
+
+// True when a block is half-read -- at IMG_END this means the stream was
+// truncated, which is worth counting rather than ignoring.
+static RAMN_Bool_t RLE_StreamMidBlock(const RleStream_t* s)
+{
+    return (s->runLeft || s->litLeft || s->awaitPix) ? True : False;
+}
+
+static uint16_t RLE_DecodeStream(RleStream_t* s, const uint8_t* src, uint16_t srcLen,
+                                 uint8_t* dst, uint16_t dstMax)
+{
+    uint16_t si = 0U, di = 0U;
+
+    for (;;)
+    {
+        // 1. Finish a run left over from a previous frame or a full dst.
+        if (s->runLeft)
+        {
+            while (s->runLeft && (di + 2U) <= dstMax)
+            {
+                dst[di++] = s->pix[0];
+                dst[di++] = s->pix[1];
+                s->runLeft--;
+            }
+            if (s->runLeft) break;          // dst full; resume next call
+        }
+
+        // 2. Finish a literal, which may span the frame boundary.
+        if (s->litLeft)
+        {
+            while (s->litLeft && si < srcLen && di < dstMax)
+            {
+                dst[di++] = src[si++];
+                s->litLeft--;
+            }
+            if (s->litLeft) break;          // needs more source, or more dst
+        }
+
+        // 3. Collect the pixel of a run whose control byte already arrived.
+        if (s->awaitPix)
+        {
+            while (s->pixHave < 2U && si < srcLen) s->pix[s->pixHave++] = src[si++];
+            if (s->pixHave < 2U) break;     // the rest is in the next frame
+            s->runLeft  = s->runCount;
+            s->awaitPix = 0U;
+            s->pixHave  = 0U;
+            continue;
+        }
+
+        // 4. Start a new block.
+        if (si >= srcLen || di >= dstMax) break;
+        uint8_t  ctrl = src[si++];
+        uint16_t n    = (uint16_t)((ctrl & 0x7FU) + 1U);
+        if (ctrl & 0x80U)
+        {
+            s->runCount = n;
+            s->awaitPix = 1U;
+            s->pixHave  = 0U;
+        }
+        else
+        {
+            s->litLeft = n;
+        }
+    }
+
+    return di;
+}
+
 static uint16_t RLE_Decode(const uint8_t* src, uint16_t srcLen,
                             uint8_t* dst, uint16_t dstMax)
 {
@@ -197,6 +311,7 @@ static void SCREENIMAGE_Deinit(void)
     }
 
     imgState        = IMG_IDLE;
+    RLE_StreamReset(&kfStream);
     kfRingWriteIdx  = 0;
     kfRingReadIdx   = 0;
     kfDecodedBytes  = 0;
@@ -223,11 +338,17 @@ static void SCREENIMAGE_Update(uint32_t tick)
         {
             KFRingEntry_t* entry = &kfRingBuf[ri];
 
-            // Decode into static buffer — avoids large stack frame and ensures sufficient
-            // capacity (worst case: 62 RLE bytes → 5120 decoded bytes).
-            uint16_t decodedLen = RLE_Decode(entry->data, entry->len,
-                                              kfDecodeBuf, KF_DECODE_BUF_SIZE);
-            if (decodedLen > 0U && (decodedLen & 1U) == 0U)
+            // Decode into static buffer — avoids large stack frame and ensures
+            // sufficient capacity. RLE_DecodeStream carries a block that
+            // straddles the frame boundary; decoding each frame on its own
+            // silently loses every such block, and on a real keyframe most
+            // boundaries have one.
+            uint16_t decodedLen = RLE_DecodeStream(&kfStream, entry->data, entry->len,
+                                                   kfDecodeBuf, KF_DECODE_BUF_SIZE);
+            // An odd count is now normal, not a fault: a literal can end mid
+            // pixel and its second byte arrives with the next frame. The panel
+            // takes a byte stream, and the stream as a whole stays aligned.
+            if (decodedLen > 0U)
             {
                 RAMN_SPI_WriteImageChunk(kfDecodeBuf, decodedLen);
                 kfDecodedBytes += decodedLen;
@@ -304,6 +425,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         kfDecodedBytes    = 0;
         kfRingWriteIdx    = 0;
         kfRingReadIdx     = 0;
+        RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
         tileAssemblyPos   = 0;
         tileReady         = False;
 

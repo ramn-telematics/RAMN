@@ -84,10 +84,15 @@ make           # both
 ST7789. That is the only question worth asking about a decoder: for these CAN
 frames, what lands on the panel?
 
-Two `CHECK_BUG` markers record the same defect at two scales. ECU A decodes
-each 0x301 frame independently, but the ESP32 RLE-encodes the whole image as
-one stream and cuts it at fixed offsets, so blocks straddle frame boundaries
-and cannot be rejoined. `RLE_Decode` itself is correct — it reproduces every
-golden vector — so this is an architecture problem, not a decoder bug. The fix
-is to reassemble before decoding (charter A-05); when it lands, both markers
-start passing and the harness will fail the build asking for their removal.
+A keyframe now arrives byte-perfect: 115,200 of 115,200, every pixel correct.
+
+It did not before. ECU A decoded each 0x301 frame independently while the
+ESP32 RLE-encodes the whole image as one stream and cuts it at fixed offsets,
+so a block routinely began in one frame and ended in the next and could not be
+rejoined. `RLE_Decode` itself was always correct — it reproduces every golden
+vector — so the fault was architectural, not in the decoder.
+
+`RLE_DecodeStream` carries the half-read block across the boundary. Its state
+is one control byte, at most two pixel bytes and two counters, which matters:
+ECU A has no framebuffer and writes straight to the panel, so buffering the
+whole stream was never an option.

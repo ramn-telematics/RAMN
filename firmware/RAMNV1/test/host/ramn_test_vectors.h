@@ -362,7 +362,7 @@ static const ramn_rle_vector_t ramn_rle_reject_vectors[3] = {
 /* IMG_CHUNK payload -> CAN FD frames, and back by REAL_LEN.
  * The STM32 asserts it produces `frames`; ECU A asserts it
  * reassembles them back to `payload`. Same table, both ends. */
-#define RAMN_PIPE_SPI_CHUNK_PAYLOAD 64
+#define RAMN_PIPE_SPI_CHUNK_PAYLOAD 61
 #define RAMN_PIPE_CAN_FRAME_HEADER 3
 #define RAMN_PIPE_CAN_FRAME_PAYLOAD 61
 #define RAMN_PIPE_CAN_ID_START 0x300
@@ -451,6 +451,6 @@ static const ramn_pipe_frame_t ramn_pipe_reject_frames[2] = {
  * either boundary moves one of these. */
 #define RAMN_PIPE_KEYFRAME_RAW_BYTES 115200
 #define RAMN_PIPE_KEYFRAME_RLE_BYTES 17499
-#define RAMN_PIPE_KEYFRAME_DATA_FRAMES 547
-#define RAMN_PIPE_KEYFRAME_DISTINCT_SEQ 274
-#define RAMN_PIPE_KEYFRAME_BYTES_ON_BUS 35008
+#define RAMN_PIPE_KEYFRAME_DATA_FRAMES 287
+#define RAMN_PIPE_KEYFRAME_DISTINCT_SEQ 287
+#define RAMN_PIPE_KEYFRAME_BYTES_ON_BUS 18368
