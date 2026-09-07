@@ -446,6 +446,65 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
     return True;   // allow navigation when screen is not active
 }
 
+// ============================================================================
+// 0x303 ACK -- ECU A's only report channel
+//
+// ECU A has no UART (ENABLE_UART is TARGET_ECUD only), so this frame is the
+// only way it can say anything about a keyframe. It is sent twice per frame:
+// once on IMG_START and once on IMG_END, with a different byte 0, so a silent
+// receiver can be told apart from one that gets IMG_START and never sees
+// IMG_END.
+//
+//   [0] stage/status : IMG_ACK_START (0x02) = 0x300 seen, keyframe begun
+//                      0x00 = keyframe complete and clean
+//                      0x01 = keyframe finished with a problem (see flags)
+//   [1] flags        : bit0 truncated (a half-read RLE block at IMG_END)
+//                      bit1 chunks dropped, ring full
+//                      bit2 chunks dropped, wrong state
+//   [2..4]           : bytes written to the panel, 24-bit little-endian
+//                      (a full 240x240 keyframe is 115,200)
+//   [5]              : 0x301 frames accepted                (saturating 255)
+//   [6]              : 0x301 frames dropped, ring full       (saturating)
+//   [7]              : 0x301 frames dropped, wrong state     (saturating)
+//
+// Its own function so that a second call site does not grow
+// SCREENIMAGE_ProcessRxCANMessage's frame: that runs on the CAN RX task, whose
+// whole stack is 1 KB (RAMN_ReceiveCANBuffer[256] in main.c).
+// ============================================================================
+#define IMG_ACK_START  0x02U
+#define IMG_ACK_END    0x00U
+
+static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated)
+{
+    FDCAN_TxHeaderTypeDef ackHdr;
+    ackHdr.Identifier          = IMG_CAN_ID_ACK;
+    ackHdr.IdType              = FDCAN_STANDARD_ID;
+    ackHdr.TxFrameType         = FDCAN_DATA_FRAME;
+    ackHdr.DataLength          = FDCAN_DLC_BYTES_8;
+    ackHdr.BitRateSwitch       = FDCAN_BRS_OFF;
+    ackHdr.FDFormat            = FDCAN_CLASSIC_CAN;
+    ackHdr.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+    ackHdr.MessageMarker       = 0U;
+    ackHdr.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+
+    uint8_t flags = 0U;
+    if (truncated    != False) flags |= 0x01U;
+    if (kfRingDrops  != 0U)    flags |= 0x02U;
+    if (kfStateDrops != 0U)    flags |= 0x04U;
+
+    uint8_t ackData[8];
+    if (stage == IMG_ACK_START) ackData[0] = IMG_ACK_START;
+    else ackData[0] = ((endStatus == 0x00U) && (flags == 0U)) ? 0x00U : 0x01U;
+    ackData[1] = flags;
+    ackData[2] = (uint8_t)(kfDecodedBytes & 0xFFU);
+    ackData[3] = (uint8_t)((kfDecodedBytes >> 8) & 0xFFU);
+    ackData[4] = (uint8_t)((kfDecodedBytes >> 16) & 0xFFU);
+    ackData[5] = (kfFramesRx   > 255U) ? 255U : (uint8_t)kfFramesRx;
+    ackData[6] = (kfRingDrops  > 255U) ? 255U : (uint8_t)kfRingDrops;
+    ackData[7] = (kfStateDrops > 255U) ? 255U : (uint8_t)kfStateDrops;
+    RAMN_FDCAN_SendMessage(&ackHdr, ackData);
+}
+
 static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader,
                                             const uint8_t* data, uint32_t tick)
 {
@@ -494,6 +553,11 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         kfPendingW     = kfWidth;
         kfPendingH     = kfHeight;
         kfWindowNeeded = True;
+
+        // Say "I got IMG_START" on the bus. Without this, an ECU A that never
+        // reaches IMG_END is indistinguishable from one that is not receiving
+        // anything at all -- both are simply silent.
+        SendImageAck(IMG_ACK_START, 0U, False);
 
 #ifdef SCREENIMAGE_DEBUG
         {
@@ -569,53 +633,12 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
 
         uint8_t status = (dlcLen >= 5U) ? data[4] : 0xFFU;
 
-        // Send ACK (0x303) back to ECU D
-        FDCAN_TxHeaderTypeDef ackHdr;
-        ackHdr.Identifier          = IMG_CAN_ID_ACK;
-        ackHdr.IdType              = FDCAN_STANDARD_ID;
-        ackHdr.TxFrameType         = FDCAN_DATA_FRAME;
-        ackHdr.DataLength          = FDCAN_DLC_BYTES_8;
-        ackHdr.BitRateSwitch       = FDCAN_BRS_OFF;
-        ackHdr.FDFormat            = FDCAN_CLASSIC_CAN;
-        ackHdr.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-        ackHdr.MessageMarker       = 0U;
-        ackHdr.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-
         // A half-read block at IMG_END means the stream stopped mid-way -- a
         // dropped 0x301 frame, or a sender that ended early. The pixels drawn
         // so far are still valid, but the frame is incomplete, so say so in
         // the ACK rather than reporting success on a partial image.
         RAMN_Bool_t truncated = RLE_StreamMidBlock(&kfStream);
-
-        // ACK payload -- ECU A's only report channel. Byte 0 keeps its original
-        // meaning (0 = good) because ECU D already reads it as the ACK status;
-        // bytes 1..7 are what this ECU saw, so a blank or torn screen can be
-        // told apart from a stream that never arrived.
-        //
-        //   [0] status  : 0 = complete and OK, 1 = something went wrong
-        //   [1] flags   : bit0 truncated (a half-read RLE block at IMG_END)
-        //                 bit1 at least one chunk dropped, ring full
-        //                 bit2 at least one chunk dropped, wrong state
-        //   [2..4]      : bytes written to the panel, 24-bit little-endian
-        //                 (a full 240x240 keyframe is 115,200)
-        //   [5]         : 0x301 frames accepted     (saturating at 255)
-        //   [6]         : 0x301 frames dropped, ring full   (saturating)
-        //   [7]         : 0x301 frames dropped, wrong state (saturating)
-        uint8_t flags = 0U;
-        if (truncated    != False) flags |= 0x01U;
-        if (kfRingDrops  != 0U)    flags |= 0x02U;
-        if (kfStateDrops != 0U)    flags |= 0x04U;
-
-        uint8_t ackData[8];
-        ackData[0] = ((status == 0x00U) && (flags == 0U)) ? 0x00U : 0x01U;
-        ackData[1] = flags;
-        ackData[2] = (uint8_t)(kfDecodedBytes & 0xFFU);
-        ackData[3] = (uint8_t)((kfDecodedBytes >> 8) & 0xFFU);
-        ackData[4] = (uint8_t)((kfDecodedBytes >> 16) & 0xFFU);
-        ackData[5] = (kfFramesRx   > 255U) ? 255U : (uint8_t)kfFramesRx;
-        ackData[6] = (kfRingDrops  > 255U) ? 255U : (uint8_t)kfRingDrops;
-        ackData[7] = (kfStateDrops > 255U) ? 255U : (uint8_t)kfStateDrops;
-        RAMN_FDCAN_SendMessage(&ackHdr, ackData);
+        SendImageAck(IMG_ACK_END, status, truncated);
 
         imgState = IMG_SHOWN;
 

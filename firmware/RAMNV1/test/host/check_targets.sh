@@ -74,11 +74,11 @@ RAMN_TELEMATICS_Update,PrintSPIStats
 RAMN_TELEMATICS_Update,PrintImageACK
 RAMN_TELEMATICS_Update,PrintImageACKTimeout"
 
-measure_stack() {   # $1 = extra CFLAGS, $2 = output .su path
-    cp "$CORE/Src/ramn_telematics.c" "$TMP/su_tu.c" || return 1
-    cc -std=c11 -O0 -w -DTARGET_ECUD $1 $INC -fstack-usage \
+measure_stack() {   # $1 = source .c, $2 = target macro, $3 = extra CFLAGS, $4 = out .su
+    cp "$CORE/Src/$1" "$TMP/su_tu.c" || return 1
+    cc -std=c11 -O0 -w -D"$2" $3 $INC -fstack-usage \
        -c "$TMP/su_tu.c" -o "$TMP/su_tu.o" 2>"$TMP/err" || return 1
-    mv "$TMP/su_tu.su" "$2" 2>/dev/null || return 1
+    mv "$TMP/su_tu.su" "$4" 2>/dev/null || return 1
 }
 
 frame_of() {        # $1 = .su file, $2 = function name
@@ -90,7 +90,7 @@ echo "stack budgets (periodic task: ${PERIODIC_STACK}B total, chain budget ${CHA
 for cfg in "off:" "CAN_DEBUG:-DTELEMATICS_CAN_DEBUG" "SPI_DEBUG:-DTELEMATICS_SPI_DEBUG"; do
     label=${cfg%%:*}; cflags=${cfg#*:}
     su="$TMP/stack_$label.su"
-    if ! measure_stack "$cflags" "$su"; then
+    if ! measure_stack ramn_telematics.c TARGET_ECUD "$cflags" "$su"; then
         echo "  [$label] could not measure stack usage -- skipped"; continue
     fi
     while IFS= read -r chain; do
@@ -114,6 +114,39 @@ for cfg in "off:" "CAN_DEBUG:-DTELEMATICS_CAN_DEBUG" "SPI_DEBUG:-DTELEMATICS_SPI
 $CHAINS
 EOF
 done
+
+# ECU A's image screen: SCREENIMAGE_ProcessRxCANMessage runs on the CAN RX task,
+# whose stack is also 1 KB (RAMN_ReceiveCANBuffer[256] in main.c). The 0x303 ACK
+# is built in its own function precisely so a second call site cannot grow that
+# handler's frame; this is what checks that it stayed that way.
+ECUA_CHAINS="SCREENIMAGE_ProcessRxCANMessage,SendImageAck
+SCREENIMAGE_Update"
+
+echo "stack budgets, ECU A image screen (CAN RX task: ${PERIODIC_STACK}B total)"
+su_a="$TMP/stack_ecua.su"
+if ! measure_stack ramn_screen_image.c TARGET_ECUA "" "$su_a"; then
+    echo "  could not measure stack usage -- skipped"
+else
+    while IFS= read -r chain; do
+        [ -z "$chain" ] && continue
+        total=0; missing=""; pretty=""
+        for fn in $(echo "$chain" | tr ',' ' '); do
+            u=$(frame_of "$su_a" "$fn")
+            if [ -z "$u" ]; then missing="$fn"; break; fi
+            total=$((total + u)); pretty="$pretty $fn($u)"
+        done
+        if [ -n "$missing" ]; then
+            echo "  [ecua] $missing: NOT FOUND -- renamed or removed?"; status=1
+        elif [ "$total" -gt "$CHAIN_BUDGET" ]; then
+            echo "  [ecua]$pretty = ${total}B > ${CHAIN_BUDGET}B -- WOULD OVERFLOW THE CAN RX TASK"
+            status=1
+        else
+            echo "  [ecua]$pretty = ${total}/${CHAIN_BUDGET}B ok"
+        fi
+    done <<EOF
+$ECUA_CHAINS
+EOF
+fi
 
 [ $status -eq 0 ] && echo "per-target link surface ok" || echo "PER-TARGET CHECK FAILED"
 exit $status

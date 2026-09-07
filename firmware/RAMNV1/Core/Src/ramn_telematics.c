@@ -166,6 +166,16 @@ static volatile RAMN_Bool_t kfAckPrintNeeded = False;
 static uint8_t              kfAckPayload[8]  = {0};
 static uint8_t              kfAckPayloadLen  = 0U;
 
+// Counted so the stats line answers "does ECU A ever reply" without depending
+// on catching a one-shot print. kfAckMissedCnt exists because the ACK WAIT IS
+// ROUTINELY CUT SHORT: the IMG_START handler sets streamState back to
+// KEYFRAME_ACTIVE with no guard, and the ESP32 sends keyframes about once a
+// second, well inside KF_ACK_TIMEOUT_MS (2 s). So KEYFRAME_SENT almost never
+// survives long enough for the timeout branch to run, and a missing ACK
+// produced no output at all -- neither an ACK line nor a timeout line.
+static volatile uint32_t kfAckRxCnt     = 0U;   // 0x303 frames received, ever
+static volatile uint32_t kfAckMissedCnt = 0U;   // keyframes whose ACK never came
+
 // Dynamic poll interval: SPI_POLL_INTERVAL_MS when idle, 1 ms when streaming
 static uint32_t currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
 
@@ -764,6 +774,12 @@ static void ProcessESP32Response(void)
 			uint8_t  xo = msg[9];
 			uint8_t  yo = msg[10];
 
+			// A new keyframe while the previous one is still waiting for its
+			// ACK means that ACK never arrived -- and the timeout branch in
+			// RAMN_TELEMATICS_Update will never run to say so, because this
+			// line is what stops it. Count it here instead.
+			if ((streamState == KEYFRAME_SENT) && (kfAckReceived == False)) kfAckMissedCnt++;
+
 			kfTotalChunks = ch;
 			kfChunksSent  = 0U;
 			kfXOffset     = xo;
@@ -1173,7 +1189,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, sizeof(buffer),
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -1187,7 +1203,9 @@ static void PrintSPIStats(void)
 		statsSnapshot.spiRxCANQueuedCnt,
 		statsSnapshot.spiRxCANQueueFailCnt,
 		canTxQueuePercent, 
-		streamState == STREAM_IDLE ? 0 : (streamState == KEYFRAME_ACTIVE ? 1 : 2)); // Stream state indicator;
+		streamState == STREAM_IDLE ? 0 : (streamState == KEYFRAME_ACTIVE ? 1 : 2), // Stream state indicator
+		kfAckRxCnt,
+		kfAckMissedCnt);
 
 	if (len > 0 && len < (int)sizeof(buffer))
 	{
@@ -1382,6 +1400,7 @@ void RAMN_TELEMATICS_ProcessImageACK(const FDCAN_RxHeaderTypeDef* pHeader,
 	for (uint8_t k = 0U; k < ackLen; k++) kfAckPayload[k] = (data != NULL) ? data[k] : 0U;
 	kfAckPayloadLen  = ackLen;
 	kfAckPrintNeeded = True;
+	kfAckRxCnt++;
 
 	if (streamState != KEYFRAME_SENT) return;
 	kfAckStatus   = (data != NULL) ? data[0] : 0xFFU;

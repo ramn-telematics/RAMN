@@ -300,6 +300,35 @@ static void case_odd_length_decode_is_not_lost(void)
 }
 
 
+static void case_img_start_is_acknowledged_on_the_bus(void)
+{
+    h_case_begin("IMG_START is acknowledged, not just IMG_END");
+    /* ECU A is silent by construction. Without a START ack, an ECU A that
+       receives 0x300 and never sees IMG_END looks exactly like one receiving
+       nothing at all -- which is the state this hardware was actually in:
+       no 0x303 of any kind ever reached ECU D. */
+    reset_state();
+    send_img_start(240, 240, 1, 100);
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL, "IMG_START alone produces a 0x303")) return;
+    CHECK(ack->len == 8, "carrying the 8-byte diagnostic payload");
+    CHECK(ack->data[0] == IMG_ACK_START, "tagged as the START stage, not a completion");
+    CHECK(ack->header.FDFormat == FDCAN_CLASSIC_CAN,
+          "classic CAN, so a non-FD listener on the bus can still see it");
+
+    /* And the END ack must still be distinguishable from it. */
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 101);
+    drain(102);
+    send_img_end(0x00, 103);
+
+    const CapturedFrame_t *endAck = last_ack();
+    if (!CHECK_OK(endAck != NULL, "IMG_END produces its own 0x303")) return;
+    CHECK(endAck->data[0] != IMG_ACK_START, "and it is not tagged as a START");
+    CHECK(endAck->data[0] == 0x00, "a clean keyframe reports status OK");
+}
+
 static void case_ack_reports_what_ecua_saw(void)
 {
     h_case_begin("the 0x303 ACK reports what ECU A actually decoded");
@@ -429,6 +458,7 @@ int main(void)
     case_a_split_block_across_frames();
     case_a_whole_keyframe();
     case_odd_length_decode_is_not_lost();
+    case_img_start_is_acknowledged_on_the_bus();
     case_ack_reports_what_ecua_saw();
     case_ack_counts_a_full_keyframe();
     case_ack_reports_a_ring_overflow();
