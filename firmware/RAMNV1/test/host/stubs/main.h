@@ -70,6 +70,31 @@ typedef struct {
              BitRateSwitch, FDFormat, TxEventFifoControl, MessageMarker;
 } FDCAN_TxHeaderTypeDef;
 
+/* FDCAN bus health, as read by PrintSPIStats. Only the fields the firmware
+   actually reads are modelled. hfdcan1 is an opaque handle here: the point of
+   the host build is the formatting and the stack cost, not the peripheral. */
+typedef struct {
+    uint32_t LastErrorCode;
+    uint32_t DataLastErrorCode;
+    uint32_t Activity;
+    uint32_t ErrorPassive;
+    uint32_t Warning;
+    uint32_t BusOff;
+} FDCAN_ProtocolStatusTypeDef;
+
+typedef struct {
+    uint32_t TxErrorCnt;
+    uint32_t RxErrorCnt;
+    uint32_t ErrorLogging;
+} FDCAN_ErrorCountersTypeDef;
+
+typedef struct { int dummy; } FDCAN_HandleTypeDef;
+extern FDCAN_HandleTypeDef hfdcan1;
+HAL_StatusTypeDef HAL_FDCAN_GetProtocolStatus(const FDCAN_HandleTypeDef *h,
+                                              FDCAN_ProtocolStatusTypeDef *s);
+HAL_StatusTypeDef HAL_FDCAN_GetErrorCounters(const FDCAN_HandleTypeDef *h,
+                                             FDCAN_ErrorCountersTypeDef *e);
+
 typedef struct {
     uint32_t Identifier, IdType, RxFrameType, DataLength, ErrorStateIndicator,
              BitRateSwitch, FDFormat, RxTimestamp, FilterIndex, IsFilterMatchingFrame;

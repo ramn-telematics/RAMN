@@ -75,6 +75,14 @@ static uint16_t kfFramesRx   = 0;   // 0x301 frames accepted into the ring
 static uint16_t kfRingDrops  = 0;   // 0x301 frames dropped: ring full
 static uint16_t kfStateDrops = 0;   // 0x301 frames dropped: not in KEYFRAME_RX
 
+// The previous keyframe's totals, captured just before IMG_START clears them.
+// The START ack is the one ECU D reliably receives, so it carries these: an END
+// ack that never arrives cannot report anything, and "nothing" is the case we
+// most need described.
+static uint32_t prevDecodedBytes = 0;
+static uint16_t prevFramesRx     = 0;
+static uint16_t prevRingDrops    = 0;
+
 // Screen hold state — mirrors the regcode pattern.
 // screenActive is the authoritative "stay on screen" flag.
 // It is set when a keyframe begins and cleared only on timeout or user navigation.
@@ -474,9 +482,14 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 // receiver can be told apart from one that gets IMG_START and never sees
 // IMG_END.
 //
-//   [0] stage/status : IMG_ACK_START (0x02) = 0x300 seen, keyframe begun
+//   [0] stage/status : IMG_ACK_START (0x02) = 0x300 seen, keyframe begun.
+//                            Bytes 2..6 then describe the PREVIOUS keyframe.
 //                      0x00 = keyframe complete and clean
 //                      0x01 = keyframe finished with a problem (see flags)
+//                      IMG_ACK_LATE (0x03) = 0x302 arrived but this ECU was not
+//                            in KEYFRAME_RX. Sent anyway: an unanswered IMG_END
+//                            and an IMG_END that never arrived are the same
+//                            silence otherwise, and they need different fixes.
 //   [1] flags        : bit0 truncated (a half-read RLE block at IMG_END)
 //                      bit1 chunks dropped, ring full
 //                      bit2 chunks dropped, wrong state
@@ -484,7 +497,10 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 //                      (a full 240x240 keyframe is 115,200)
 //   [5]              : 0x301 frames accepted                (saturating 255)
 //   [6]              : 0x301 frames dropped, ring full       (saturating)
-//   [7]              : 0x301 frames dropped, wrong state     (saturating)
+//   [7]              : FDCAN RX overruns since boot          (saturating)
+//                      -- frames the peripheral dropped before this module saw
+//                      them. 23 back-to-back 64-byte FD frames arrive in about
+//                      1.5 ms, so this is where a burst is lost if it is lost.
 //
 // Its own function so that a second call site does not grow
 // SCREENIMAGE_ProcessRxCANMessage's frame: that runs on the CAN RX task, whose
@@ -492,6 +508,7 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 // ============================================================================
 #define IMG_ACK_START  0x02U
 #define IMG_ACK_END    0x00U
+#define IMG_ACK_LATE   0x03U
 
 static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated)
 {
@@ -511,16 +528,25 @@ static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated
     if (kfRingDrops  != 0U)    flags |= 0x02U;
     if (kfStateDrops != 0U)    flags |= 0x04U;
 
+    // On a START ack the current counters are all zero by definition, so report
+    // the frame that just ended instead -- that is the interesting one.
+    uint32_t decoded = (stage == IMG_ACK_START) ? prevDecodedBytes : kfDecodedBytes;
+    uint16_t rx      = (stage == IMG_ACK_START) ? prevFramesRx     : kfFramesRx;
+    uint16_t drops   = (stage == IMG_ACK_START) ? prevRingDrops    : kfRingDrops;
+
+    uint32_t overrun = RAMN_FDCAN_Status.CANRxOverrunCnt;
+
     uint8_t ackData[8];
-    if (stage == IMG_ACK_START) ackData[0] = IMG_ACK_START;
+    if (stage == IMG_ACK_START)     ackData[0] = IMG_ACK_START;
+    else if (stage == IMG_ACK_LATE) ackData[0] = IMG_ACK_LATE;
     else ackData[0] = ((endStatus == 0x00U) && (flags == 0U)) ? 0x00U : 0x01U;
     ackData[1] = flags;
-    ackData[2] = (uint8_t)(kfDecodedBytes & 0xFFU);
-    ackData[3] = (uint8_t)((kfDecodedBytes >> 8) & 0xFFU);
-    ackData[4] = (uint8_t)((kfDecodedBytes >> 16) & 0xFFU);
-    ackData[5] = (kfFramesRx   > 255U) ? 255U : (uint8_t)kfFramesRx;
-    ackData[6] = (kfRingDrops  > 255U) ? 255U : (uint8_t)kfRingDrops;
-    ackData[7] = (kfStateDrops > 255U) ? 255U : (uint8_t)kfStateDrops;
+    ackData[2] = (uint8_t)(decoded & 0xFFU);
+    ackData[3] = (uint8_t)((decoded >> 8) & 0xFFU);
+    ackData[4] = (uint8_t)((decoded >> 16) & 0xFFU);
+    ackData[5] = (rx      > 255U) ? 255U : (uint8_t)rx;
+    ackData[6] = (drops   > 255U) ? 255U : (uint8_t)drops;
+    ackData[7] = (overrun > 255U) ? 255U : (uint8_t)overrun;
     RAMN_FDCAN_SendMessage(&ackHdr, ackData);
 }
 
@@ -551,6 +577,10 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // Clamp dimensions to physical screen size
         if (kfWidth  > (uint16_t)LCD_WIDTH)  kfWidth  = (uint16_t)LCD_WIDTH;
         if (kfHeight > (uint16_t)LCD_HEIGHT) kfHeight = (uint16_t)LCD_HEIGHT;
+
+        prevDecodedBytes  = kfDecodedBytes;
+        prevFramesRx      = kfFramesRx;
+        prevRingDrops     = kfRingDrops;
 
         kfDecodedBytes    = 0;
         kfFramesRx        = 0;
@@ -648,7 +678,15 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     // ---- 0x302: IMG_END ----
     if (id == IMG_CAN_ID_END)
     {
-        if (imgState != KEYFRAME_RX) return;
+        // Answer even when the keyframe is not open. Staying silent here makes
+        // "IMG_END never reached ECU A" and "IMG_END arrived but the keyframe
+        // had already been torn down" indistinguishable on the bus, and they
+        // are completely different faults.
+        if (imgState != KEYFRAME_RX)
+        {
+            SendImageAck(IMG_ACK_LATE, 0U, False);
+            return;
+        }
 
         uint8_t status = (dlcLen >= 5U) ? data[4] : 0xFFU;
 

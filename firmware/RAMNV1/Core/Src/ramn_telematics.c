@@ -1181,6 +1181,28 @@ static void PrintSPIStats(void)
 	SPI_PollState_t currentState = spiPollState;
 	taskEXIT_CRITICAL();
 
+	// FDCAN bus health. The image data frames (0x301) are the only traffic on
+	// this bus that uses BRS, so DLEC -- the DATA-phase error code -- is the
+	// direct answer to whether the fast phase works. LEC covers the arbitration
+	// phase. Both self-clear to 7 (NO_CHANGE) once read, so a nonzero value
+	// means an error since the last stats line, not a stale one.
+	FDCAN_ProtocolStatusTypeDef ps;
+	uint8_t lec = 7U, dlec = 7U, busoff = 0U, errpass = 0U;
+	if (HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps) == HAL_OK)
+	{
+		lec     = (uint8_t)ps.LastErrorCode;
+		dlec    = (uint8_t)ps.DataLastErrorCode;
+		busoff  = (uint8_t)ps.BusOff;
+		errpass = (uint8_t)ps.ErrorPassive;
+	}
+	FDCAN_ErrorCountersTypeDef ec;
+	uint8_t tec = 0U, rec = 0U;
+	if (HAL_FDCAN_GetErrorCounters(&hfdcan1, &ec) == HAL_OK)
+	{
+		tec = (uint8_t)ec.TxErrorCnt;
+		rec = (uint8_t)ec.RxErrorCnt;
+	}
+
 	// Get CAN TX queue usage
 	size_t canTxQueueUsed = xStreamBufferBytesAvailable(CANTxDataStreamBufferHandle);
 	size_t canTxQueueFree = xStreamBufferSpacesAvailable(CANTxDataStreamBufferHandle);
@@ -1193,7 +1215,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, bufferSize,
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -1209,7 +1231,9 @@ static void PrintSPIStats(void)
 		canTxQueuePercent, 
 		streamState == STREAM_IDLE ? 0 : (streamState == KEYFRAME_ACTIVE ? 1 : 2), // Stream state indicator
 		kfAckRxCnt,
-		kfAckMissedCnt);
+		kfAckMissedCnt,
+		tec, rec, lec, dlec, busoff, errpass,
+		RAMN_FDCAN_Status.CANRxOverrunCnt);
 
 	if (len > 0 && len < (int)bufferSize)
 	{

@@ -329,6 +329,72 @@ static void case_img_start_is_acknowledged_on_the_bus(void)
     CHECK(endAck->data[0] == 0x00, "a clean keyframe reports status OK");
 }
 
+static void case_img_end_is_always_answered(void)
+{
+    h_case_begin("IMG_END is answered even when no keyframe is open");
+    /* On hardware ECU D reached KEYFRAME_SENT -- so it DID put 0x302 on the bus
+       -- and ECU A never replied. Silence there has two completely different
+       causes with the same appearance: the frame never arrived, or it arrived
+       after the keyframe had been torn down. Answering unconditionally splits
+       them. */
+    reset_state();
+    imgState = IMG_IDLE;               /* no keyframe open */
+    send_img_end(0x00, 100);
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL, "an out-of-state IMG_END still produces a 0x303")) return;
+    CHECK(ack->data[0] == IMG_ACK_LATE, "tagged 0x03: arrived, but nothing was open");
+}
+
+static void case_start_ack_carries_the_previous_frame(void)
+{
+    h_case_begin("the START ack reports the keyframe that just ended");
+    /* The END ack is the one that goes missing, so it cannot be the only place
+       these numbers live. At IMG_START the current counters are all zero by
+       definition -- reporting them would say nothing. */
+    reset_state();
+    send_img_start(240, 240, 1, 100);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 101);
+    drain(102);
+    size_t firstFrameBytes = fake_screen_len;
+
+    fake_reset();                       /* forget the first frame's ACKs */
+    send_img_start(240, 240, 1, 200);   /* second keyframe */
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL && ack->len == 8, "the second START is acked")) return;
+    CHECK(ack->data[0] == IMG_ACK_START, "tagged as a START");
+    uint32_t decoded = (uint32_t)ack->data[2]
+                     | ((uint32_t)ack->data[3] << 8)
+                     | ((uint32_t)ack->data[4] << 16);
+    CHECK(decoded == firstFrameBytes, "and it reports the PREVIOUS frame's decoded bytes");
+    CHECK(ack->data[5] == 1, "and the previous frame's accepted chunk count");
+}
+
+static void case_ack_carries_the_can_rx_overrun_count(void)
+{
+    h_case_begin("the ACK carries ECU A's FDCAN RX overrun count");
+    /* 23 back-to-back 64-byte FD frames arrive in about 1.5 ms. If the
+       peripheral drops any, this module never sees them and every counter it
+       owns reads clean -- so the overrun count has to come from the driver, or
+       a lost burst is invisible. */
+    reset_state();
+    RAMN_FDCAN_Status.CANRxOverrunCnt = 9;
+    send_img_start(240, 240, 1, 100);
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL && ack->len == 8, "the START is acked")) return;
+    CHECK(ack->data[7] == 9, "byte 7 reports the driver's overrun count");
+
+    fake_reset();                                 /* also zeroes the fake driver counters */
+    RAMN_FDCAN_Status.CANRxOverrunCnt = 100000;   /* must not wrap into a small number */
+    send_img_start(240, 240, 1, 200);
+    const CapturedFrame_t *big = last_ack();
+    if (!CHECK_OK(big != NULL, "acked again")) return;
+    CHECK(big->data[7] == 255, "and saturates rather than wrapping");
+}
+
 static void case_ack_reports_what_ecua_saw(void)
 {
     h_case_begin("the 0x303 ACK reports what ECU A actually decoded");
@@ -488,6 +554,9 @@ int main(void)
     case_a_whole_keyframe();
     case_odd_length_decode_is_not_lost();
     case_img_start_is_acknowledged_on_the_bus();
+    case_img_end_is_always_answered();
+    case_start_ack_carries_the_previous_frame();
+    case_ack_carries_the_can_rx_overrun_count();
     case_ack_reports_what_ecua_saw();
     case_ack_counts_a_full_keyframe();
     case_the_ring_absorbs_a_whole_keyframe();

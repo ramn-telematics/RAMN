@@ -7,3 +7,6 @@ extern int             fake_can_tx_count;
 extern RAMN_Result_t   fake_can_tx_result;
 extern uint32_t        fake_tick;
 void fake_reset(void);
+
+extern FDCAN_ProtocolStatusTypeDef fake_can_status;
+extern FDCAN_ErrorCountersTypeDef  fake_can_errors;
