@@ -22,8 +22,14 @@ SRCS_A   := test_screen_image.c fakes_screen.c fakes.c harness.c
 # not defined here -- doing so shadows the project's own definition.
 CFLAGS_A := $(CFLAGS) -Wno-unused-but-set-variable
 
-.PHONY: all clean ecud ecua
-all: ecud ecua
+.PHONY: all clean ecud ecua targets
+all: ecud ecua targets
+
+# Catches what a host suite structurally cannot: a module that compiles and
+# passes every test here, then fails to LINK for a target that lacks the
+# symbols it references. See check_targets.sh.
+targets:
+	./check_targets.sh
 
 ecud: $(BIN)
 	./$(BIN)

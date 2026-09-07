@@ -34,6 +34,16 @@
 // Comment out to disable.
 #define SCREENIMAGE_DEBUG
 
+// RAMN_UART_SendFromTask is where this output goes, and ENABLE_UART is defined
+// for TARGET_ECUD only (see ramn_config.h). This screen module runs on ECU A, which
+// has no UART: the function is neither declared nor compiled there, so leaving
+// the flag on makes every debug call an implicit declaration that fails at
+// link. Turn the flag off where there is nothing to print to, rather than
+// wrapping each call site.
+#if defined(SCREENIMAGE_DEBUG) && !defined(ENABLE_UART)
+#undef SCREENIMAGE_DEBUG
+#endif
+
 volatile RAMN_Bool_t RAMN_SCREENIMAGE_DisplayRequested = False;
 
 // ============================================================================
@@ -514,9 +524,15 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         ackHdr.MessageMarker       = 0U;
         ackHdr.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
 
+        // A half-read block at IMG_END means the stream stopped mid-way -- a
+        // dropped 0x301 frame, or a sender that ended early. The pixels drawn
+        // so far are still valid, but the frame is incomplete, so say so in
+        // the ACK rather than reporting success on a partial image.
+        RAMN_Bool_t truncated = RLE_StreamMidBlock(&kfStream);
+
         uint8_t ackData[2];
-        ackData[0] = (status == 0x00U) ? 0x00U : 0x01U;
-        ackData[1] = 0x00U;
+        ackData[0] = ((status == 0x00U) && (truncated == False)) ? 0x00U : 0x01U;
+        ackData[1] = (truncated != False) ? 0x01U : 0x00U;   // 1 = stream truncated
         RAMN_FDCAN_SendMessage(&ackHdr, ackData);
 
         imgState = IMG_SHOWN;
@@ -525,8 +541,8 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         {
             char buf[64];
             int  len = snprintf(buf, sizeof(buf),
-                "IMG END: status=%u decoded=%u active=%d\r\n",
-                status, kfDecodedBytes, (int)screenActive);
+                "IMG END: status=%u decoded=%u active=%d trunc=%d\r\n",
+                status, kfDecodedBytes, (int)screenActive, (int)truncated);
             if (len > 0) RAMN_UART_SendFromTask((uint8_t*)buf, (uint32_t)len);
         }
 #endif

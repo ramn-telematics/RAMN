@@ -24,9 +24,22 @@
 // Comment out to disable.
 #define TELEMATICS_SPI_DEBUG
 
+// RAMN_UART_SendFromTask is where this output goes, and ENABLE_UART is defined
+// for TARGET_ECUD only (see ramn_config.h). This module is compiled for every target, including on ECU A, which
+// has no UART: the function is neither declared nor compiled there, so leaving
+// the flag on makes every debug call an implicit declaration that fails at
+// link. Turn the flag off where there is nothing to print to, rather than
+// wrapping each call site.
+#if defined(TELEMATICS_SPI_DEBUG) && !defined(ENABLE_UART)
+#undef TELEMATICS_SPI_DEBUG
+#endif
+
 // Define to enable UART debug output for all outgoing CAN messages.
 // Comment out to disable.
 //#define TELEMATICS_CAN_DEBUG
+#if defined(TELEMATICS_CAN_DEBUG) && !defined(ENABLE_UART)
+#undef TELEMATICS_CAN_DEBUG   // same reason as above; off today, guarded anyway
+#endif
 
 // External reference to CAN TX queue
 extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
