@@ -98,6 +98,10 @@ static void reset_state(void)
     tileAssemblyPos   = 0;
     tileReady         = False;
     fake_reset();
+    /* The activity timeout reads xTaskGetTickCount(), so the fake clock is part
+       of this module's state -- a case that leaves it advanced silently expires
+       the hold in every case after it. */
+    fake_tick = 0;
 }
 
 /* IMG_END as ECU D forwards it: 8 bytes, byte 4 = status. */
@@ -395,6 +399,34 @@ static void case_ack_carries_the_can_rx_overrun_count(void)
     CHECK(big->data[7] == 255, "and saturates rather than wrapping");
 }
 
+static void case_a_lagging_periodic_tick_does_not_dismiss(void)
+{
+    h_case_begin("a lagging periodic tick does not dismiss the screen");
+    /* The periodic task's xLastWakeTime falls permanently behind real time
+       whenever the loop overruns -- and writing a keyframe to the panel is
+       ~33 ms inside a 10 ms period, so it always does. lastActivityTick is
+       taken with xTaskGetTickCount() in the CAN RX task, so the subtraction
+       underflowed to ~4.29 billion and the 5 s hold expired instantly.
+
+       On hardware this tore the screen down mid-keyframe on EVERY frame:
+       imgState fell back to IMG_IDLE, the remaining chunks were rejected as
+       out-of-state, and IMG_END came back as st=3 with decoded=0. */
+    reset_state();
+    fake_tick = 10000;                       /* real time */
+    send_img_start(240, 240, 1, 10000);      /* lastActivityTick = 10000 */
+
+    SCREENIMAGE_Update(500);                 /* a badly lagging xLastWakeTime */
+
+    CHECK(screenActive != False, "the screen is still held");
+    CHECK(imgState == KEYFRAME_RX, "and the keyframe is still open");
+    CHECK(RAMN_SCREENIMAGE_DisplayRequested != False, "and still requested");
+
+    /* A real idle period must still dismiss it. */
+    fake_tick = 10000 + IMAGE_HOLD_MS + 1;
+    SCREENIMAGE_Update(600);
+    CHECK(screenActive == False, "but a genuine idle timeout still dismisses");
+}
+
 static void case_ack_reports_what_ecua_saw(void)
 {
     h_case_begin("the 0x303 ACK reports what ECU A actually decoded");
@@ -555,6 +587,7 @@ int main(void)
     case_odd_length_decode_is_not_lost();
     case_img_start_is_acknowledged_on_the_bus();
     case_img_end_is_always_answered();
+    case_a_lagging_periodic_tick_does_not_dismiss();
     case_start_ack_carries_the_previous_frame();
     case_ack_carries_the_can_rx_overrun_count();
     case_ack_reports_what_ecua_saw();

@@ -1843,7 +1843,15 @@ void RAMN_PeriodicTaskFunc(void *argument)
 #endif
 
 #ifdef ENABLE_SCREEN
-		RAMN_SCREENMANAGER_Update(xLastWakeTime);
+		// xTaskGetTickCount(), NOT xLastWakeTime. vTaskDelayUntil advances
+		// xLastWakeTime by exactly SIM_LOOP_CLOCK_MS per iteration, so when this
+		// loop overruns its period -- and writing a keyframe to the panel is
+		// ~115,200 bytes, about 33 ms inside a 10 ms period -- it falls
+		// permanently behind real time and never catches up. Screens compare it
+		// against timestamps taken with xTaskGetTickCount() in the CAN RX task,
+		// so the unsigned subtraction wrapped and every activity timeout fired
+		// immediately. That tore the image screen down mid-keyframe.
+		RAMN_SCREENMANAGER_Update(xTaskGetTickCount());
 #endif
 
 		vTaskDelayUntil(&xLastWakeTime, SIM_LOOP_CLOCK_MS);

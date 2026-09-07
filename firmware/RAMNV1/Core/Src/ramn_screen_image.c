@@ -448,7 +448,28 @@ static void SCREENIMAGE_Update(uint32_t tick)
     }
 
     // ---- Timeout: hold screen for IMAGE_HOLD_MS after last activity, then dismiss ----
-    if (screenActive && (tick - lastActivityTick) > IMAGE_HOLD_MS)
+    //
+    // TWO DIFFERENT CLOCKS used to meet here, and the mismatch dismissed the
+    // screen on the first update of every keyframe.
+    //
+    // lastActivityTick comes from the CAN RX task as xTaskGetTickCount() -- real
+    // time now. The `tick` argument is the periodic task's xLastWakeTime, which
+    // vTaskDelayUntil advances by exactly SIM_LOOP_CLOCK_MS per iteration. Writing
+    // a keyframe to the panel is ~115,200 bytes, about 33 ms inside a 10 ms
+    // period, so that loop overruns hard and xLastWakeTime falls PERMANENTLY
+    // behind real time -- it never catches up.
+    //
+    // Once it lags at all, `tick` is less than lastActivityTick, the unsigned
+    // subtraction wraps to ~4.29 billion, and the comparison against 5,000 is
+    // always true. The screen was torn down mid-keyframe on every frame: Deinit
+    // set imgState back to IMG_IDLE, every remaining chunk was rejected as
+    // out-of-state, and IMG_END came back as an IMG_ACK_LATE with decoded=0.
+    //
+    // Read the same clock the activity timestamp was taken from, and compare as
+    // a SIGNED difference so a lagging or wrapped tick can never dismiss.
+    uint32_t nowTick   = (uint32_t)xTaskGetTickCount();
+    int32_t  sinceLast = (int32_t)(nowTick - lastActivityTick);
+    if (screenActive && (sinceLast > (int32_t)IMAGE_HOLD_MS))
     {
         screenActive                   = False;
         imgState                       = IMG_IDLE;
