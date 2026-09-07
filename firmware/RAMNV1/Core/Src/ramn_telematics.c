@@ -502,6 +502,31 @@ static void SendImageCANFrame(uint32_t canId, uint32_t dlc,
 //   TYPE 0x11 : DELTA_FRAME_END signals end of one delta frame
 // Empty response: LEN=2, [0xCC][0x00][CHK]
 // ============================================================================
+/* Byte count -> FDCAN DLC enum.
+ *
+ * The DLC byte on the SPI link is a BYTE COUNT (0-64). This HAL's DataLength
+ * is an ENUM (FDCAN_DLC_BYTES_64 == 0x0F), and RAMN_FDCAN_SendMessage calls
+ * DLCtoUINT8 on it to recover the count. Assigning the wire's byte count
+ * straight into DataLength therefore made the send path index a sixteen-entry
+ * table with a number up to 64 -- an out-of-bounds read 48 bytes past
+ * DlcToUint8convTable for a full CAN FD frame.
+ *
+ * It went unnoticed because below 9 the enum and the byte count are the same
+ * number, and almost all real traffic is DLC <= 8.
+ *
+ * Sizes CAN FD cannot express (9, 10, 11, 13, 14, 15, 17-19, ...) return 0xFF
+ * so the caller can refuse them. Rounding up would put bytes on the bus that
+ * the sender never wrote; rounding down would truncate.
+ */
+static uint8_t ByteCountToDLC(uint8_t bytes)
+{
+	for (uint8_t enumVal = 0U; enumVal < 16U; enumVal++)
+	{
+		if (DLCtoUINT8(enumVal) == bytes) return enumVal;
+	}
+	return 0xFFU;
+}
+
 static void ProcessESP32Response(void)
 {
 	uint8_t* rxBuf  = processRxBuffer;
@@ -602,23 +627,50 @@ static void ProcessESP32Response(void)
 #endif
 
 		// ------------------------------------------------------------------
-		// TYPE 0x00: CAN forward — relay as classic CAN to the bus
-		// Format: [LEN][0xCC][0x00][ID3][ID2][ID1][ID0][DLC][FLAGS][DATA...][CHK]
+		// CAN forward — relay as classic CAN to the bus
+		// Format: [LEN][0xCC][ID3][ID2][ID1][ID0][DLC][FLAGS][DATA...][CHK]
+		//
+		// A CAN poll response carries NO type byte. Byte 2 is ID[31:24], and
+		// that is exactly why every type code sits at or above 0x20: an
+		// extended identifier caps at 0x1FFFFFFF, so byte 2 of a CAN frame
+		// never exceeds RAMN_MAX_ID_HIGH_BYTE. Testing `<=` against that
+		// ceiling is the dispatch rule, and it is what makes byte 2
+		// self-describing.
+		//
+		// This branch used to require byte 2 == 0x00 and read every field one
+		// position later, as though a type byte were present. Two failures
+		// followed, both seen on hardware:
+		//
+		//   every field shifted by one -- ID 0x100 with DLC 8 was read as
+		//   identifier 0x00010008, which the HAL truncates to 0x008, and the
+		//   misread FLAGS byte set the remote bit, so the frame went out
+		//   empty. Every cansend from the UI appeared as ID 0x008, no payload.
+		//
+		//   extended identifiers above 0x00FFFFFF have a nonzero byte 2, so
+		//   they matched no branch at all and were dropped silently. J1939
+		//   traffic (0x18FEE000 and friends) never reached the bus.
 		// ------------------------------------------------------------------
-		if (msgType == 0x00U)
+		if (msgType <= RAMN_MAX_ID_HIGH_BYTE)
 		{
-			if (msgLen < 9U) { spiStats.spiRxInvalidCnt++; continue; }
+			/* MSGLEN counts marker + ID(4) + DLC + FLAGS + CHK = 8, plus the
+			 * payload. A zero-payload frame -- any remote frame, or DLC 0 --
+			 * is exactly 8. */
+			if (msgLen < 8U) { spiStats.spiRxInvalidCnt++; continue; }
 
-			uint32_t canId = ((uint32_t)msg[3] << 24) | ((uint32_t)msg[4] << 16) |
-			                 ((uint32_t)msg[5] << 8)  |  (uint32_t)msg[6];
-			uint8_t dlc   = msg[7];
-			uint8_t flags = msg[8];
+			uint32_t canId = ((uint32_t)msg[2] << 24) | ((uint32_t)msg[3] << 16) |
+			                 ((uint32_t)msg[4] << 8)  |  (uint32_t)msg[5];
+			uint8_t dlc   = msg[6];
+			uint8_t flags = msg[7];
+
+			/* The wire carries a byte count; DataLength is an enum. */
+			uint8_t dlcEnum = ByteCountToDLC(dlc);
+			if (dlcEnum == 0xFFU) { spiStats.spiRxInvalidCnt++; continue; }
 
 			FDCAN_TxHeaderTypeDef h;
 			h.Identifier          = canId;
 			h.IdType              = (flags & 0x01U) ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
 			h.TxFrameType         = (flags & 0x02U) ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
-			h.DataLength          = dlc;
+			h.DataLength          = dlcEnum;
 			h.BitRateSwitch       = FDCAN_BRS_OFF;
 			h.FDFormat            = FDCAN_CLASSIC_CAN;
 			h.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
@@ -627,10 +679,17 @@ static void ProcessESP32Response(void)
 
 			uint8_t data[64];
 			RAMN_memset(data, 0, sizeof(data));
-			uint8_t payLen = DLCtoUINT8(dlc);
-			uint8_t maxPay = (msgLen >= 9U) ? (msgLen - 8U) : 0U;
+			/* The DLC byte on this link is a BYTE COUNT (0-64), not an
+			 * FDCAN DLC enum. DLCtoUINT8 indexes a sixteen-entry table, so
+			 * feeding it a byte count reads out of bounds for anything above
+			 * 8 -- a 64-byte CAN FD payload indexed 48 bytes past the end of
+			 * DlcToUint8convTable. It went unnoticed because for 0-8 the enum
+			 * and the byte count are the same number, and real traffic is
+			 * almost all DLC <= 8. */
+			uint8_t payLen = (dlc > CAN_MAX_PAYLOAD_BYTES) ? CAN_MAX_PAYLOAD_BYTES : dlc;
+			uint8_t maxPay = (msgLen >= 8U) ? (msgLen - 8U) : 0U;
 			if (payLen > maxPay) payLen = maxPay;
-			for (uint8_t k = 0U; k < payLen; k++) data[k] = msg[9U + k];
+			for (uint8_t k = 0U; k < payLen; k++) data[k] = msg[8U + k];
 
 			RAMN_Result_t fwdResult = RAMN_FDCAN_SendMessage(&h, data);
 			if (fwdResult == RAMN_OK) spiStats.spiRxCANQueuedCnt++;
@@ -654,10 +713,10 @@ static void ProcessESP32Response(void)
 		}
 
 		// ------------------------------------------------------------------
-		// TYPE 0x01: IMG_START — start of a keyframe
-		// Format: [0x0A][0xCC][0x01][W_HI][W_LO][H_HI][H_LO][CH_HI][CH_LO][X_OFF][Y_OFF][CHK]
+		// TYPE 0x81: IMG_START — start of a keyframe
+		// Format: [0x0A][0xCC][0x81][W_HI][W_LO][H_HI][H_LO][CH_HI][CH_LO][X_OFF][Y_OFF][CHK]
 		// ------------------------------------------------------------------
-		if (msgType == 0x01U)
+		if (msgType == RAMN_MSG_TYPE_IMG_START)
 		{
 			if (msgLen < 10U) { spiStats.spiRxInvalidCnt++; continue; }
 
@@ -695,10 +754,10 @@ static void ProcessESP32Response(void)
 		}
 
 		// ------------------------------------------------------------------
-		// TYPE 0x02: IMG_CHUNK — keyframe RLE pixel data
-		// Format: [LEN][0xCC][0x02][SEQ_HI][SEQ_LO][PAYLOAD_LEN][RLE...][CHK]
+		// TYPE 0x82: IMG_CHUNK — keyframe RLE pixel data
+		// Format: [LEN][0xCC][0x82][SEQ_HI][SEQ_LO][PAYLOAD_LEN][RLE...][CHK]
 		// ------------------------------------------------------------------
-		if (msgType == 0x02U)
+		if (msgType == RAMN_MSG_TYPE_IMG_CHUNK)
 		{
 			if (streamState != KEYFRAME_ACTIVE) continue;
 			if (msgLen < 5U) { spiStats.spiRxInvalidCnt++; continue; }
@@ -737,10 +796,10 @@ static void ProcessESP32Response(void)
 		}
 
 		// ------------------------------------------------------------------
-		// TYPE 0x03: IMG_END — keyframe complete
-		// Format: [0x03][0xCC][0x03][CHK]
+		// TYPE 0x83: IMG_END — keyframe complete
+		// Format: [0x83][0xCC][0x83][CHK]
 		// ------------------------------------------------------------------
-		if (msgType == 0x03U)
+		if (msgType == RAMN_MSG_TYPE_IMG_END)
 		{
 			if (streamState != KEYFRAME_ACTIVE) continue;
 
@@ -760,9 +819,9 @@ static void ProcessESP32Response(void)
 		}
 
 		// ------------------------------------------------------------------
-		// TYPE 0x04: IMG_ABORT — abort current keyframe
+		// TYPE 0x84: IMG_ABORT — abort current keyframe
 		// ------------------------------------------------------------------
-		if (msgType == 0x04U)
+		if (msgType == RAMN_MSG_TYPE_IMG_ABORT)
 		{
 			if (streamState == KEYFRAME_ACTIVE || streamState == KEYFRAME_SENT)
 			{
@@ -777,10 +836,10 @@ static void ProcessESP32Response(void)
 		}
 
 		// ------------------------------------------------------------------
-		// TYPE 0x10: DELTA_FRAME — one RLE chunk of a dirty tile
+		// TYPE 0x90: DELTA_FRAME — one RLE chunk of a dirty tile
 		// Format: [LEN][0xCC][0x10][TILE_X][TILE_Y][TILE_SIZE][CHUNK_SEQ][PAYLOAD_LEN][RLE...][CHK]
 		// ------------------------------------------------------------------
-		if (msgType == 0x10U)
+		if (msgType == RAMN_MSG_TYPE_DELTA_FRAME)
 		{
 			if (msgLen < 7U) { spiStats.spiRxInvalidCnt++; continue; }
 
@@ -831,10 +890,10 @@ static void ProcessESP32Response(void)
 		}
 
 		// ------------------------------------------------------------------
-		// TYPE 0x11: DELTA_FRAME_END — end of one delta frame
+		// TYPE 0x91: DELTA_FRAME_END — end of one delta frame
 		// Format: [0x04][0xCC][0x11][TILE_COUNT][CHK]
 		// ------------------------------------------------------------------
-		if (msgType == 0x11U)
+		if (msgType == RAMN_MSG_TYPE_DELTA_FRAME_END)
 		{
 			// Forward 0x306 DELTA_FRAME_END
 			uint8_t canData[4];

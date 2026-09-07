@@ -211,6 +211,12 @@ uint16_t convertUint32ToBytes(uint8_t *data, uint16_t dataSize, uint32_t n)
 
 uint8_t DLCtoUINT8(uint32_t dlc_enum)
 {
+	/* The table has sixteen entries and a DLC enum is four bits. Callers that
+	 * pass a byte count instead of an enum used to index far past the end --
+	 * a 64-byte CAN FD frame read 48 bytes beyond it. Clamp rather than
+	 * invoke undefined behaviour; a caller handing this a byte count has a
+	 * bug either way, and 0 is the safe answer. */
+	if (dlc_enum > 15U) return 0U;
 	return DlcToUint8convTable[(uint8_t)(dlc_enum)];
 }
 

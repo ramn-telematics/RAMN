@@ -33,7 +33,9 @@ RAMN_Result_t RAMN_FDCAN_SendMessage(const FDCAN_TxHeaderTypeDef* h, const uint8
 
 /* ramn_utils, copied verbatim from ramn_utils.c */
 static const uint8_t DlcToUint8convTable[] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
-uint8_t  DLCtoUINT8(uint32_t e) { return DlcToUint8convTable[(uint8_t)e]; }
+/* Mirrors the bounds guard in ramn_utils.c. A fake that is more permissive
+   than the real thing hides the bug it is standing in for. */
+uint8_t  DLCtoUINT8(uint32_t e) { return (e > 15U) ? 0U : DlcToUint8convTable[(uint8_t)e]; }
 uint32_t UINT8toDLC(uint8_t dlc) { return dlc; }
 void RAMN_memset(void* dst, uint8_t b, uint32_t n) { memset(dst, b, n); }
 

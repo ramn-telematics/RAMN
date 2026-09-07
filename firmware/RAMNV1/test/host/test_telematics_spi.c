@@ -17,6 +17,7 @@
 #include "harness.h"
 #include "fakes.h"
 #include "ramn_telematics.c"
+#include "conformance_shared.h"
 
 /* ------------------------------------------------------------------ */
 /* Fixture builders -- the wire format, expressed once                  */
@@ -63,6 +64,10 @@ static void feed(const uint8_t *bytes, size_t n)
     ProcessESP32Response();
 }
 
+/* The conformance cases live in test_conformance.c but cannot include
+   ramn_telematics.c a second time, so they drive the decoder through this. */
+void conf_feed(const uint8_t *bytes, size_t n) { feed(bytes, n); }
+
 /* ------------------------------------------------------------------ */
 /* Cases                                                               */
 /* ------------------------------------------------------------------ */
@@ -85,36 +90,34 @@ static void case_standard_can_frame(void)
 
     /* A frame IS forwarded today -- it is the CONTENTS that are wrong,
        because the ESP32 omits the TYPE byte the decoder expects at msg[2]
-       and every field lands one byte late. */
+       and every field lands one byte late. Fixed: byte 2 is ID[31:24] and
+       the dispatch tests it against the identifier ceiling. */
     CHECK(fake_can_tx_count == 1, "exactly one frame forwarded");
     if (fake_can_tx_count != 1) return;
 
     CapturedFrame_t *c = &fake_can_tx[0];
-    CHECK_BUG(c->header.Identifier == 0x100, "CAN ID is 0x100",
-              "reads 0x00010008 -- the HAL truncates that to 0x008 on the bus");
+    CHECK(c->header.Identifier == 0x100, "CAN ID is 0x100");
     CHECK(c->header.IdType == FDCAN_STANDARD_ID, "standard ID");
-    CHECK_BUG(c->header.TxFrameType == FDCAN_DATA_FRAME, "data frame, not remote",
-              "FLAGS is read from a payload byte");
-    CHECK_BUG(c->len == 8, "DLC 8", NULL);
-    CHECK_BUG(memcmp(c->data, payload, 8) == 0, "payload intact", NULL);
+    CHECK(c->header.TxFrameType == FDCAN_DATA_FRAME, "data frame, not remote");
+    CHECK(c->len == 8, "DLC 8");
+    CHECK(memcmp(c->data, payload, 8) == 0, "payload intact");
 }
 
 static void case_extended_id_does_not_alias_a_message_type(void)
 {
     h_case_begin("extended ID 0x01ABCDEF is CAN data, not IMG_START");
     /* msg[2] is ID[31:24] on a CAN frame. Extended IDs reach 0x1FFFFFFF, so
-       that byte spans 0x00-0x1F -- which currently overlaps every image type
-       code (0x01,0x02,0x03,0x04,0x10,0x11). Moving the type codes above 0x1F
-       makes byte 2 self-describing and fixes this by construction. */
+       that byte spans 0x00-0x1F. The image type codes used to live in that
+       range (0x01,0x02,0x03,0x04,0x10,0x11) and this frame was dispatched as
+       IMG_START. They now start at 0x81, above the ceiling, so byte 2 is
+       self-describing and this holds by construction rather than by luck. */
     const uint8_t payload[2] = {0xAA, 0xBB};
     uint8_t f[80];
     feed(f, build_can_response(f, 0x01ABCDEF, payload, 2, 0x01));
 
-    CHECK_BUG(fake_can_tx_count == 1 &&
-              fake_can_tx[0].header.Identifier == 0x01ABCDEF,
-              "extended ID forwarded unchanged",
-              "dispatched as IMG_START and emitted CAN 0x300 instead;"
-              " ~19% of the extended ID space aliases a type code.");
+    CHECK(fake_can_tx_count == 1 &&
+          fake_can_tx[0].header.Identifier == 0x01ABCDEF,
+          "extended ID forwarded unchanged");
 }
 
 static void case_zero_payload_frames_are_legal(void)
@@ -122,13 +125,12 @@ static void case_zero_payload_frames_are_legal(void)
     h_case_begin("remote frame (DLC 0) is forwarded, not dropped");
     /* A CAN remote frame carries no payload, so it is always the minimum-size
        frame. The guard must not be one byte too strict -- the same off-by-one
-       that cost the ESP32 every remote frame (deviation D-1). */
+       that cost the ESP32 every remote frame (deviation D-1). It was `< 9U`
+       here, which assumed a type byte that a CAN response never carries. */
     uint8_t f[80];
     feed(f, build_can_response(f, 0x200, NULL, 0, 0x02));
 
-    CHECK_BUG(fake_can_tx_count == 1, "remote frame forwarded",
-              "`if (msgLen < 9U)` rejects it; the minimum CAN response is"
-              " msgLen == 8, so the guard should be < 8.");
+    CHECK(fake_can_tx_count == 1, "remote frame forwarded");
 }
 
 static void case_short_and_malformed_are_rejected(void)
@@ -163,6 +165,9 @@ int main(void)
     case_extended_id_does_not_alias_a_message_type();
     case_zero_payload_frames_are_legal();
     case_short_and_malformed_are_rejected();
+
+    printf("\n-- against the golden vectors from ramn-protocol --\n");
+    conformance_cases();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);

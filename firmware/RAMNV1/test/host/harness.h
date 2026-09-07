@@ -20,3 +20,9 @@ void h_report(int ok, int is_bug, const char *msg, const char *note,
 
 #define CHECK_BUG(cond, msg, note) \
     h_report((cond) ? 1 : 0, 1, (msg), (note), __FILE__, __LINE__)
+
+/* CHECK, but yields the result so a loop can skip the assertions that would
+ * only cascade from it. Reporting eight failures for one missing frame buries
+ * the one that matters. */
+#define CHECK_OK(cond, msg) \
+    (h_report((cond) ? 1 : 0, 0, (msg), NULL, __FILE__, __LINE__), (cond) ? 1 : 0)

@@ -1,5 +1,7 @@
 #pragma once
 #include "main.h"
+/* The real type codes, not a copy of them. */
+#include "ramn_msg_types.h"
 void RAMN_TELEMATICS_Init(uint32_t tick);
 void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick);
 void RAMN_TELEMATICS_Update(uint32_t tick);

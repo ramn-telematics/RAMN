@@ -12,7 +12,7 @@ CFLAGS   := -std=c11 -g -O0 -Wall -Wextra \
             -DTELEMATICS_HAS_STREAM_STATE \
             -Istubs -I. -I$(CORE)/Inc -I$(CORE)/Src
 BIN      := run_tests
-SRCS     := test_telematics_spi.c fakes.c harness.c
+SRCS     := test_telematics_spi.c test_conformance.c fakes.c harness.c
 
 .PHONY: all clean
 all: $(BIN)
