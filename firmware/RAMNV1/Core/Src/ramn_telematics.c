@@ -138,6 +138,28 @@ static uint32_t    lastDeltaActivityTick  = 0;
 static volatile RAMN_Bool_t kfAckReceived = False;
 static volatile uint8_t     kfAckStatus   = 0x00U;
 
+// UART scratch buffers.
+//
+// These are static, not locals, because every one of them is written on the
+// periodic task, whose ENTIRE stack is 1 KB (RAMN_PeriodicBuffer[256] in
+// main.c), down a chain whose frames are live at once:
+//   RAMN_TELEMATICS_Update -> ProcessESP32Response -> SendImageCANFrame
+// As locals they cost ~300 bytes of that stack. Two of them declared inline in
+// RAMN_TELEMATICS_Update already overflowed the task once and left ECU D
+// unresponsive -- FreeRTOS detects the overflow (configCHECK_FOR_STACK_OVERFLOW
+// is 2) but vApplicationStackOverflowHook is empty, so it returns into a
+// corrupted task. Keeping them off the stack is also what makes
+// TELEMATICS_CAN_DEBUG safe to switch on.
+//
+// Safe to share: one task writes them, and RAMN_UART_SendFromTask copies into
+// a stream buffer before it returns.
+#ifdef ENABLE_UART
+static char imgAckPrintBuf[128];
+#endif
+#if defined(TELEMATICS_SPI_DEBUG) || defined(TELEMATICS_CAN_DEBUG)
+static char telemDbgBuf[96];
+#endif
+
 // Last 0x303 ACK payload from ECU A, verbatim, waiting to be printed by the
 // periodic task. See RAMN_TELEMATICS_ProcessImageACK for the byte layout.
 static volatile RAMN_Bool_t kfAckPrintNeeded = False;
@@ -496,8 +518,7 @@ static void SendImageCANFrame(uint32_t canId, uint32_t dlc,
 	{
 		uint8_t payLen = DLCtoUINT8(dlc);
 		// Print first 8 bytes of payload in one shot — same style as SPI debug
-		char canBuf[96];
-		int  canLen = snprintf(canBuf, sizeof(canBuf),
+		int  canLen = snprintf(telemDbgBuf, sizeof(telemDbgBuf),
 		    "CAN TX: ID=0x%03lX BRS=%d len=%u %s | %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 		    (unsigned long)canId, (int)(brs == True), payLen,
 		    (result == RAMN_OK) ? "OK" : "FAIL",
@@ -505,7 +526,7 @@ static void SendImageCANFrame(uint32_t canId, uint32_t dlc,
 		    (payLen > 2U) ? data[2] : 0U, (payLen > 3U) ? data[3] : 0U,
 		    (payLen > 4U) ? data[4] : 0U, (payLen > 5U) ? data[5] : 0U,
 		    (payLen > 6U) ? data[6] : 0U, (payLen > 7U) ? data[7] : 0U);
-		if (canLen > 0) RAMN_UART_SendFromTask((uint8_t*)canBuf, (uint32_t)canLen);
+		if (canLen > 0) RAMN_UART_SendFromTask((uint8_t*)telemDbgBuf, (uint32_t)canLen);
 	}
 #endif
 }
@@ -555,15 +576,14 @@ static void ProcessESP32Response(void)
 
 #ifdef TELEMATICS_SPI_DEBUG
 	// Print first 16 raw bytes of every poll response
-	char dbgBuf[80];
-	int  dbgLen = snprintf(dbgBuf, sizeof(dbgBuf),
+	int  dbgLen = snprintf(telemDbgBuf, sizeof(telemDbgBuf),
 	    "SPI RX: %02X %02X %02X %02X %02X %02X %02X %02X "
 	             "%02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 	    rxBuf[0],  rxBuf[1],  rxBuf[2],  rxBuf[3],
 	    rxBuf[4],  rxBuf[5],  rxBuf[6],  rxBuf[7],
 	    rxBuf[8],  rxBuf[9],  rxBuf[10], rxBuf[11],
 	    rxBuf[12], rxBuf[13], rxBuf[14], rxBuf[15]);
-	if (dbgLen > 0) RAMN_UART_SendFromTask((uint8_t*)dbgBuf, (uint32_t)dbgLen);
+	if (dbgLen > 0) RAMN_UART_SendFromTask((uint8_t*)telemDbgBuf, (uint32_t)dbgLen);
 #endif
 
 	for (int msgNum = 0; msgNum < 2; msgNum++)
@@ -626,11 +646,10 @@ static void ProcessESP32Response(void)
 		{
 			spiStats.spiRxChecksumErrorCnt++;
 #ifdef TELEMATICS_SPI_DEBUG
-			char chkBuf[64];
-			int  chkLen = snprintf(chkBuf, sizeof(chkBuf),
+			int  chkLen = snprintf(telemDbgBuf, sizeof(telemDbgBuf),
 			    "SPI: chk fail at %u len=%u residue=0x%02X\r\n",
 			    respStart, msgLen, chk);
-			if (chkLen > 0) RAMN_UART_SendFromTask((uint8_t*)chkBuf, (uint32_t)chkLen);
+			if (chkLen > 0) RAMN_UART_SendFromTask((uint8_t*)telemDbgBuf, (uint32_t)chkLen);
 #endif
 			continue;
 		}
@@ -639,11 +658,10 @@ static void ProcessESP32Response(void)
 
 #ifdef TELEMATICS_SPI_DEBUG
 		{
-			char typeBuf[48];
-			int  typeLen = snprintf(typeBuf, sizeof(typeBuf),
+			int  typeLen = snprintf(telemDbgBuf, sizeof(telemDbgBuf),
 			    "SPI: msg%d at %u len=%u type=0x%02X\r\n",
 			    msgNum, respStart, msgLen, msgType);
-			if (typeLen > 0) RAMN_UART_SendFromTask((uint8_t*)typeBuf, (uint32_t)typeLen);
+			if (typeLen > 0) RAMN_UART_SendFromTask((uint8_t*)telemDbgBuf, (uint32_t)typeLen);
 		}
 #endif
 
@@ -718,8 +736,7 @@ static void ProcessESP32Response(void)
 
 #ifdef TELEMATICS_CAN_DEBUG
 			{
-				char canBuf[96];
-				int  canLen = snprintf(canBuf, sizeof(canBuf),
+				int  canLen = snprintf(telemDbgBuf, sizeof(telemDbgBuf),
 				    "CAN TX: ID=0x%03lX BRS=0 len=%u %s | %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 				    (unsigned long)canId, payLen,
 				    (fwdResult == RAMN_OK) ? "OK" : "FAIL",
@@ -727,7 +744,7 @@ static void ProcessESP32Response(void)
 				    (payLen > 2U) ? data[2] : 0U, (payLen > 3U) ? data[3] : 0U,
 				    (payLen > 4U) ? data[4] : 0U, (payLen > 5U) ? data[5] : 0U,
 				    (payLen > 6U) ? data[6] : 0U, (payLen > 7U) ? data[7] : 0U);
-				if (canLen > 0) RAMN_UART_SendFromTask((uint8_t*)canBuf, (uint32_t)canLen);
+				if (canLen > 0) RAMN_UART_SendFromTask((uint8_t*)telemDbgBuf, (uint32_t)canLen);
 			}
 #endif
 			continue;
@@ -1092,9 +1109,6 @@ void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, c
 // task and RAMN_UART_SendFromTask copies into a stream buffer before it
 // returns, so sharing the buffer between them is safe.
 // ============================================================================
-#ifdef ENABLE_UART
-static char imgAckPrintBuf[128];
-#endif
 
 static void PrintImageACK(void)
 {
