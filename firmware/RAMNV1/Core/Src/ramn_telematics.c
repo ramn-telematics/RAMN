@@ -203,6 +203,8 @@ static void FlushSPIBuffer(void);
 static RAMN_Bool_t RequestESP32Poll(void);
 static void ProcessESP32Response(void);
 static void PrintSPIStats(void);
+static void PrintImageACK(void);
+static void PrintImageACKTimeout(void);
 
 // ============================================================================
 // INITIALIZATION
@@ -1073,6 +1075,66 @@ void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, c
 // Prints detailed SPI transmission and polling statistics over UART
 // Called periodically to monitor CAN-to-SPI bridge performance
 // ============================================================================
+// ============================================================================
+// IMAGE ACK REPORTING
+//
+// These print from RAMN_TELEMATICS_Update, which runs on the periodic task.
+// That task's whole stack is 1 KB -- RAMN_PeriodicBuffer[256] in main.c -- and
+// PrintSPIStats already puts a ~600-byte frame on it. Two char buffers declared
+// inline in RAMN_TELEMATICS_Update grew its frame from 32 to 224 bytes, and
+// with PrintSPIStats' frame live underneath it that overflowed the task.
+// configCHECK_FOR_STACK_OVERFLOW is 2, so FreeRTOS detected it -- and
+// vApplicationStackOverflowHook is empty, so it returned into a corrupted
+// task and ECU D went dead on hardware.
+//
+// So: one static buffer, not a local, and a separate frame that is never live
+// at the same time as PrintSPIStats'. Both printers run only on the periodic
+// task and RAMN_UART_SendFromTask copies into a stream buffer before it
+// returns, so sharing the buffer between them is safe.
+// ============================================================================
+#ifdef ENABLE_UART
+static char imgAckPrintBuf[128];
+#endif
+
+static void PrintImageACK(void)
+{
+#ifdef ENABLE_UART
+	if (kfAckPrintNeeded == False) return;
+	kfAckPrintNeeded = False;
+
+	int len;
+	if (kfAckPayloadLen >= 8U)
+	{
+		uint32_t decoded = (uint32_t)kfAckPayload[2]
+		                 | ((uint32_t)kfAckPayload[3] << 8)
+		                 | ((uint32_t)kfAckPayload[4] << 16);
+		len = snprintf(imgAckPrintBuf, sizeof(imgAckPrintBuf),
+		    "ECUA ACK: st=%u flags=0x%02X decoded=%lu/115200 rx=%u drop=%u/%u (sent %u)\r\n",
+		    kfAckPayload[0], kfAckPayload[1], (unsigned long)decoded,
+		    kfAckPayload[5], kfAckPayload[6], kfAckPayload[7], kfChunksSent);
+	}
+	else
+	{
+		// A short ACK means ECU A predates the diagnostic payload -- say so
+		// rather than printing nothing.
+		len = snprintf(imgAckPrintBuf, sizeof(imgAckPrintBuf),
+		    "ECUA ACK: len=%u st=%u (no diagnostics -- old ECU A build?)\r\n",
+		    kfAckPayloadLen, (kfAckPayloadLen > 0U) ? kfAckPayload[0] : 0xFFU);
+	}
+	if (len > 0) RAMN_UART_SendFromTask((uint8_t*)imgAckPrintBuf, (uint32_t)len);
+#endif
+}
+
+static void PrintImageACKTimeout(void)
+{
+#ifdef ENABLE_UART
+	int len = snprintf(imgAckPrintBuf, sizeof(imgAckPrintBuf),
+	    "ECUA ACK: TIMEOUT after %ums (sent %u chunks)\r\n",
+	    (unsigned)KF_ACK_TIMEOUT_MS, kfChunksSent);
+	if (len > 0) RAMN_UART_SendFromTask((uint8_t*)imgAckPrintBuf, (uint32_t)len);
+#endif
+}
+
 static void PrintSPIStats(void)
 {
 #ifdef ENABLE_UART
@@ -1236,36 +1298,8 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 	// IMAGE STREAM STATE MANAGEMENT
 	// ========================================================================
 
-	// Report the last ACK from ECU A. This is the only telemetry ECU A can
-	// produce, so it is printed on every ACK rather than only on failure.
-#ifdef ENABLE_UART
-	if (kfAckPrintNeeded != False)
-	{
-		kfAckPrintNeeded = False;
-		if (kfAckPayloadLen >= 8U)
-		{
-			uint32_t decoded = (uint32_t)kfAckPayload[2]
-			                 | ((uint32_t)kfAckPayload[3] << 8)
-			                 | ((uint32_t)kfAckPayload[4] << 16);
-			char ackBuf[128];
-			int  ackLen = snprintf(ackBuf, sizeof(ackBuf),
-			    "ECUA ACK: st=%u flags=0x%02X decoded=%lu/115200 rx=%u ringdrop=%u statedrop=%u (sent %u)\r\n",
-			    kfAckPayload[0], kfAckPayload[1], (unsigned long)decoded,
-			    kfAckPayload[5], kfAckPayload[6], kfAckPayload[7], kfChunksSent);
-			if (ackLen > 0) RAMN_UART_SendFromTask((uint8_t*)ackBuf, (uint32_t)ackLen);
-		}
-		else
-		{
-			// A short ACK means ECU A is running firmware older than the
-			// diagnostic payload -- say so instead of printing nothing.
-			char ackBuf[80];
-			int  ackLen = snprintf(ackBuf, sizeof(ackBuf),
-			    "ECUA ACK: len=%u st=%u (no diagnostics -- old ECU A firmware?)\r\n",
-			    kfAckPayloadLen, (kfAckPayloadLen > 0U) ? kfAckPayload[0] : 0xFFU);
-			if (ackLen > 0) RAMN_UART_SendFromTask((uint8_t*)ackBuf, (uint32_t)ackLen);
-		}
-	}
-#endif
+	// Report the last ACK from ECU A -- the only telemetry ECU A can produce.
+	PrintImageACK();
 
 	// KEYFRAME_SENT: wait for ACK from ECU A (0x303), timeout after 2 s
 	if (streamState == KEYFRAME_SENT)
@@ -1280,15 +1314,7 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 		{
 			// ACK timed out — give up and return to idle. Say so: silence here
 			// and silence from a healthy ECU A look identical on the wire.
-#ifdef ENABLE_UART
-			{
-				char toBuf[80];
-				int  toLen = snprintf(toBuf, sizeof(toBuf),
-				    "ECUA ACK: TIMEOUT after %ums (sent %u chunks)\r\n",
-				    (unsigned)KF_ACK_TIMEOUT_MS, kfChunksSent);
-				if (toLen > 0) RAMN_UART_SendFromTask((uint8_t*)toBuf, (uint32_t)toLen);
-			}
-#endif
+			PrintImageACKTimeout();
 			streamState           = STREAM_IDLE;
 			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
 		}

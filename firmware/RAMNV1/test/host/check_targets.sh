@@ -39,5 +39,58 @@ for target in TARGET_ECUA TARGET_ECUB TARGET_ECUC TARGET_ECUD; do
     done
 done
 
+# ---------------------------------------------------------------------------
+# Stack budget check.
+#
+# The periodic task's ENTIRE stack is 1 KB -- RAMN_PeriodicBuffer[256] in
+# main.c -- and RAMN_TELEMATICS_Update runs on it, with PrintSPIStats' ~600
+# byte frame live underneath. Two char buffers declared inline in
+# RAMN_TELEMATICS_Update took its own frame from 32 to 224 bytes; that
+# overflowed the task and ECU D went dead on hardware. configCHECK_FOR_STACK_
+# OVERFLOW is 2 so FreeRTOS detected it, but vApplicationStackOverflowHook is
+# empty, so it returned into a corrupted task and simply stopped responding.
+#
+# Nothing in a host suite catches that: the code compiles, links, and passes
+# every functional test. So measure the frames instead. Budgets are per
+# function, sized to the deepest call chain that runs on the periodic task:
+# a caller's frame stays live while its callee runs, so caller + callee must
+# leave room for the FreeRTOS context and everything else on that task.
+#
+# Frames are x86-64, not ARM, so these numbers are not the real stack cost --
+# they are a REGRESSION signal. Adding a buffer shows up here the same way it
+# shows up on target. If a budget genuinely needs to rise, raise it in the
+# same commit that justifies it.
+# ---------------------------------------------------------------------------
+echo "stack budgets (periodic task total: 1024 bytes)"
+
+# function:max_frame_bytes -- hot-path functions on the 1 KB periodic task
+BUDGETS="RAMN_TELEMATICS_Update:64 PrintImageACK:128 PrintImageACKTimeout:64"
+
+su_out="$TMP/stack.su"
+if cp "$CORE/Src/ramn_telematics.c" "$TMP/su_tu.c" && \
+   cc -std=c11 -O0 -w -DTARGET_ECUD $INC -fstack-usage \
+      -c "$TMP/su_tu.c" -o "$TMP/su_tu.o" 2>"$TMP/err"; then
+    mv "$TMP/su_tu.su" "$su_out" 2>/dev/null || true
+fi
+
+if [ ! -s "$su_out" ]; then
+    echo "  could not measure stack usage (compiler lacks -fstack-usage?) -- skipped"
+else
+    for b in $BUDGETS; do
+        fn=${b%%:*}; budget=${b##*:}
+        used=$(awk -F'\t' -v f=":$fn" '$1 ~ (f "$") {print $2}' "$su_out" | head -1)
+        if [ -z "$used" ]; then
+            echo "  $fn: NOT FOUND in stack usage output -- renamed or removed?"
+            status=1
+        elif [ "$used" -gt "$budget" ]; then
+            echo "  $fn: $used bytes > budget $budget -- THIS IS WHAT KILLED ECU D"
+            echo "      move large buffers to static, or into their own function"
+            status=1
+        else
+            echo "  $fn: $used/$budget bytes ok"
+        fi
+    done
+fi
+
 [ $status -eq 0 ] && echo "per-target link surface ok" || echo "PER-TARGET CHECK FAILED"
 exit $status
