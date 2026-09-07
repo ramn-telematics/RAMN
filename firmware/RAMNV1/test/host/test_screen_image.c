@@ -400,6 +400,35 @@ static void case_ack_counts_a_full_keyframe(void)
     CHECK(decoded == 240u * 240u * 2u, "and it reports all 115,200 bytes, not 115,200 mod 65,536");
 }
 
+static void case_the_ring_absorbs_a_whole_keyframe(void)
+{
+    h_case_begin("the ring absorbs a keyframe arriving faster than it drains");
+    /* The producer and consumer are not rate-matched. ECU D polls the ESP32
+       every 1 ms while streaming and each poll yields two chunks (~2 CAN
+       frames/ms), while SCREENIMAGE_Update drains on the 10 ms periodic task
+       and a full panel write is ~33 ms. So a whole keyframe lands before the
+       first drain finishes, and the ring has to hold it.
+
+       At 8 entries this dropped over half of every keyframe -- and because the
+       RLE stream is continuous, a dropped chunk desynchronises every byte
+       after it, so the screen showed nothing rather than a partial image. */
+    reset_state();
+
+    const uint16_t chunks = 45;   /* the upper end of what this canvas produces */
+    send_img_start(240, 240, chunks, 500);
+
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};   /* one run of two pixels */
+    for (uint16_t i = 0; i < chunks; i++)
+        send_img_data(i, payload, sizeof payload, 501);   /* no drain in between */
+
+    CHECK(kfRingDrops == 0, "a whole keyframe arrives with nothing dropped");
+    CHECK(kfFramesRx == chunks, "every chunk was accepted");
+
+    drain(502);
+    CHECK(fake_screen_len == (size_t)chunks * 4u,
+          "and every chunk's pixels reach the panel once drained");
+}
+
 static void case_ack_reports_a_ring_overflow(void)
 {
     h_case_begin("chunks dropped by a full ring are reported, not silent");
@@ -461,6 +490,7 @@ int main(void)
     case_img_start_is_acknowledged_on_the_bus();
     case_ack_reports_what_ecua_saw();
     case_ack_counts_a_full_keyframe();
+    case_the_ring_absorbs_a_whole_keyframe();
     case_ack_reports_a_ring_overflow();
     case_ack_reports_wrong_state_drops();
 

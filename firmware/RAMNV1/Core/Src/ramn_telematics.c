@@ -155,6 +155,7 @@ static volatile uint8_t     kfAckStatus   = 0x00U;
 // a stream buffer before it returns.
 #ifdef ENABLE_UART
 static char imgAckPrintBuf[128];
+static char spiStatsPrintBuf[288];
 #endif
 #if defined(TELEMATICS_SPI_DEBUG) || defined(TELEMATICS_CAN_DEBUG)
 static char telemDbgBuf[96];
@@ -1168,7 +1169,10 @@ static void PrintImageACKTimeout(void)
 static void PrintSPIStats(void)
 {
 #ifdef ENABLE_UART
-	char buffer[256];  // Reduced buffer size
+	// Static for the same reason as imgAckPrintBuf: this is the deepest UART
+	// frame on the periodic task's 1 KB stack, and the stats line only grows.
+	char *buffer = spiStatsPrintBuf;
+	const size_t bufferSize = sizeof(spiStatsPrintBuf);
 	int len;
 
 	// Capture stats atomically to prevent corruption during printing
@@ -1188,7 +1192,7 @@ static void PrintSPIStats(void)
 	const char* stateName = (currentState <= SPI_POLL_TIMEOUT) ? stateNames[currentState] : "UNK";
 
 	// Print compact stats on single line to reduce UART load
-	len = snprintf(buffer, sizeof(buffer),
+	len = snprintf(buffer, bufferSize,
 		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
@@ -1207,7 +1211,7 @@ static void PrintSPIStats(void)
 		kfAckRxCnt,
 		kfAckMissedCnt);
 
-	if (len > 0 && len < (int)sizeof(buffer))
+	if (len > 0 && len < (int)bufferSize)
 	{
 		RAMN_UART_SendFromTask((uint8_t*)buffer, (uint32_t)len);
 	}

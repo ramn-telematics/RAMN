@@ -93,7 +93,26 @@ static uint32_t lastActivityTick = 0;
 // Single-producer (ReceiveCAN task) / single-consumer (Periodic Update task).
 // No mutex needed; __DMB() barriers ensure correct ordering.
 // ============================================================================
-#define KFRING_ENTRIES   8
+// Sized to absorb a whole keyframe's burst, because the producer is far faster
+// than the consumer and the two are not rate-matched:
+//
+//   arrival  ECU D polls the ESP32 every 1 ms while streaming and each poll
+//            yields two chunks, so ~2 frames/ms -- a 25-chunk keyframe lands in
+//            roughly 13 ms.
+//   drain    SCREENIMAGE_Update runs on the periodic task every 10 ms, and
+//            writing a full frame to the panel is ~115,200 bytes at ~27 MHz,
+//            about 33 ms.
+//
+// At 8 entries (7 usable) that dropped well over half of every keyframe. A
+// dropped chunk is not a local hole: the RLE stream is one continuous stream,
+// so losing one desynchronises every byte after it AND shifts the panel's
+// auto-increment position, which is why a partly-received keyframe shows as
+// nothing recognisable rather than a partial image.
+//
+// 64 entries covers the 25-45 chunk keyframes this canvas produces. A less
+// compressible image can still overflow it -- that is what the ring-drop count
+// in the 0x303 ACK is for.
+#define KFRING_ENTRIES   64
 #define KFRING_PAYLOAD  62    // bytes per IMG_DATA frame (62 bytes of RLE payload)
 
 typedef struct {
