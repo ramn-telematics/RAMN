@@ -625,7 +625,18 @@ static void ProcessESP32Response(void)
 	if (dbgLen > 0) RAMN_UART_SendFromTask((uint8_t*)telemDbgBuf, (uint32_t)dbgLen);
 #endif
 
-	for (int msgNum = 0; msgNum < 2; msgNum++)
+	// Messages parsed out of one poll response.
+	//
+	// This was a hardcoded 2, sized to the old 160-byte transaction that held
+	// exactly two image chunks. Growing the transaction to 512 -- seven chunks --
+	// therefore changed nothing at all: ECU D still read the first two and threw
+	// the other five away without a word. The bound has to follow the buffer, or
+	// the buffer size is a number that only looks like it does something.
+	//
+	// The smallest possible message is 4 bytes ([LEN][0xCC][TYPE][CHK]), so this
+	// is the real ceiling; the loop stops early as soon as no further marker is
+	// found.
+	for (int msgNum = 0; msgNum < (int)(SPI_TRANSACTION_SIZE / 4); msgNum++)
 	{
 		// Scan from current offset for a 0xCC marker preceded by a valid LEN byte
 		RAMN_Bool_t found     = False;
