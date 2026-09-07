@@ -14,6 +14,7 @@
 uint8_t  fake_screen[FAKE_SCREEN_MAX];
 size_t   fake_screen_len;
 int      fake_screen_writes;
+int      fake_screen_odd_drops;
 int      fake_window_opens;
 uint16_t fake_window_w, fake_window_h;
 
@@ -22,12 +23,18 @@ void fake_screen_reset(void)
     memset(fake_screen, 0, sizeof(fake_screen));
     fake_screen_len = 0;
     fake_screen_writes = 0;
+    fake_screen_odd_drops = 0;
     fake_window_opens = 0;
     fake_window_w = fake_window_h = 0;
 }
 
 void RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len)
 {
+    /* Mirrors the real RAMN_SPI_WriteImageChunk in ramn_spi.c, which drops
+       zero-length and ODD-length writes on the floor and returns. A fake more
+       permissive than the thing it stands in for hides exactly the bug it
+       exists to catch -- this one hid a blank screen. */
+    if (len == 0U || (len & 1U)) { fake_screen_odd_drops++; return; }
     fake_screen_writes++;
     if (fake_screen_len + len > FAKE_SCREEN_MAX) len = (uint16_t)(FAKE_SCREEN_MAX - fake_screen_len);
     memcpy(&fake_screen[fake_screen_len], data, len);

@@ -240,6 +240,39 @@ static void case_a_whole_keyframe(void)
     CHECK(memcmp(fake_screen, raw, sizeof raw) == 0, "and every pixel is the right one");
 }
 
+static void case_odd_length_decode_is_not_lost(void)
+{
+    h_case_begin("a chunk decoding to an odd length still reaches the panel");
+    /* Straight from a real keyframe: the stream opens with a 1-byte literal,
+       so decoded lengths pass through odd values. RAMN_SPI_WriteImageChunk
+       DISCARDS an odd-length write outright -- byte stream to us, pixels to
+       the ST7789 -- so handing it one loses the whole chunk in silence. This
+       is what a blank screen looked like on hardware.
+
+       payload: 00 00   literal, one byte     -> 1 byte  (odd)
+                84 FFFF run of 5 pixels       -> 10      (11, odd)
+                81 0000 run of 2 pixels       -> 4       (15, odd) */
+    reset_state();
+    send_img_start(240, 240, 2, 100);
+
+    const uint8_t first[]  = {0x00, 0x00, 0x84, 0xFF, 0xFF, 0x81, 0x00, 0x00};
+    const uint8_t second[] = {0x00, 0x11};      /* a literal byte to pair the tail */
+    send_img_data(0, first, sizeof first, 101);
+    drain(102);
+    send_img_data(1, second, sizeof second, 103);
+    drain(104);
+
+    /* 1 + 10 + 4 = 15 from the first chunk, then 1 more: 16 bytes, all of it. */
+    CHECK(fake_screen_odd_drops == 0, "nothing was dropped for being odd-length");
+    CHECK(fake_screen_len == 16, "every decoded byte reached the panel");
+    if (fake_screen_len >= 15) {
+        const uint8_t want[15] = {0x00,
+                                  0xFF,0xFF, 0xFF,0xFF, 0xFF,0xFF, 0xFF,0xFF, 0xFF,0xFF,
+                                  0x00,0x00, 0x00,0x00};
+        CHECK(memcmp(fake_screen, want, 15) == 0, "and in the right order");
+    }
+}
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -251,6 +284,7 @@ int main(void)
     case_real_len_past_the_frame_is_clamped();
     case_a_split_block_across_frames();
     case_a_whole_keyframe();
+    case_odd_length_decode_is_not_lost();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);

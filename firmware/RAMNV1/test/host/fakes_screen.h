@@ -9,6 +9,7 @@
 extern uint8_t  fake_screen[FAKE_SCREEN_MAX];
 extern size_t   fake_screen_len;      /* bytes written to the panel */
 extern int      fake_screen_writes;   /* number of WriteImageChunk calls */
+extern int      fake_screen_odd_drops; /* writes the real SPI layer would drop */
 extern int      fake_window_opens;
 extern uint16_t fake_window_w, fake_window_h;
 

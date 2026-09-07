@@ -132,6 +132,11 @@ static uint16_t tilePendingH    = 0;
 #define KF_DECODE_BUF_SIZE  5440U
 static uint8_t kfDecodeBuf[KF_DECODE_BUF_SIZE];
 
+// One byte of a pixel whose partner has not been decoded yet. The panel only
+// accepts whole pixels, so an odd tail waits here for the next chunk.
+static uint8_t         kfCarryByte  = 0;
+static volatile RAMN_Bool_t kfCarryValid = False;
+
 // ============================================================================
 // RLE DECODER
 // ============================================================================
@@ -322,6 +327,7 @@ static void SCREENIMAGE_Deinit(void)
 
     imgState        = IMG_IDLE;
     RLE_StreamReset(&kfStream);
+    kfCarryValid    = False;
     kfRingWriteIdx  = 0;
     kfRingReadIdx   = 0;
     kfDecodedBytes  = 0;
@@ -353,11 +359,29 @@ static void SCREENIMAGE_Update(uint32_t tick)
             // straddles the frame boundary; decoding each frame on its own
             // silently loses every such block, and on a real keyframe most
             // boundaries have one.
+            // A byte held back from the previous chunk goes out in front of
+            // this one, so the panel always receives whole pixels.
+            uint16_t off = 0U;
+            if (kfCarryValid != False) { kfDecodeBuf[0] = kfCarryByte; off = 1U; }
+
             uint16_t decodedLen = RLE_DecodeStream(&kfStream, entry->data, entry->len,
-                                                   kfDecodeBuf, KF_DECODE_BUF_SIZE);
-            // An odd count is now normal, not a fault: a literal can end mid
-            // pixel and its second byte arrives with the next frame. The panel
-            // takes a byte stream, and the stream as a whole stays aligned.
+                                                   &kfDecodeBuf[off],
+                                                   (uint16_t)(KF_DECODE_BUF_SIZE - off));
+            decodedLen = (uint16_t)(decodedLen + off);
+            kfCarryValid = False;
+
+            // RAMN_SPI_WriteImageChunk DISCARDS an odd-length write outright --
+            // it is a byte stream to us but pixels to the ST7789. A literal can
+            // end mid-pixel, so odd lengths are normal here and handing one over
+            // loses the whole chunk in silence. Hold the trailing byte back and
+            // send it with the next one instead.
+            if (decodedLen & 1U)
+            {
+                kfCarryByte  = kfDecodeBuf[decodedLen - 1U];
+                kfCarryValid = True;
+                decodedLen--;
+            }
+
             if (decodedLen > 0U)
             {
                 RAMN_SPI_WriteImageChunk(kfDecodeBuf, decodedLen);
@@ -436,6 +460,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         kfRingWriteIdx    = 0;
         kfRingReadIdx     = 0;
         RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
+        kfCarryValid   = False;
         tileAssemblyPos   = 0;
         tileReady         = False;
 
