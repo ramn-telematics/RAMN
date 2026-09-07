@@ -1,3 +1,4 @@
 # Built by `make`; rebuilt from source in seconds and platform-specific.
 run_tests
 run_tests_ecua
+.control/
