@@ -123,9 +123,20 @@ static uint32_t lastActivityTick = 0;
 #define KFRING_ENTRIES   64
 #define KFRING_PAYLOAD  62    // bytes per IMG_DATA frame (62 bytes of RLE payload)
 
+// Delta tile chunks go through THIS ring too, rather than a staging slot of
+// their own. One queue, one consumer, and the decode happens where the SPI
+// writes happen -- which is what makes streaming decode possible at all.
+#define KFRING_KIND_IMG   0U   // keyframe chunk  (0x301)
+#define KFRING_KIND_TILE  1U   // delta tile chunk (0x305)
+
 typedef struct {
     uint8_t data[KFRING_PAYLOAD];
     uint8_t len;
+    uint8_t kind;
+    uint8_t tileX;      // tile fields are meaningful only for KFRING_KIND_TILE
+    uint8_t tileY;
+    uint8_t tileSize;
+    uint8_t tileSeq;
 } KFRingEntry_t;
 
 static KFRingEntry_t        kfRingBuf[KFRING_ENTRIES];
@@ -145,6 +156,13 @@ static uint8_t curTileX    = 0;
 static uint8_t curTileY    = 0;
 static uint8_t curTileSize = 0;   // pixel width/height: 8, 16, or 40
 
+// Counts tile chunks refused before they reach the ring: an impossible size, a
+// tile that would hang off the edge of the panel, or a length that disagrees
+// with the frame it arrived in.
+static uint16_t kfTileDrops = 0;
+// Tiles whose chunks stopped arriving before the tile was complete.
+static uint16_t kfTileShort = 0;
+
 // ============================================================================
 // DEFERRED SPI WORK — set by ProcessRxCANMessage (CAN RX task), consumed by
 // Update (Periodic task). SPI functions block on ulTaskNotifyTake and must
@@ -158,14 +176,11 @@ static uint8_t  kfPendingYOff = 0;
 static uint16_t kfPendingW    = 0;
 static uint16_t kfPendingH    = 0;
 
-// Delta tile: a fully assembled tile waiting to be written to the display
-static volatile RAMN_Bool_t tileReady = False;
-static uint8_t  tileStagingBuf[TILE_RAW_MAX];
-static uint16_t tileStagingLen  = 0;
-static uint16_t tilePendingX    = 0;
-static uint16_t tilePendingY    = 0;
-static uint16_t tilePendingW    = 0;
-static uint16_t tilePendingH    = 0;
+// Delta tiles are assembled and written by Update straight out of the ring, so
+// there is no staging copy and no single slot to overflow. The old design
+// staged one finished tile at a time and dropped any tile that arrived while
+// the previous one was still waiting for the 10 ms periodic task -- which is
+// most of a delta frame.
 
 // Static decode buffer for keyframe ring-buffer drain — avoids large stack frame.
 // Worst case: one run carried in from the previous frame (128 px = 256 bytes),
@@ -221,6 +236,14 @@ typedef struct {
 } RleStream_t;
 
 static RleStream_t kfStream;
+
+// A delta tile is one RLE stream cut into 59-byte chunks by ECU D, exactly as a
+// keyframe is cut into 61-byte ones. A 40x40 tile is 3,200 raw bytes and needs
+// up to ~55 chunks, so blocks straddle chunk boundaries constantly. Decoding
+// each chunk on its own -- which is what this module used to do -- loses every
+// block that spans a boundary, silently. Same defect as the keyframe path had,
+// same fix: carry the partial block across.
+static RleStream_t tileStream;
 
 static void RLE_StreamReset(RleStream_t* s)
 {
@@ -378,7 +401,9 @@ static void SCREENIMAGE_Deinit(void)
     kfStateDrops    = 0;
     tileAssemblyPos = 0;
     kfWindowNeeded  = False;
-    tileReady       = False;
+    kfTileDrops     = 0;
+    kfTileShort     = 0;
+    RLE_StreamReset(&tileStream);
 }
 
 static void SCREENIMAGE_Update(uint32_t tick)
@@ -398,6 +423,51 @@ static void SCREENIMAGE_Update(uint32_t tick)
         while (ri != kfRingWriteIdx)
         {
             KFRingEntry_t* entry = &kfRingBuf[ri];
+
+            if (entry->kind == KFRING_KIND_TILE)
+            {
+                // First chunk of a tile: latch its geometry and start a fresh
+                // RLE stream. Bit 7 of the sequence marks the last chunk.
+                if ((entry->tileSeq & 0x7FU) == 0U)
+                {
+                    curTileX    = entry->tileX;
+                    curTileY    = entry->tileY;
+                    curTileSize = entry->tileSize;
+                    tileAssemblyPos = 0U;
+                    RLE_StreamReset(&tileStream);
+                }
+
+                uint16_t room = (uint16_t)(TILE_RAW_MAX - tileAssemblyPos);
+                uint16_t got  = RLE_DecodeStream(&tileStream, entry->data, entry->len,
+                                                 &tileAssemblyBuf[tileAssemblyPos], room);
+                tileAssemblyPos = (uint16_t)(tileAssemblyPos + got);
+
+                if (entry->tileSeq & 0x80U)
+                {
+                    uint16_t w    = (uint16_t)curTileSize;
+                    uint16_t need = (uint16_t)(w * w * 2U);
+                    if (tileAssemblyPos >= need)
+                    {
+                        RAMN_SPI_OpenImageWindow((uint16_t)((uint16_t)curTileX * 8U),
+                                                 (uint16_t)((uint16_t)curTileY * 8U), w, w);
+                        RAMN_SPI_WriteImageChunk(tileAssemblyBuf, need);
+                        kfDecodedBytes += need;
+                    }
+                    else if (kfTileShort < 0xFFFFU)
+                    {
+                        // Chunks stopped before the tile was whole. Writing a
+                        // partial tile would shift every row inside it, so the
+                        // tile is left as it was and the miss is counted.
+                        kfTileShort++;
+                    }
+                    tileAssemblyPos = 0U;
+                }
+
+                ri = (ri + 1U) % KFRING_ENTRIES;
+                __DMB();
+                kfRingReadIdx = ri;
+                continue;
+            }
 
             // Decode into static buffer — avoids large stack frame and ensures
             // sufficient capacity. RLE_DecodeStream carries a block that
@@ -437,14 +507,6 @@ static void SCREENIMAGE_Update(uint32_t tick)
             __DMB();
             kfRingReadIdx = ri;
         }
-    }
-
-    // ---- Write completed delta tile (deferred from DELTA_TILE_CHUNK handler) ----
-    if (tileReady != False)
-    {
-        tileReady = False;
-        RAMN_SPI_OpenImageWindow(tilePendingX, tilePendingY, tilePendingW, tilePendingH);
-        RAMN_SPI_WriteImageChunk(tileStagingBuf, tileStagingLen);
     }
 
     // ---- Timeout: hold screen for IMAGE_HOLD_MS after last activity, then dismiss ----
@@ -612,7 +674,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
         kfCarryValid   = False;
         tileAssemblyPos   = 0;
-        tileReady         = False;
+        RLE_StreamReset(&tileStream);
 
         imgState                       = KEYFRAME_RX;
         RAMN_SCREENIMAGE_DisplayRequested = True;
@@ -688,7 +750,8 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         KFRingEntry_t* entry = &kfRingBuf[wi];
         for (uint8_t i = 0U; i < payLen; i++)
             entry->data[i] = data[3U + i];
-        entry->len = payLen;
+        entry->len  = payLen;
+        entry->kind = KFRING_KIND_IMG;
         if (kfFramesRx < 0xFFFFU) kfFramesRx++;
 
         __DMB();
@@ -749,7 +812,11 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     // ---- 0x305: DELTA_TILE_CHUNK ----
     if (id == DELTA_CAN_ID_TILE_CHUNK)
     {
-        if (imgState != IMG_SHOWN) return;
+        if (imgState != IMG_SHOWN)
+        {
+            if (kfStateDrops < 0xFFFFU) kfStateDrops++;
+            return;
+        }
         if (dlcLen < 5U) return;
 
         uint8_t tileX    = data[0];
@@ -758,60 +825,53 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         uint8_t chunkSeq = data[3];
         uint8_t payLen   = data[4];
 
-        // Basic validation
-        if (tileX > 29U || tileY > 29U) return;
-        if (tileSize != 8U && tileSize != 16U && tileSize != 40U) return;
-        if (payLen == 0U || (5U + payLen) > dlcLen) return;
-
-        // First chunk of a new tile: reset assembly buffer and record tile coords
-        if ((chunkSeq & 0x7FU) == 0U)
+        // Geometry is validated here and REJECTED, not clamped. Tile
+        // coordinates are on an 8-pixel grid while tileSize is the extent, so a
+        // 40-wide tile at tileX=29 starts at x=232 and hangs 32 pixels off the
+        // panel. Clamping the window to what fits and then writing the tile's
+        // bytes into it shifts every row inside the tile -- a corrupt tile drawn
+        // confidently. A tile that does not fit is not a tile.
+        if ((tileSize != 8U) && (tileSize != 16U) && (tileSize != 40U))
         {
-            curTileX        = tileX;
-            curTileY        = tileY;
-            curTileSize     = tileSize;
-            tileAssemblyPos = 0U;
+            if (kfTileDrops < 0xFFFFU) kfTileDrops++;
+            return;
+        }
+        if ((((uint16_t)tileX * 8U) + tileSize) > (uint16_t)LCD_WIDTH ||
+            (((uint16_t)tileY * 8U) + tileSize) > (uint16_t)LCD_HEIGHT)
+        {
+            if (kfTileDrops < 0xFFFFU) kfTileDrops++;
+            return;
+        }
+        if ((payLen == 0U) || ((uint16_t)(5U + payLen) > (uint16_t)dlcLen))
+        {
+            if (kfTileDrops < 0xFFFFU) kfTileDrops++;
+            return;
+        }
+        if (payLen > KFRING_PAYLOAD) payLen = KFRING_PAYLOAD;
+
+        // Straight into the shared ring: decoding happens in Update, where the
+        // SPI writes happen, so a tile's RLE stream can be carried across chunk
+        // boundaries and no tile is dropped waiting for a staging slot.
+        uint8_t wi      = kfRingWriteIdx;
+        uint8_t next_wi = (uint8_t)((wi + 1U) % KFRING_ENTRIES);
+        if (next_wi == kfRingReadIdx)
+        {
+            if (kfRingDrops < 0xFFFFU) kfRingDrops++;
+            return;
         }
 
-        // RLE-decode this chunk's payload into the assembly buffer
-        uint16_t decoded = RLE_Decode(&data[5], payLen,
-                                       tileAssemblyBuf + tileAssemblyPos,
-                                       (uint16_t)(TILE_RAW_MAX - tileAssemblyPos));
-        tileAssemblyPos = (uint16_t)(tileAssemblyPos + decoded);
+        KFRingEntry_t* entry = &kfRingBuf[wi];
+        for (uint8_t i = 0U; i < payLen; i++) entry->data[i] = data[5U + i];
+        entry->len      = payLen;
+        entry->kind     = KFRING_KIND_TILE;
+        entry->tileX    = tileX;
+        entry->tileY    = tileY;
+        entry->tileSize = tileSize;
+        entry->tileSeq  = chunkSeq;
+        if (kfFramesRx < 0xFFFFU) kfFramesRx++;
 
-        // Last-chunk flag (bit 7 of chunkSeq) — stage tile for Update() to write to screen.
-        if (chunkSeq & 0x80U)
-        {
-            uint16_t px = (uint16_t)((uint16_t)curTileX * 8U);
-            uint16_t py = (uint16_t)((uint16_t)curTileY * 8U);
-            uint16_t pw = (uint16_t)curTileSize;
-            uint16_t ph = (uint16_t)curTileSize;
-
-            // Clamp to screen boundaries
-            if (px + pw > (uint16_t)LCD_WIDTH)  pw = (uint16_t)LCD_WIDTH  - px;
-            if (py + ph > (uint16_t)LCD_HEIGHT) ph = (uint16_t)LCD_HEIGHT - py;
-
-            uint16_t expectedBytes = (uint16_t)(pw * ph * 2U);
-            if (tileAssemblyPos >= expectedBytes && (expectedBytes & 1U) == 0U)
-            {
-                if (tileReady == False)
-                {
-                    // Copy assembled tile into staging buffer and signal Update().
-                    // SPI must be called from the Periodic task — defer via flag.
-                    for (uint16_t i = 0U; i < expectedBytes; i++)
-                        tileStagingBuf[i] = tileAssemblyBuf[i];
-                    tileStagingLen = expectedBytes;
-                    tilePendingX   = px;
-                    tilePendingY   = py;
-                    tilePendingW   = pw;
-                    tilePendingH   = ph;
-                    tileReady      = True;
-                }
-                // If tileReady is already set (Update hasn't drained it yet), drop this tile.
-                // The periodic keyframe from the ESP32 will resync any missed tiles.
-            }
-
-            tileAssemblyPos = 0U;
-        }
+        __DMB();
+        kfRingWriteIdx = next_wi;
         return;
     }
 

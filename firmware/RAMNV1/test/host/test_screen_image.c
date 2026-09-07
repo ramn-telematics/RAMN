@@ -96,7 +96,9 @@ static void reset_state(void)
     kfRingDrops       = 0;
     kfStateDrops      = 0;
     tileAssemblyPos   = 0;
-    tileReady         = False;
+    kfTileDrops       = 0;
+    kfTileShort       = 0;
+    RLE_StreamReset(&tileStream);
     fake_reset();
     /* The activity timeout reads xTaskGetTickCount(), so the fake clock is part
        of this module's state -- a case that leaves it advanced silently expires
@@ -123,6 +125,69 @@ static const CapturedFrame_t *last_ack(void)
     for (int i = fake_can_tx_count - 1; i >= 0; i--)
         if (fake_can_tx[i].header.Identifier == IMG_CAN_ID_ACK) return &fake_can_tx[i];
     return NULL;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Delta fixtures                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Put ECU A into the state a delta frame requires: a keyframe has completed,
+   so imgState is IMG_SHOWN. */
+static void reach_img_shown(void)
+{
+    reset_state();
+    send_img_start(240, 240, 1, 100);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 101);
+    drain(102);
+    send_img_end(0x00, 103);
+    fake_screen_reset();
+    fake_reset();
+}
+
+/* 0x305 as ECU D forwards it: [X][Y][SIZE][SEQ][LEN][RLE...] padded to 64. */
+static void send_tile_chunk(uint8_t tx, uint8_t ty, uint8_t size, uint8_t seq,
+                            const uint8_t *rle, uint8_t len, uint32_t tick)
+{
+    uint8_t b[64];
+    memset(b, 0, sizeof b);
+    b[0] = tx; b[1] = ty; b[2] = size; b[3] = seq; b[4] = len;
+    memcpy(&b[5], rle, len);
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof(h));
+    h.Identifier = DELTA_CAN_ID_TILE_CHUNK;
+    h.DataLength = FDCAN_DLC_BYTES_64;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+}
+
+/* RLE-encode a run of identical pixels the way the sender does. */
+static uint16_t rle_solid(uint8_t *out, uint16_t pixels, uint8_t hi, uint8_t lo)
+{
+    uint16_t n = 0;
+    while (pixels) {
+        uint16_t run = pixels > 128 ? 128 : pixels;
+        out[n++] = (uint8_t)(0x80 | (run - 1));
+        out[n++] = hi; out[n++] = lo;
+        pixels = (uint16_t)(pixels - run);
+    }
+    return n;
+}
+
+/* Cut an RLE stream into 59-byte chunks and send them as one tile, with bit 7
+   of the sequence set on the last -- exactly ECU D's framing. */
+static void send_tile(uint8_t tx, uint8_t ty, uint8_t size,
+                      const uint8_t *rle, uint16_t rleLen, uint32_t tick)
+{
+    const uint8_t CH = 59;
+    uint16_t nchunks = (uint16_t)((rleLen + CH - 1) / CH);
+    for (uint16_t i = 0; i < nchunks; i++) {
+        uint16_t off = (uint16_t)(i * CH);
+        uint8_t n = (uint8_t)((rleLen - off) > CH ? CH : (rleLen - off));
+        uint8_t seq = (uint8_t)(i & 0x7F);
+        if (i == nchunks - 1) seq |= 0x80;
+        send_tile_chunk(tx, ty, size, seq, &rle[off], n, tick);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -573,6 +638,170 @@ static void case_ack_reports_wrong_state_drops(void)
     CHECK(kfStateDrops == 1, "a late data frame is counted, not ignored");
 }
 
+
+static void case_a_delta_tile_reaches_the_panel(void)
+{
+    h_case_begin("a delta tile is decoded and written to the panel");
+    reach_img_shown();
+
+    /* An 8x8 tile of one colour: 64 pixels, 128 bytes. */
+    uint8_t rle[64];
+    uint16_t n = rle_solid(rle, 64, 0x12, 0x34);
+    send_tile(3, 5, 8, rle, n, 200);
+    drain(201);
+
+    CHECK(kfTileDrops == 0, "the tile passes validation");
+    CHECK(fake_window_opens == 1, "one window is opened for it");
+    CHECK(fake_window_w == 8 && fake_window_h == 8, "sized to the tile");
+    CHECK(fake_screen_len == 8 * 8 * 2, "and a whole tile of pixels is written");
+    if (fake_screen_len >= 2)
+        CHECK(fake_screen[0] == 0x12 && fake_screen[1] == 0x34, "with the right pixel");
+}
+
+static void case_a_tile_split_across_chunks(void)
+{
+    h_case_begin("a tile whose RLE spans many chunks still decodes");
+    /* THE defect this rework exists for. A 40x40 tile is 3,200 bytes and ECU D
+       caps a chunk at 59, so the stream is cut into ~26 pieces with blocks
+       straddling the cuts. Decoding each chunk on its own loses every straddling
+       block -- which was most of them. */
+    reach_img_shown();
+
+    static uint8_t rle[4096];
+    uint16_t n = 0;
+    /* Alternating short runs, so blocks land across chunk boundaries. */
+    for (uint16_t px = 0; px < 40 * 40; ) {
+        uint16_t run = (px / 7) % 5 + 1;
+        if (px + run > 40 * 40) run = (uint16_t)(40 * 40 - px);
+        rle[n++] = (uint8_t)(0x80 | (run - 1));
+        rle[n++] = (uint8_t)(px & 0xFF);
+        rle[n++] = (uint8_t)(px >> 8);
+        px = (uint16_t)(px + run);
+    }
+    CHECK(n > 59 * 4, "the fixture really does span many chunks");
+
+    /* Reference: the whole stream decoded in one go. */
+    static uint8_t want[TILE_RAW_MAX];
+    {
+        RleStream_t st; RLE_StreamReset(&st);
+        uint16_t got = RLE_DecodeStream(&st, rle, n, want, sizeof want);
+        CHECK(got >= 40 * 40 * 2, "reference decode produces a full tile");
+    }
+
+    /* Show the old approach really does get it wrong on this fixture, so this
+       case demonstrably tests the fix rather than merely passing. Decoding each
+       59-byte chunk on its own is what the module used to do.
+
+       Compared by CONTENT, not by length: a misparse happily over-produces and
+       is then clipped at the buffer, so the byte count comes out right while
+       the pixels are garbage. Checking the count alone passed here, which is
+       exactly the kind of weak assertion this case exists to avoid. */
+    {
+        static uint8_t naive[TILE_RAW_MAX];
+        memset(naive, 0, sizeof naive);
+        uint16_t pos = 0;
+        for (uint16_t off = 0; off < n && pos < TILE_RAW_MAX; off += 59) {
+            uint16_t len = (uint16_t)((n - off) > 59 ? 59 : (n - off));
+            pos = (uint16_t)(pos + RLE_Decode(&rle[off], len, &naive[pos],
+                                              (uint16_t)(TILE_RAW_MAX - pos)));
+        }
+        CHECK(memcmp(naive, want, 40 * 40 * 2) != 0,
+              "per-chunk decoding produces the wrong pixels -- the old bug is real");
+    }
+
+    send_tile(0, 0, 40, rle, n, 300);
+    drain(301);
+
+    CHECK(kfTileShort == 0, "the tile is not reported short");
+    CHECK(fake_screen_len == 40 * 40 * 2, "every pixel of the tile reaches the panel");
+    CHECK(memcmp(fake_screen, want, 40 * 40 * 2) == 0, "and every pixel is the right one");
+}
+
+static void case_many_tiles_in_one_frame(void)
+{
+    h_case_begin("a whole delta frame of tiles arrives without dropping any");
+    /* The old path staged ONE finished tile and dropped any that arrived while
+       it waited for the 10 ms periodic task. A delta frame is many tiles back
+       to back, so most of it disappeared. */
+    reach_img_shown();
+
+    const int TILES = 12;
+    uint8_t rle[64];
+    uint16_t n = rle_solid(rle, 64, 0xAB, 0xCD);
+    for (int i = 0; i < TILES; i++)
+        send_tile((uint8_t)i, (uint8_t)i, 8, rle, n, 400);   /* no drain between */
+    drain(401);
+
+    CHECK(kfRingDrops == 0, "none were dropped for want of a slot");
+    CHECK(fake_window_opens == TILES, "each tile opened its own window");
+    CHECK(fake_screen_len == (size_t)TILES * 8 * 8 * 2, "and every tile was written");
+}
+
+static void case_a_tile_that_would_overhang_is_refused(void)
+{
+    h_case_begin("a tile that would hang off the panel is refused, not clamped");
+    /* Tile coordinates are on an 8-pixel grid, tileSize is the extent, so a
+       40-wide tile at tileX=29 starts at x=232 and needs 32 pixels that do not
+       exist. Clamping the window and writing the tile's bytes into it shifts
+       every row -- corrupt, and drawn with confidence. */
+    reach_img_shown();
+
+    uint8_t rle[4096];
+    uint16_t n = rle_solid(rle, 40 * 40, 0x11, 0x22);
+    send_tile(29, 0, 40, rle, n, 500);
+    drain(501);
+
+    CHECK(kfTileDrops > 0, "the overhanging tile is counted as refused");
+    CHECK(fake_window_opens == 0, "no window is opened for it");
+    CHECK(fake_screen_len == 0, "and nothing is written to the panel");
+
+    /* The largest tile that does fit at that size must still be accepted. */
+    fake_screen_reset();
+    send_tile(25, 25, 40, rle, n, 502);      /* 200..239 -- exactly flush */
+    drain(503);
+    CHECK(fake_screen_len == 40 * 40 * 2, "a tile flush with the edge is accepted");
+}
+
+static void case_a_bad_tile_size_is_refused(void)
+{
+    h_case_begin("an impossible tile size is refused");
+    reach_img_shown();
+    uint8_t rle[8];
+    uint16_t n = rle_solid(rle, 1, 0x00, 0x00);
+    send_tile_chunk(0, 0, 24, 0x80, rle, (uint8_t)n, 600);   /* 24 is not 8/16/40 */
+    drain(601);
+    CHECK(kfTileDrops == 1, "the size is rejected");
+    CHECK(fake_screen_len == 0, "and nothing reaches the panel");
+}
+
+static void case_a_truncated_tile_is_not_drawn(void)
+{
+    h_case_begin("a tile whose chunks stop early is counted, not half-drawn");
+    reach_img_shown();
+
+    /* Claim the last chunk while only part of the tile has been sent. */
+    uint8_t rle[64];
+    uint16_t n = rle_solid(rle, 8, 0x77, 0x88);      /* 8 pixels of a 64-pixel tile */
+    send_tile(1, 1, 8, rle, n, 700);
+    drain(701);
+
+    CHECK(kfTileShort == 1, "the short tile is counted");
+    CHECK(fake_screen_len == 0, "and no partial tile is written");
+}
+
+static void case_tiles_before_a_keyframe_are_dropped(void)
+{
+    h_case_begin("delta tiles before any keyframe are dropped");
+    reset_state();
+    imgState = IMG_IDLE;
+    uint8_t rle[64];
+    uint16_t n = rle_solid(rle, 64, 0x01, 0x02);
+    send_tile(0, 0, 8, rle, n, 800);
+    drain(801);
+    CHECK(kfStateDrops > 0, "they are counted as out-of-state");
+    CHECK(fake_screen_len == 0, "and nothing is drawn");
+}
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -595,6 +824,13 @@ int main(void)
     case_the_ring_absorbs_a_whole_keyframe();
     case_ack_reports_a_ring_overflow();
     case_ack_reports_wrong_state_drops();
+    case_a_delta_tile_reaches_the_panel();
+    case_a_tile_split_across_chunks();
+    case_many_tiles_in_one_frame();
+    case_a_tile_that_would_overhang_is_refused();
+    case_a_bad_tile_size_is_refused();
+    case_a_truncated_tile_is_not_drawn();
+    case_tiles_before_a_keyframe_are_dropped();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);
