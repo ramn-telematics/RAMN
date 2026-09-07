@@ -58,7 +58,22 @@ static uint16_t kfHeight       = 0;
 static uint16_t kfTotalChunks  = 0;
 static uint8_t  kfXOffset      = 0;
 static uint8_t  kfYOffset      = 0;
-static uint16_t kfDecodedBytes = 0;
+
+// Bytes handed to the panel for the current keyframe. A 240x240 RGB565 frame
+// is 115,200 bytes, so this MUST be wider than 16 bits: as a uint16_t it wrapped
+// at 65,536 and could never report a complete keyframe.
+static uint32_t kfDecodedBytes = 0;
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC COUNTERS -- reported to ECU D in the 0x303 ACK
+//
+// ECU A has no UART (ENABLE_UART is TARGET_ECUD only), so the ACK is the only
+// channel it has to say what actually happened to a keyframe. Every one of
+// these counts a place where a chunk used to disappear in silence.
+// ---------------------------------------------------------------------------
+static uint16_t kfFramesRx   = 0;   // 0x301 frames accepted into the ring
+static uint16_t kfRingDrops  = 0;   // 0x301 frames dropped: ring full
+static uint16_t kfStateDrops = 0;   // 0x301 frames dropped: not in KEYFRAME_RX
 
 // Screen hold state — mirrors the regcode pattern.
 // screenActive is the authoritative "stay on screen" flag.
@@ -331,6 +346,9 @@ static void SCREENIMAGE_Deinit(void)
     kfRingWriteIdx  = 0;
     kfRingReadIdx   = 0;
     kfDecodedBytes  = 0;
+    kfFramesRx      = 0;
+    kfRingDrops     = 0;
+    kfStateDrops    = 0;
     tileAssemblyPos = 0;
     kfWindowNeeded  = False;
     tileReady       = False;
@@ -457,6 +475,9 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         if (kfHeight > (uint16_t)LCD_HEIGHT) kfHeight = (uint16_t)LCD_HEIGHT;
 
         kfDecodedBytes    = 0;
+        kfFramesRx        = 0;
+        kfRingDrops       = 0;
+        kfStateDrops      = 0;
         kfRingWriteIdx    = 0;
         kfRingReadIdx     = 0;
         RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
@@ -491,6 +512,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     {
         if (imgState != KEYFRAME_RX)
         {
+            if (kfStateDrops < 0xFFFFU) kfStateDrops++;
 #ifdef SCREENIMAGE_DEBUG
             char buf[48];
             int  len = snprintf(buf, sizeof(buf),
@@ -504,7 +526,16 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // Enqueue into ring buffer — writer (ReceiveCAN task) side
         uint8_t wi      = kfRingWriteIdx;
         uint8_t next_wi = (uint8_t)((wi + 1U) % KFRING_ENTRIES);
-        if (next_wi == kfRingReadIdx) return;   // ring full — drop chunk
+        if (next_wi == kfRingReadIdx)
+        {
+            // Ring full: the Periodic task has not drained fast enough. Counted
+            // rather than dropped in silence -- a lost chunk desynchronises the
+            // RLE stream and corrupts every pixel after it, so this number is
+            // the difference between "the decoder is wrong" and "the frames
+            // never got to the decoder".
+            if (kfRingDrops < 0xFFFFU) kfRingDrops++;
+            return;
+        }
 
         // Payload starts at byte 3 (skip SEQ_HI, SEQ_LO, REAL_LEN). REAL_LEN
         // is the true byte count ECU D actually packed into this frame — DLC
@@ -524,6 +555,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         for (uint8_t i = 0U; i < payLen; i++)
             entry->data[i] = data[3U + i];
         entry->len = payLen;
+        if (kfFramesRx < 0xFFFFU) kfFramesRx++;
 
         __DMB();
         kfRingWriteIdx = next_wi;
@@ -542,7 +574,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         ackHdr.Identifier          = IMG_CAN_ID_ACK;
         ackHdr.IdType              = FDCAN_STANDARD_ID;
         ackHdr.TxFrameType         = FDCAN_DATA_FRAME;
-        ackHdr.DataLength          = FDCAN_DLC_BYTES_2;
+        ackHdr.DataLength          = FDCAN_DLC_BYTES_8;
         ackHdr.BitRateSwitch       = FDCAN_BRS_OFF;
         ackHdr.FDFormat            = FDCAN_CLASSIC_CAN;
         ackHdr.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
@@ -555,9 +587,34 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // the ACK rather than reporting success on a partial image.
         RAMN_Bool_t truncated = RLE_StreamMidBlock(&kfStream);
 
-        uint8_t ackData[2];
-        ackData[0] = ((status == 0x00U) && (truncated == False)) ? 0x00U : 0x01U;
-        ackData[1] = (truncated != False) ? 0x01U : 0x00U;   // 1 = stream truncated
+        // ACK payload -- ECU A's only report channel. Byte 0 keeps its original
+        // meaning (0 = good) because ECU D already reads it as the ACK status;
+        // bytes 1..7 are what this ECU saw, so a blank or torn screen can be
+        // told apart from a stream that never arrived.
+        //
+        //   [0] status  : 0 = complete and OK, 1 = something went wrong
+        //   [1] flags   : bit0 truncated (a half-read RLE block at IMG_END)
+        //                 bit1 at least one chunk dropped, ring full
+        //                 bit2 at least one chunk dropped, wrong state
+        //   [2..4]      : bytes written to the panel, 24-bit little-endian
+        //                 (a full 240x240 keyframe is 115,200)
+        //   [5]         : 0x301 frames accepted     (saturating at 255)
+        //   [6]         : 0x301 frames dropped, ring full   (saturating)
+        //   [7]         : 0x301 frames dropped, wrong state (saturating)
+        uint8_t flags = 0U;
+        if (truncated    != False) flags |= 0x01U;
+        if (kfRingDrops  != 0U)    flags |= 0x02U;
+        if (kfStateDrops != 0U)    flags |= 0x04U;
+
+        uint8_t ackData[8];
+        ackData[0] = ((status == 0x00U) && (flags == 0U)) ? 0x00U : 0x01U;
+        ackData[1] = flags;
+        ackData[2] = (uint8_t)(kfDecodedBytes & 0xFFU);
+        ackData[3] = (uint8_t)((kfDecodedBytes >> 8) & 0xFFU);
+        ackData[4] = (uint8_t)((kfDecodedBytes >> 16) & 0xFFU);
+        ackData[5] = (kfFramesRx   > 255U) ? 255U : (uint8_t)kfFramesRx;
+        ackData[6] = (kfRingDrops  > 255U) ? 255U : (uint8_t)kfRingDrops;
+        ackData[7] = (kfStateDrops > 255U) ? 255U : (uint8_t)kfStateDrops;
         RAMN_FDCAN_SendMessage(&ackHdr, ackData);
 
         imgState = IMG_SHOWN;
@@ -566,8 +623,9 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         {
             char buf[64];
             int  len = snprintf(buf, sizeof(buf),
-                "IMG END: status=%u decoded=%u active=%d trunc=%d\r\n",
-                status, kfDecodedBytes, (int)screenActive, (int)truncated);
+                "IMG END: status=%u decoded=%lu rx=%u drop=%u/%u trunc=%d\r\n",
+                status, (unsigned long)kfDecodedBytes, kfFramesRx,
+                kfRingDrops, kfStateDrops, (int)truncated);
             if (len > 0) RAMN_UART_SendFromTask((uint8_t*)buf, (uint32_t)len);
         }
 #endif

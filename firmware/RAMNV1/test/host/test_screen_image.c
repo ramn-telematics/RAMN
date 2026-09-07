@@ -14,6 +14,7 @@
 
 #include "harness.h"
 #include "fakes_screen.h"
+#include "fakes.h"
 #include "ramn_test_vectors.h"
 
 /* ENABLE_SCREEN comes from the Makefile (CFLAGS_A), as it does in the real build. */
@@ -91,8 +92,33 @@ static void reset_state(void)
     kfRingWriteIdx    = 0;
     kfRingReadIdx     = 0;
     kfDecodedBytes    = 0;
+    kfFramesRx        = 0;
+    kfRingDrops       = 0;
+    kfStateDrops      = 0;
     tileAssemblyPos   = 0;
     tileReady         = False;
+    fake_reset();
+}
+
+/* IMG_END as ECU D forwards it: 8 bytes, byte 4 = status. */
+static void send_img_end(uint8_t status, uint32_t tick)
+{
+    uint8_t b[8];
+    memset(b, 0, sizeof b);
+    b[4] = status;
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof(h));
+    h.Identifier = IMG_CAN_ID_END;
+    h.DataLength = FDCAN_DLC_BYTES_8;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+}
+
+/* The single 0x303 frame ECU A sends in reply to IMG_END, or NULL. */
+static const CapturedFrame_t *last_ack(void)
+{
+    for (int i = fake_can_tx_count - 1; i >= 0; i--)
+        if (fake_can_tx[i].header.Identifier == IMG_CAN_ID_ACK) return &fake_can_tx[i];
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -273,6 +299,124 @@ static void case_odd_length_decode_is_not_lost(void)
     }
 }
 
+
+static void case_ack_reports_what_ecua_saw(void)
+{
+    h_case_begin("the 0x303 ACK reports what ECU A actually decoded");
+    /* ECU A has no UART -- ENABLE_UART is TARGET_ECUD only -- so this ACK is
+       the ONLY thing it can say about a keyframe. A blank screen and a stream
+       that never arrived are indistinguishable without it. */
+    reset_state();
+    send_img_start(240, 240, 1, 100);
+
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};   /* a run of two pixels */
+    send_img_data(0, payload, 3, 101);
+    drain(102);
+    send_img_end(0x00, 103);
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL, "IMG_END is answered with a 0x303 ACK")) return;
+
+    CHECK(ack->len == 8, "the ACK carries the full 8-byte diagnostic payload");
+    if (ack->len < 8) return;
+
+    CHECK(ack->data[0] == 0x00, "status is OK on a clean stream");
+    CHECK(ack->data[1] == 0x00, "no flags set: not truncated, nothing dropped");
+
+    uint32_t decoded = (uint32_t)ack->data[2]
+                     | ((uint32_t)ack->data[3] << 8)
+                     | ((uint32_t)ack->data[4] << 16);
+    CHECK(decoded == fake_screen_len, "the reported byte count is what reached the panel");
+    CHECK(ack->data[5] == 1, "one data frame was accepted");
+    CHECK(ack->data[6] == 0, "no ring-full drops");
+    CHECK(ack->data[7] == 0, "no wrong-state drops");
+}
+
+static void case_ack_counts_a_full_keyframe(void)
+{
+    h_case_begin("the ACK's byte count survives a whole keyframe");
+    /* A 240x240 RGB565 frame is 115,200 bytes. The counter behind this field
+       was a uint16_t, so it wrapped at 65,536 and could never report a
+       complete frame -- the one number worth reporting was the one it could
+       not hold. */
+    reset_state();
+
+    /* A solid frame: one run block per 128 pixels, three source bytes each. */
+    static uint8_t stream[240 * 240 / 128 * 3];
+    for (size_t i = 0; i < sizeof stream; i += 3) {
+        stream[i] = 0xFF;                    /* run of 128 */
+        stream[i + 1] = 0x12; stream[i + 2] = 0x34;
+    }
+
+    uint16_t chunks = (uint16_t)((sizeof stream + RAMN_PIPE_SPI_CHUNK_PAYLOAD - 1) /
+                                 RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+    send_img_start(240, 240, chunks, 200);
+    uint16_t seq = 0;
+    for (size_t off = 0; off < sizeof stream; off += RAMN_PIPE_SPI_CHUNK_PAYLOAD) {
+        size_t n = sizeof stream - off;
+        if (n > RAMN_PIPE_SPI_CHUNK_PAYLOAD) n = RAMN_PIPE_SPI_CHUNK_PAYLOAD;
+        send_img_data(seq++, &stream[off], (uint8_t)n, 201);
+        drain(202);
+    }
+    drain(203);
+    send_img_end(0x00, 204);
+
+    CHECK(fake_screen_len == 240 * 240 * 2, "a full screen of pixels reaches the panel");
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL && ack->len == 8, "an 8-byte ACK came back")) return;
+    uint32_t decoded = (uint32_t)ack->data[2]
+                     | ((uint32_t)ack->data[3] << 8)
+                     | ((uint32_t)ack->data[4] << 16);
+    CHECK(decoded == 240u * 240u * 2u, "and it reports all 115,200 bytes, not 115,200 mod 65,536");
+}
+
+static void case_ack_reports_a_ring_overflow(void)
+{
+    h_case_begin("chunks dropped by a full ring are reported, not silent");
+    /* The ring holds KFRING_ENTRIES-1 frames and is drained by the Periodic
+       task. If that task is busy -- SCREENIMAGE_Init alone paints 115,200
+       bytes of black over SPI -- frames arrive with nowhere to go. Dropping
+       one desynchronises the RLE stream and corrupts every pixel after it, so
+       a silent drop presents as a decoder fault. */
+    reset_state();
+    send_img_start(240, 240, 32, 300);
+
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    for (int i = 0; i < KFRING_ENTRIES + 4; i++)        /* no drain in between */
+        send_img_data((uint16_t)i, payload, sizeof payload, 301);
+
+    CHECK(kfRingDrops > 0, "the ring did overflow with no drain running");
+    drain(302);
+    send_img_end(0x00, 303);
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL && ack->len == 8, "an 8-byte ACK came back")) return;
+    CHECK(ack->data[0] == 0x01, "status is not OK when chunks were lost");
+    CHECK((ack->data[1] & 0x02) != 0, "the ring-drop flag is set");
+    CHECK(ack->data[6] == (uint8_t)kfRingDrops, "and the drop count is reported");
+}
+
+static void case_ack_reports_wrong_state_drops(void)
+{
+    h_case_begin("chunks arriving outside KEYFRAME_RX are counted");
+    /* Data after IMG_END, or with no IMG_START at all, is dropped by design.
+       Counting it separates "ECU D sent nothing" from "ECU A threw it away". */
+    reset_state();
+    send_img_start(240, 240, 1, 400);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 401);
+    drain(402);
+    send_img_end(0x00, 403);            /* -> IMG_SHOWN */
+
+    const CapturedFrame_t *first = last_ack();
+    if (!CHECK_OK(first != NULL, "the first IMG_END is acknowledged")) return;
+    CHECK(first->data[7] == 0, "nothing was dropped for state before IMG_END");
+
+    send_img_data(1, payload, sizeof payload, 404);   /* too late */
+    CHECK(kfStateDrops == 1, "a late data frame is counted, not ignored");
+}
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -285,6 +429,10 @@ int main(void)
     case_a_split_block_across_frames();
     case_a_whole_keyframe();
     case_odd_length_decode_is_not_lost();
+    case_ack_reports_what_ecua_saw();
+    case_ack_counts_a_full_keyframe();
+    case_ack_reports_a_ring_overflow();
+    case_ack_reports_wrong_state_drops();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);
