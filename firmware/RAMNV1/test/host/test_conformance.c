@@ -37,18 +37,14 @@ void conformance_cases(void)
     for (size_t i = 0; i < RAMN_VECTOR_COUNT; i++) {
         const ramn_vector_t *v = &ramn_vectors[i];
 
-        /* The vectors are the STM32 -> ESP32 direction (marker 0xAA). This
-           decoder reads poll responses (0xCC). The body is identical, so swap
-           the marker and recompute the checksum over it rather than skipping
-           the family -- the fields under test are the same bytes either way. */
-        uint8_t f[96];
-        memcpy(f, v->encoded, v->encoded_len);
-        f[1] = 0xCC;
-        uint8_t chk = 0;
-        for (size_t k = 1; k < v->encoded_len - 1; k++) chk ^= f[k];
-        f[v->encoded_len - 1] = chk;
-
-        conf_feed(f, v->encoded_len);
+        /* encoded_tx: the 0xCC poll response this decoder actually receives,
+           and byte for byte what the ESP32's encoder is asserted to produce.
+           This used to swap the marker and recompute the checksum here, while
+           the ESP32's suite did its own fixup in the other direction -- so the
+           bytes one end produced were never compared against the bytes the
+           other consumed, and a shared mistake in the two fixups would pass
+           both suites. Feed the literal bytes instead. */
+        conf_feed(v->encoded_tx, v->encoded_len);
 
         if (!CHECK_OK(fake_can_tx_count == 1, v->name)) continue;
         CapturedFrame_t *c = &fake_can_tx[0];
