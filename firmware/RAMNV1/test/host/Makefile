@@ -12,17 +12,39 @@ CFLAGS   := -std=c11 -g -O0 -Wall -Wextra \
             -DTELEMATICS_HAS_STREAM_STATE \
             -Istubs -I. -I$(CORE)/Inc -I$(CORE)/Src
 BIN      := run_tests
-SRCS     := test_telematics_spi.c fakes.c harness.c
+SRCS     := test_telematics_spi.c test_conformance.c fakes.c harness.c
 
-.PHONY: all clean
-all: $(BIN)
+# ECU A's image receive path is a separate binary: it compiles a different
+# module white-box, and two files cannot each #include a .c into one link.
+BIN_A    := run_tests_ecua
+SRCS_A   := test_screen_image.c fakes_screen.c fakes.c harness.c
+# ENABLE_SCREEN comes from the real ramn_config.h for an ECU A build, so it is
+# not defined here -- doing so shadows the project's own definition.
+CFLAGS_A := $(CFLAGS) -Wno-unused-but-set-variable
+
+.PHONY: all clean ecud ecua targets
+all: ecud ecua targets
+
+# Catches what a host suite structurally cannot: a module that compiles and
+# passes every test here, then fails to LINK for a target that lacks the
+# symbols it references. See check_targets.sh.
+targets:
+	./check_targets.sh
+
+ecud: $(BIN)
 	./$(BIN)
 
-$(BIN): $(SRCS) $(wildcard stubs/*.h) $(CORE)/Src/ramn_telematics.c
+ecua: $(BIN_A)
+	./$(BIN_A)
+
+$(BIN): $(SRCS) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_telematics.c
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
+$(BIN_A): $(SRCS_A) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_screen_image.c
+	$(CC) $(CFLAGS_A) -o $@ $(SRCS_A)
+
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(BIN_A)
 
 # Run this same suite against an older revision of the module under test, to
 # check whether a failure is a regression or was always broken:

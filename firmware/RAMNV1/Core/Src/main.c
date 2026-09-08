@@ -875,7 +875,17 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.NominalTimeSeg1 = 60;
   hfdcan1.Init.NominalTimeSeg2 = 19;
   hfdcan1.Init.DataPrescaler = 1;
-  hfdcan1.Init.DataSyncJumpWidth = 16;
+  /* SJW must not exceed phase segment 2: a resynchronisation may shorten
+   * phase_seg2 by up to SJW, and jumping further than the segment is long
+   * pushes the sample point past the end of the bit. This was 16 against a
+   * DataTimeSeg2 of 4 -- four times the legal maximum. The HAL does not catch
+   * it (IS_FDCAN_DATA_SJW only bounds it to 1..16) and nothing exercised it
+   * until image streaming started sending BRS frames, since the data phase is
+   * only entered on BRS. Nominal timing is unaffected: SJW 16 <= TimeSeg2 19
+   * there is legal.
+   *
+   * Data phase: 1 + 15 + 4 = 20 tq at an 80 MHz kernel clock = 4 Mbit/s. */
+  hfdcan1.Init.DataSyncJumpWidth = 4;
   hfdcan1.Init.DataTimeSeg1 = 15;
   hfdcan1.Init.DataTimeSeg2 = 4;
   hfdcan1.Init.StdFiltersNbr = 1;
@@ -1843,7 +1853,15 @@ void RAMN_PeriodicTaskFunc(void *argument)
 #endif
 
 #ifdef ENABLE_SCREEN
-		RAMN_SCREENMANAGER_Update(xLastWakeTime);
+		// xTaskGetTickCount(), NOT xLastWakeTime. vTaskDelayUntil advances
+		// xLastWakeTime by exactly SIM_LOOP_CLOCK_MS per iteration, so when this
+		// loop overruns its period -- and writing a keyframe to the panel is
+		// ~115,200 bytes, about 33 ms inside a 10 ms period -- it falls
+		// permanently behind real time and never catches up. Screens compare it
+		// against timestamps taken with xTaskGetTickCount() in the CAN RX task,
+		// so the unsigned subtraction wrapped and every activity timeout fired
+		// immediately. That tore the image screen down mid-keyframe.
+		RAMN_SCREENMANAGER_Update(xTaskGetTickCount());
 #endif
 
 		vTaskDelayUntil(&xLastWakeTime, SIM_LOOP_CLOCK_MS);

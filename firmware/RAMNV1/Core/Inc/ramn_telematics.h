@@ -18,6 +18,8 @@
 #ifndef INC_RAMN_TELEMATICS_H_
 #define INC_RAMN_TELEMATICS_H_
 
+#include "ramn_msg_types.h"
+
 #include "main.h"
 
 // Public API Functions

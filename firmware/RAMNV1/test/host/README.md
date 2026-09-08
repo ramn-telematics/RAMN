@@ -70,3 +70,29 @@ revision before image streaming, confirmed working on hardware):
 
 All six pass there and fail on `d128bdf`, so all six arrived with the image
 streaming change — none is pre-existing.
+
+
+## ECU A: the image receive path
+
+```sh
+make ecua      # just this suite
+make           # both
+```
+
+`test_screen_image.c` compiles `ramn_screen_image.c` white-box and asserts on
+`RAMN_SPI_WriteImageChunk` — exactly the pixel bytes that would reach the
+ST7789. That is the only question worth asking about a decoder: for these CAN
+frames, what lands on the panel?
+
+A keyframe now arrives byte-perfect: 115,200 of 115,200, every pixel correct.
+
+It did not before. ECU A decoded each 0x301 frame independently while the
+ESP32 RLE-encodes the whole image as one stream and cuts it at fixed offsets,
+so a block routinely began in one frame and ended in the next and could not be
+rejoined. `RLE_Decode` itself was always correct — it reproduces every golden
+vector — so the fault was architectural, not in the decoder.
+
+`RLE_DecodeStream` carries the half-read block across the boundary. Its state
+is one control byte, at most two pixel bytes and two counters, which matters:
+ECU A has no framebuffer and writes straight to the panel, so buffering the
+whole stream was never an option.
