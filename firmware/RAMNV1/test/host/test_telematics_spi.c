@@ -156,6 +156,129 @@ static void case_short_and_malformed_are_rejected(void)
 }
 
 #ifdef TELEMATICS_HAS_STREAM_STATE
+/* Feed the SAME buffer twice, as the ESP32 does when it re-presents a staged
+   response ECU D's write did not acknowledge. feed() resets the fixture but not
+   the dedupe fingerprint, which is exactly the state under test. */
+static void feed_twice(const uint8_t *bytes, size_t n, int *first, int *second)
+{
+    feed(bytes, n);
+    *first = fake_can_tx_count;
+    feed(bytes, n);
+    *second = fake_can_tx_count;
+}
+
+/* IMG_START as the ESP32 stages it: 13 bytes, checksum over 1..11. */
+static size_t build_img_start(uint8_t *out, uint16_t w, uint16_t h,
+                              uint16_t chunks, uint8_t scale)
+{
+    memset(out, 0, 16);
+    out[0]  = 0x0C;
+    out[1]  = 0xCC;
+    out[2]  = RAMN_MSG_TYPE_IMG_START;
+    out[3]  = (uint8_t)(w & 0xFF);      out[4]  = (uint8_t)(w >> 8);
+    out[5]  = (uint8_t)(h & 0xFF);      out[6]  = (uint8_t)(h >> 8);
+    out[7]  = (uint8_t)(chunks & 0xFF); out[8]  = (uint8_t)(chunks >> 8);
+    out[9]  = 0; out[10] = 0;
+    out[11] = scale;
+    uint8_t chk = 0;
+    for (uint8_t i = 1; i <= 11; i++) chk ^= out[i];
+    out[12] = chk;
+    return 13;
+}
+
+static void case_a_re_presented_image_transaction_is_forwarded_once(void)
+{
+    h_case_begin("an image transaction the ESP32 presents twice is forwarded once");
+    /* "Re-present when unsure" is the right behaviour for a link that cannot
+       retransmit, and it is only safe because the receiver ignores what it has
+       already seen. ECU A's chunk sequence gate does that for 0x301 -- its
+       duplicate counter fires on hardware, flags=0x10 -- but IMG_START and
+       IMG_END carry no sequence and both change state.
+
+       A second IMG_START zeroes kfExpectedSeq and the counters mid-frame and
+       queues a second START entry, which ECU A's latest-frame-wins skip then
+       reads as "this frame is stale". A second IMG_END finds imgState already
+       IMG_SHOWN and comes back IMG_ACK_LATE, with every chunk behind it
+       refused out-of-state. Hardware signature: st=3 decoded=0, then
+       flags=0x01/0x04/0x05 and a partial decode, all with nothing lost.
+
+       The repeat is a property of the TRANSACTION, so it is caught here, in
+       the one place that can see a whole one. */
+    uint8_t f[16];
+    size_t  n = build_img_start(f, 60, 60, 25, 4);
+    int     first = 0, second = 0;
+
+    lastImageRespFingerprint = 0;
+    feed_twice(f, n, &first, &second);
+
+    CHECK(first == 1, "the first presentation forwards IMG_START to the bus");
+    CHECK(second == 0, "the second forwards nothing at all");
+    CHECK(spiStats.spiRxRepeatRespCnt == 1, "and is counted as a repeat");
+}
+
+static void case_a_repeated_plain_can_frame_is_still_forwarded(void)
+{
+    h_case_begin("a plain CAN frame repeated identically is still forwarded");
+    /* A periodic frame polled faster than it changes repeats byte for byte and
+       legitimately. Deduplicating those would be dropping real gateway
+       traffic, so only image traffic -- which carries sequence numbers, and so
+       cannot repeat by accident -- is deduplicated. */
+    uint8_t data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t f[32];
+    size_t  n = build_can_response(f, 0x123, data, 8, 0);
+    int     first = 0, second = 0;
+
+    lastImageRespFingerprint = 0;
+    feed_twice(f, n, &first, &second);
+
+    CHECK(first == 1, "the first copy reaches the bus");
+    CHECK(second == 1, "and so does the second");
+}
+
+static void case_a_different_image_transaction_is_not_mistaken_for_a_repeat(void)
+{
+    h_case_begin("a different image transaction is not mistaken for a repeat");
+    uint8_t a[16], b[16];
+    size_t  na = build_img_start(a, 60, 60, 25, 4);
+    size_t  nb = build_img_start(b, 60, 60, 26, 4);   /* one chunk more */
+
+    lastImageRespFingerprint = 0;
+    feed(a, na);
+    int first = fake_can_tx_count;
+    feed(b, nb);
+    int second = fake_can_tx_count;
+
+    CHECK(first == 1, "the first frame goes out");
+    CHECK(second == 1, "and so does the next, which differs by one byte");
+    CHECK(spiStats.spiRxRepeatRespCnt == 0, "nothing is counted as a repeat");
+}
+
+static void case_an_img_ack_late_does_not_end_the_keyframe_wait(void)
+{
+    h_case_begin("an IMG_ACK_LATE does not end the keyframe wait");
+    /* st=3 means "0x302 reached me but I was not receiving a keyframe" -- the
+       opposite of a completion. Taken as one it ends the wait early and
+       reports its own arrival as the frame's paint time, which is why a log of
+       genuine 70-90 ms paints was salted with 7-12 ms ones measuring nothing. */
+    fake_reset();
+    fake_tick     = 400000u;
+    streamState   = KEYFRAME_SENT;
+    kfAckReceived = False;
+    kfAckWaitTick = (uint32_t)xTaskGetTickCount();
+
+    FDCAN_RxHeaderTypeDef hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.Identifier = IMG_CAN_ID_ACK;
+    hdr.DataLength = FDCAN_DLC_BYTES_8;
+    uint8_t late[8] = {0x03, 0, 0, 0, 0, 0, 0, 0};
+    RAMN_TELEMATICS_ProcessImageACK(&hdr, late, 0u);
+    CHECK(kfAckReceived == False, "a late ACK is not taken as the frame completing");
+
+    uint8_t done[8] = {0x00, 0, 0, 0, 0, 0, 0, 0};
+    RAMN_TELEMATICS_ProcessImageACK(&hdr, done, 0u);
+    CHECK(kfAckReceived == True, "but the real one is");
+}
+
 static void case_the_keyframe_ack_wait_is_measured_against_its_own_clock(void)
 {
     h_case_begin("the keyframe ACK wait is measured against the clock it was armed with");
@@ -261,6 +384,10 @@ int main(void)
     case_zero_payload_frames_are_legal();
     case_short_and_malformed_are_rejected();
 #ifdef TELEMATICS_HAS_STREAM_STATE
+    case_a_re_presented_image_transaction_is_forwarded_once();
+    case_a_repeated_plain_can_frame_is_still_forwarded();
+    case_a_different_image_transaction_is_not_mistaken_for_a_repeat();
+    case_an_img_ack_late_does_not_end_the_keyframe_wait();
     case_the_keyframe_ack_wait_is_measured_against_its_own_clock();
     case_an_ack_that_arrives_reports_how_long_it_took();
     case_the_delta_idle_timeout_uses_the_same_clock();

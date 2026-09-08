@@ -174,6 +174,9 @@ static uint32_t kfAckWaitTick    = 0;
 static uint32_t    kfAckLatencyMs    = 0;
 static RAMN_Bool_t kfAckLatencyPrint = False;
 #define KF_ACK_TIMEOUT_MS 2000U
+// Byte 0 of a 0x303 when ECU A saw IMG_END outside a keyframe. Mirrors
+// IMG_ACK_LATE in ramn_screen_image.c.
+#define IMG_ACK_LATE_STATUS 0x03U
 
 // Delta tracking
 static uint8_t     deltaFrameSeq          = 0;
@@ -250,6 +253,7 @@ static uint8_t pollTxBuffer[SPI_RX_BUFFER_SIZE] = {
 typedef struct
 {
 	// TX stats (CAN → ESP32)
+	volatile uint32_t spiRxRepeatRespCnt;  // Image transactions the ESP32 presented twice
 	volatile uint32_t spiTxRequestCnt;     // Number of CAN messages requested for SPI transmission
 	volatile uint32_t spiTxSentCnt;        // Number of successful SPI transmissions (batch count)
 	volatile uint32_t spiTxBytesSent;      // Total bytes successfully transmitted over SPI
@@ -631,10 +635,55 @@ static uint8_t ByteCountToDLC(uint8_t bytes)
 	return 0xFFU;
 }
 
+// A 32-bit FNV-1a over the whole transaction. Its own function, and the
+// running value a static rather than a local, because ProcessESP32Response is
+// the middle of the deepest chain on the periodic task's 1 KB stack and a
+// single extra 32-bit local there costs 16 bytes of a 32-byte margin.
+static uint32_t respFingerprint;
+static uint32_t lastImageRespFingerprint;
+static void FingerprintResponse(const uint8_t* buf)
+{
+	uint32_t h = 2166136261UL;
+	for (uint16_t i = 0U; i < SPI_RX_BUFFER_SIZE; i++)
+	{
+		h ^= (uint32_t)buf[i];
+		h *= 16777619UL;
+	}
+	respFingerprint = h;
+}
+
 static void ProcessESP32Response(void)
 {
 	uint8_t* rxBuf  = processRxBuffer;
 	uint16_t offset = 0;
+
+	// The ESP32 re-presents its staged SPI response whenever ECU D's write did
+	// not parse as a poll, and on a full-duplex bus ECU D has already clocked
+	// those bytes out. That is deliberate -- "re-present when unsure" is the
+	// right behaviour for a link that cannot retransmit -- and it is only safe
+	// because the receiver ignores what it has already seen.
+	//
+	// ECU A's chunk sequence gate does exactly that for 0x301, and its
+	// duplicate counter proves the repeats are real: flags=0x10 on hardware.
+	// But IMG_START and IMG_END carry no sequence of their own, and both change
+	// state. Forwarded twice they wreck the frame they belong to:
+	//
+	//   IMG_START again  zeroes kfExpectedSeq and the counters mid-frame, and
+	//                    queues a second START entry -- which ECU A's
+	//                    latest-frame-wins skip then reads as "this frame is
+	//                    stale", dropping a picture that was arriving fine.
+	//   IMG_END again    finds imgState already IMG_SHOWN and comes back
+	//                    IMG_ACK_LATE, and every chunk behind it is refused
+	//                    out-of-state.
+	//
+	// Which is precisely the hardware signature: st=3 with decoded=0, then
+	// flags=0x01/0x04/0x05 and a partial decode, all with drop=0/0 -- nothing
+	// lost, everything delivered twice.
+	//
+	// Deduplicate here instead of gating each message type separately. This is
+	// the one place that can see a whole transaction, and the repeat is a
+	// property of the transaction, not of the messages inside it.
+	FingerprintResponse(rxBuf);
 
 #ifdef TELEMATICS_SPI_DEBUG
 	// Print first 16 raw bytes of every poll response
@@ -728,6 +777,25 @@ static void ProcessESP32Response(void)
 		}
 
 		uint8_t msgType = msg[2];
+
+		// Only image traffic is deduplicated. A plain CAN frame relayed from
+		// the ESP32 repeats identically all the time and legitimately -- a
+		// periodic 100 ms frame polled faster than it changes is the normal
+		// case -- so dropping those would be dropping real gateway traffic.
+		// Image messages carry sequence numbers, so a byte-identical image
+		// transaction can only be the same one twice.
+		if ((msgNum == 0) && (msgType >= RAMN_MSG_TYPE_IMG_START))
+		{
+			if (respFingerprint == lastImageRespFingerprint)
+			{
+				spiStats.spiRxRepeatRespCnt++;
+#ifdef TELEMATICS_SPI_DEBUG
+				RAMN_UART_SendStringFromTask("SPI: repeat transaction skipped\r\n");
+#endif
+				return;
+			}
+			lastImageRespFingerprint = respFingerprint;
+		}
 
 #ifdef TELEMATICS_SPI_DEBUG
 		{
@@ -1212,7 +1280,7 @@ static void PrintImageACK(void)
 		                 | ((uint32_t)kfAckPayload[3] << 8)
 		                 | ((uint32_t)kfAckPayload[4] << 16);
 		len = snprintf(imgAckPrintBuf, sizeof(imgAckPrintBuf),
-		    "ECUA ACK: st=%u flags=0x%02X decoded=%lu/115200 rx=%u drop=%u/%u (sent %u)\r\n",
+		    "ECUA ACK: st=%u flags=0x%02X decoded=%lu/115200 rx=%u ringdrop=%u canovr=%u (sent %u)\r\n",
 		    kfAckPayload[0], kfAckPayload[1], (unsigned long)decoded,
 		    kfAckPayload[5], kfAckPayload[6], kfAckPayload[7], kfChunksSent);
 	}
@@ -1308,7 +1376,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, bufferSize,
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -1316,6 +1384,7 @@ static void PrintSPIStats(void)
 		statsSnapshot.spiRxCompleteCnt,
 		statsSnapshot.spiRxEmptyRespCnt,
 		statsSnapshot.spiRxNoRespFoundCnt,
+		statsSnapshot.spiRxRepeatRespCnt,
 		statsSnapshot.spiRxBusySkipCnt + statsSnapshot.spiRxStateSkipCnt,
 		statsSnapshot.spiRxWatchdogResetCnt,
 		stateName,
@@ -1575,6 +1644,14 @@ void RAMN_TELEMATICS_ProcessImageACK(const FDCAN_RxHeaderTypeDef* pHeader,
 	kfAckRxCnt++;
 
 	if (streamState != KEYFRAME_SENT) return;
+
+	// IMG_ACK_LATE means "0x302 reached me but I was not receiving a keyframe"
+	// -- the opposite of a completion. Taken as one it ends the wait early and
+	// reports its arrival as the frame's paint time, which is why a log full of
+	// genuine 70-90 ms paints was salted with 7-12 ms ones that measured
+	// nothing. Let the real ACK, or the timeout, end the wait.
+	if (((data != NULL) ? data[0] : 0xFFU) == IMG_ACK_LATE_STATUS) return;
+
 	kfAckStatus   = (data != NULL) ? data[0] : 0xFFU;
 	kfAckReceived = True;
 }
