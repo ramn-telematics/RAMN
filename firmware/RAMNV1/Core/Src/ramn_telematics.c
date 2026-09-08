@@ -1323,33 +1323,24 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 		taskEXIT_CRITICAL();
 	}
 
+	// The poll costs one state transition per call: request on one tick, notice
+	// the DMA finished and process on the next, and only on a third is the
+	// machine back in IDLE to ask again. At a 10 ms period that is ~30 ms a
+	// poll however small currentPollIntervalMs is set -- measured at 32.4 ms
+	// while streaming, with the interval already down at 1 ms. Seven chunks a
+	// poll made that 216 chunks/s, so a 1120-chunk keyframe of a photograph
+	// took 5.2 seconds.
+	//
+	// The DMA for a 512-byte transaction finishes in well under a tick, so the
+	// wait was never for the hardware -- it was for the next call. Letting the
+	// machine take as many steps as it can without blocking collapses the
+	// round trip to one tick: process the response and ask again in the same
+	// call. Two passes is all it can ever use, since a fresh request leaves
+	// REQUESTED and there is nothing to do but wait for the interrupt.
 	switch (spiPollState)
 	{
 		case SPI_POLL_IDLE:
-			// Check if it's time to poll ESP32
-			if ((tick - spiLastPollTick) >= currentPollIntervalMs)
-			{
-				if (RequestESP32Poll())
-				{
-					// Poll request successful
-					// CRITICAL: Protect timestamp writes from interrupts (prevent word-tearing/corruption)
-					taskENTER_CRITICAL();
-					spiLastPollTick = tick;
-					spiLastPollAttemptTick = tick;
-					taskEXIT_CRITICAL();
-					// State changed to SPI_POLL_REQUESTED by RequestESP32Poll
-				}
-				else
-				{
-					// Poll failed (bus busy) - retry sooner by updating attempt time
-					// This allows faster retries when SPI becomes available
-					taskENTER_CRITICAL();
-					spiLastPollAttemptTick = tick;
-					taskEXIT_CRITICAL();
-					// Don't update spiLastPollTick - will retry next Update() call
-				}
-			}
-			break;
+			break;   // nothing outstanding; a poll starts in the request below
 
 		case SPI_POLL_REQUESTED:
 			// Waiting for DMA completion (handled by callback)
@@ -1391,6 +1382,30 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 
 			spiPollState = SPI_POLL_IDLE;
 			break;
+	}
+
+	// Ask again in the SAME call, now that whatever the last one left has been
+	// dealt with. Deferring this to the next tick is what made a poll cost
+	// three of them however small currentPollIntervalMs was set.
+	if ((spiPollState == SPI_POLL_IDLE) && ((tick - spiLastPollTick) >= currentPollIntervalMs))
+	{
+		if (RequestESP32Poll())
+		{
+			// CRITICAL: Protect timestamp writes from interrupts (prevent word-tearing/corruption)
+			taskENTER_CRITICAL();
+			spiLastPollTick = tick;
+			spiLastPollAttemptTick = tick;
+			taskEXIT_CRITICAL();
+			// State changed to SPI_POLL_REQUESTED by RequestESP32Poll
+		}
+		else
+		{
+			// Bus busy. spiLastPollTick is deliberately not advanced, so the
+			// next call retries immediately rather than waiting an interval.
+			taskENTER_CRITICAL();
+			spiLastPollAttemptTick = tick;
+			taskEXIT_CRITICAL();
+		}
 	}
 
 	// Periodically flush SPI buffer to ensure messages don't get stuck
