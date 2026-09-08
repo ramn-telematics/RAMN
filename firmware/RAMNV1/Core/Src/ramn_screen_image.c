@@ -713,7 +713,16 @@ static void SCREENIMAGE_Update(uint32_t tick)
                 SendImageAck(IMG_ACK_END, entry->data[0], &st);
                 prevStats = st;               // for the next frame's START ack
                 kfEndSeen = True;
-                imgState  = IMG_SHOWN;
+                // imgState is NOT touched here. It gates which 0x301 frames the
+                // CAN RX task accepts, and that task is already receiving the
+                // NEXT keyframe by the time this entry is drained -- setting
+                // IMG_SHOWN from here lands in the middle of that frame and
+                // every chunk after it is refused as out-of-state. Measured on
+                // hardware: about half of all frames came back
+                // flags=0x04 decoded=2910/7200, and their IMG_END then answered
+                // IMG_ACK_LATE because the state had moved on underneath it.
+                // The keyframe is over when IMG_END ARRIVES, which is a fact
+                // the CAN RX task owns and now records for itself.
 
                 ri = (ri + 1U) % KFRING_ENTRIES;
                 __DMB();
@@ -1203,6 +1212,14 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
             endEntry->kind    = KFRING_KIND_END;
             __DMB();
             kfRingWriteIdx = next_wi;
+
+            // The frame stops HERE, where the last chunk of it has arrived --
+            // not where the drain finishes painting it. imgState is read only
+            // by this task, to decide which chunks to accept, so this task is
+            // the only one that may write it: a write from the drain arrives
+            // an unbounded time later, by which point this task has moved on
+            // to the next keyframe and the write silently truncates it.
+            imgState = IMG_SHOWN;
             return;
         }
 

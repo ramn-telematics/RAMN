@@ -1171,6 +1171,75 @@ static size_t panel_count(uint8_t lo, uint8_t hi)
     return n;
 }
 
+/* Send chunks [from, to) of a prepared stream, without draining. */
+static void send_chunk_range(const uint8_t *stream, uint16_t n,
+                             uint16_t from, uint16_t to, uint32_t tick)
+{
+    for (uint16_t i = from; i < to; i++) {
+        uint16_t off  = (uint16_t)(i * RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+        if (off >= n) break;
+        uint16_t take = (uint16_t)(n - off);
+        if (take > RAMN_PIPE_SPI_CHUNK_PAYLOAD) take = RAMN_PIPE_SPI_CHUNK_PAYLOAD;
+        send_img_data(i, &stream[off], (uint8_t)take, tick);
+    }
+}
+
+static void case_draining_an_img_end_does_not_close_the_frame_after_it(void)
+{
+    h_case_begin("draining one frame's IMG_END does not close the keyframe already arriving");
+    /* imgState decides which 0x301 frames the CAN RX task accepts. IMG_END was
+       queued on the ring (so its ACK could report a frame that had actually
+       been painted) but imgState was still set to IMG_SHOWN where that entry
+       was DRAINED -- an unbounded time later, by which point the RX task is
+       receiving the next keyframe. The write lands mid-frame and every chunk
+       after it is refused as out-of-state.
+
+       On hardware this showed as about half of all frames coming back
+       flags=0x04 decoded=2910/7200 rx=10, with their IMG_END then answered
+       IMG_ACK_LATE because the state had moved on underneath it. Nothing was
+       wrong with the link: ECU A was refusing chunks it had asked for.
+
+       A keyframe is over when its IMG_END ARRIVES. That is the RX task's own
+       fact, and it is the only task that reads the flag. */
+    reset_state();
+
+    uint8_t sa[256], sb[256];
+    uint16_t na = rle_runs(sa, 0x11, 0x22, 60u * 60u);
+    uint16_t nb = rle_runs(sb, 0x33, 0x44, 60u * 60u);
+    uint16_t ca = (uint16_t)((na + RAMN_PIPE_SPI_CHUNK_PAYLOAD - 1) / RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+    uint16_t cb = (uint16_t)((nb + RAMN_PIPE_SPI_CHUNK_PAYLOAD - 1) / RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+    if (!CHECK_OK(cb >= 2, "the fixture frame is long enough to interleave")) return;
+
+    /* Frame A arrives and is drained, so the drain is past A's START entry and
+       A will not be skipped as stale. */
+    send_img_start_scaled(60, 60, ca, 4, 200);
+    send_chunk_range(sa, na, 0, ca, 200);
+    drain(200);
+
+    /* A's IMG_END is queued but not yet drained -- the periodic task is busy
+       painting, which is where it spends most of a frame period. */
+    feed_img_end(0x00, 210);
+
+    /* Frame B starts arriving while that END is still sitting in the ring. */
+    send_img_start_scaled(60, 60, cb, 4, 220);
+    send_chunk_range(sb, nb, 0, 1, 220);
+
+    /* Now the drain reaches A's IMG_END, mid-way through frame B. */
+    drain(230);
+
+    send_chunk_range(sb, nb, 1, cb, 240);
+    feed_img_end(0x00, 240);
+    drain(250);
+
+    CHECK(kfStateDrops == 0, "no chunk of the arriving frame is refused as out-of-state");
+    CHECK(panel_count(0x33, 0x44) == 240u * 240u, "and it reaches the panel whole");
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL, "it is acknowledged")) return;
+    CHECK(ack->data[0] == 0x00U, "as a clean keyframe, not IMG_ACK_LATE");
+    CHECK((ack->data[1] & 0x04U) == 0U, "with no out-of-state drops reported");
+}
+
 static void case_a_superseded_keyframe_is_dropped_whole(void)
 {
     h_case_begin("a keyframe superseded before it is painted is dropped whole, and said so");
@@ -1297,6 +1366,7 @@ int main(void)
     case_scale_zero_means_one_to_one();
     case_tiles_are_refused_while_scaled();
     case_a_superseded_keyframe_is_dropped_whole();
+    case_draining_an_img_end_does_not_close_the_frame_after_it();
     case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
