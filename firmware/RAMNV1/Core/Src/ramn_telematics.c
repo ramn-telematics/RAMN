@@ -72,12 +72,18 @@ extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
 // past the first ~256 bytes of a flush was clocked into nothing. That is the
 // TX[Req:33600 Sent:7793] gap in the stats line.
 //
-// Throughput: one IMG_CHUNK SPI message is 68 bytes on the wire, and ECU D can
-// only run one poll per few periodic ticks (the state machine advances once per
-// RAMN_TELEMATICS_Update, at SIM_LOOP_CLOCK_MS), so roughly 30 polls/second.
-// Chunks per poll is therefore the lever that matters: 512 carries 7 of them
-// against the 2 that fit in 160.
-#define SPI_TRANSACTION_SIZE 512
+// Throughput: one IMG_CHUNK SPI message is 68 bytes on the wire, and the poll
+// now completes in one periodic tick, so chunks per transaction is the only
+// remaining lever on this link -- and the link itself is nearly idle. At
+// 32 MHz (SPI2, PCLK 128 MHz / 4) a 1020-byte transaction clocks in 255 us,
+// 2.6% of a 10 ms tick.
+//
+// The size has to be a whole number of 68-byte messages or the remainder is
+// clocked for nothing: 512 carried 7 and wasted 36 bytes on every transaction.
+// 1020 is 15 of them exactly, and stays inside the 1024 the ESP32's DMA
+// descriptor is sized for. That is 1500 chunks/s, about 26% of the CAN bus.
+#define IMG_CHUNK_SPI_MSG_LEN 68U   // LEN+MARKER+TYPE+SEQ(2)+REAL_LEN+61+CHK
+#define SPI_TRANSACTION_SIZE 1020
 
 // Tile RLE bytes one 0x305 frame carries: 64 minus the 5-byte tile header.
 #define DELTA_CAN_HEADER     5U
@@ -121,15 +127,22 @@ static volatile uint32_t spiStatsLastPrintTick = 0;
 // ============================================================================
 #define SPI_POLL_INTERVAL_MS 50   // Normal poll interval (ms) — reduced to 1 ms during streaming
 #define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response
-#define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // 7 packed IMG_CHUNKs per poll
+#define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // 15 packed IMG_CHUNKs per poll
 
 /* One IMG_CHUNK SPI message is [LEN][MARKER][TYPE][SEQ_HI][SEQ_LO][REAL_LEN]
    + 61 payload + [CHK] = 68 bytes. A transaction that cannot hold at least two
    of them is not worth the poll. */
-_Static_assert(SPI_TRANSACTION_SIZE >= (2 * 68),
+_Static_assert(SPI_TRANSACTION_SIZE >= (2 * IMG_CHUNK_SPI_MSG_LEN),
                "SPI transaction too small to carry two image chunks");
 _Static_assert(SPI_TRANSACTION_SIZE <= 1024,
                "raise the ESP32's SPI_BUFFER_SIZE to match before growing this");
+/* Every byte past the last whole message is clocked and thrown away, so a size
+   that is not a multiple of one is pure waste on every single transaction. */
+_Static_assert((SPI_TRANSACTION_SIZE % IMG_CHUNK_SPI_MSG_LEN) == 0,
+               "SPI transaction must be a whole number of IMG_CHUNK messages");
+/* The ESP32's SPI slave DMA moves whole words. */
+_Static_assert((SPI_TRANSACTION_SIZE % 4) == 0,
+               "SPI transaction must be a multiple of 4 bytes");
 
 // Poll state machine
 typedef enum {
