@@ -52,10 +52,12 @@ static void feed_can(uint32_t id, const uint8_t *data, uint8_t byteLen, uint32_t
 }
 
 /* IMG_START as ECU D forwards it: 12 bytes, little-endian fields. */
-static void send_img_start(uint16_t w, uint16_t h, uint16_t chunks, uint32_t tick)
+static void send_img_start_scaled(uint16_t w, uint16_t h, uint16_t chunks,
+                                  uint8_t scale, uint32_t tick)
 {
     uint8_t b[12];
     memset(b, 0, sizeof b);
+    b[8] = scale;
     b[0] = (uint8_t)(w & 0xFF);      b[1] = (uint8_t)(w >> 8);
     b[2] = (uint8_t)(h & 0xFF);      b[3] = (uint8_t)(h >> 8);
     b[4] = (uint8_t)(chunks & 0xFF); b[5] = (uint8_t)(chunks >> 8);
@@ -64,6 +66,12 @@ static void send_img_start(uint16_t w, uint16_t h, uint16_t chunks, uint32_t tic
     for (int i = 0; i < 11; i++) chk ^= b[i];
     b[11] = chk;
     feed_can(IMG_CAN_ID_START, b, 12, tick);
+}
+
+/* Unscaled, which is every case that predates the scale byte. */
+static void send_img_start(uint16_t w, uint16_t h, uint16_t chunks, uint32_t tick)
+{
+    send_img_start_scaled(w, h, chunks, 1, tick);
 }
 
 /* One 0x301 data frame: [SEQ_HI][SEQ_LO][REAL_LEN][payload...] padded to 64. */
@@ -99,6 +107,8 @@ static void reset_state(void)
     kfTileDrops       = 0;
     kfTileShort       = 0;
     tileActive        = False;
+    kfScale           = 1;
+    kfRowFill         = 0;
     kfExpectedSeq     = 0;
     kfSeqBroken       = False;
     kfDupSkips        = 0;
@@ -949,6 +959,138 @@ static void case_a_chunk_arriving_out_of_order_is_refused(void)
     CHECK((ack->data[1] & 0x01U) != 0U, "and the ACK says the frame was truncated");
 }
 
+/* ------------------------------------------------------------------ */
+/* Scaled keyframes                                                     */
+/* ------------------------------------------------------------------ */
+
+/* A valid stream for arbitrary pixels: literal blocks of up to 128 bytes.
+   128 is not a multiple of a 60-pixel row, so blocks straddle row boundaries
+   throughout -- which is the case the row assembler has to get right. */
+static uint16_t rle_literal(uint8_t *out, const uint8_t *px, uint16_t nbytes)
+{
+    uint16_t o = 0, i = 0;
+    while (i < nbytes) {
+        uint16_t n = (uint16_t)(nbytes - i);
+        if (n > 128) n = 128;
+        out[o++] = (uint8_t)(n - 1);
+        memcpy(&out[o], &px[i], n);
+        o = (uint16_t)(o + n);
+        i = (uint16_t)(i + n);
+    }
+    return o;
+}
+
+/* Distinct-ish pixels, so a misplaced one shows up rather than blending in. */
+static void make_source(uint8_t *px, uint16_t w, uint16_t h)
+{
+    for (uint16_t y = 0; y < h; y++)
+        for (uint16_t x = 0; x < w; x++) {
+            uint16_t v = (uint16_t)(((x * 7u + y * 31u) & 0xFFFFu) | 1u);
+            px[(y * w + x) * 2]     = (uint8_t)(v & 0xFF);
+            px[(y * w + x) * 2 + 1] = (uint8_t)(v >> 8);
+        }
+}
+
+static void send_scaled_frame(uint16_t w, uint16_t h, uint8_t scale,
+                              const uint8_t *px, uint32_t tick)
+{
+    static uint8_t stream[80000];
+    uint16_t n = rle_literal(stream, px, (uint16_t)(w * h * 2));
+    uint16_t chunks = (uint16_t)((n + RAMN_PIPE_SPI_CHUNK_PAYLOAD - 1) /
+                                 RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+    send_img_start_scaled(w, h, chunks, scale, tick);
+    uint16_t seq = 0;
+    for (uint16_t off = 0; off < n; off = (uint16_t)(off + RAMN_PIPE_SPI_CHUNK_PAYLOAD)) {
+        uint16_t take = (uint16_t)(n - off);
+        if (take > RAMN_PIPE_SPI_CHUNK_PAYLOAD) take = RAMN_PIPE_SPI_CHUNK_PAYLOAD;
+        send_img_data(seq++, &stream[off], (uint8_t)take, tick + 1);
+        drain(tick + 2);            /* the ring holds 63, this frame is ~120 */
+    }
+    drain(tick + 3);
+}
+
+static void case_a_scaled_keyframe_fills_the_panel(void)
+{
+    h_case_begin("a 60x60 frame at scale 4 fills the whole panel");
+    /* Flattening in the browser paints f x f blocks flat but still ships all
+       57,600 pixels and leaves the RLE to find the runs, which it only partly
+       does. Sending the small image instead and repeating pixels here is the
+       same picture for a fraction of the link: measured on a photographic
+       frame, 3x3 flattened at full size is 824 chunks against 206 for 80x80
+       scaled. */
+    reset_state();
+    static uint8_t src[60 * 60 * 2];
+    make_source(src, 60, 60);
+    send_scaled_frame(60, 60, 4, src, 200);
+
+    CHECK(fake_window_opens == 1, "one window is opened");
+    CHECK(fake_window_w == 240 && fake_window_h == 240,
+          "sized to the panel, not to the 60x60 source");
+    CHECK(fake_panel_oob == 0, "and nothing is written outside it");
+
+    size_t wrong = 0, checked = 0;
+    for (uint16_t y = 0; y < 240 && wrong == 0; y++)
+        for (uint16_t x = 0; x < 240; x++) {
+            size_t d = ((size_t)y * 240 + x) * 2;
+            size_t s = ((size_t)(y / 4) * 60 + (x / 4)) * 2;
+            checked++;
+            if (fake_panel[d] != src[s] || fake_panel[d + 1] != src[s + 1]) { wrong++; break; }
+        }
+    CHECK(checked == 240u * 240u, "every panel pixel was compared");
+    CHECK(wrong == 0, "and each one carries the source pixel it magnifies");
+}
+
+static void case_a_scale_that_would_overflow_is_refused(void)
+{
+    h_case_begin("a scale that would not fit the panel falls back to 1:1");
+    /* A wrong scale does not crop the picture, it shears every row after the
+       first. A 1:1 image in the corner is at least recognisably wrong. */
+    reset_state();
+    static uint8_t src[120 * 120 * 2];
+    make_source(src, 120, 120);
+    send_scaled_frame(120, 120, 3, src, 300);      /* 360 px would not fit */
+
+    CHECK(fake_window_w == 120 && fake_window_h == 120,
+          "the window is the source size, not 360x360");
+    CHECK(fake_panel_oob == 0, "and nothing is written off the panel");
+}
+
+static void case_scale_zero_means_one_to_one(void)
+{
+    h_case_begin("a sender with no scale byte still draws 1:1");
+    /* Byte 8 was padding before this existed, so an older ECU D sends 0. */
+    reset_state();
+    static uint8_t src[64 * 2];
+    make_source(src, 64, 1);
+    send_scaled_frame(64, 1, 0, src, 400);
+
+    CHECK(fake_window_w == 64 && fake_window_h == 1, "the window is 64x1");
+    CHECK(memcmp(fake_panel, src, 64 * 2) == 0, "and the pixels land unscaled");
+}
+
+static void case_tiles_are_refused_while_scaled(void)
+{
+    h_case_begin("delta tiles are refused against a scaled keyframe");
+    /* Tiles carry source-space coordinates and no scale of their own, so
+       against a scaled keyframe they would land at a fraction of their real
+       position and size. The sender holds scale at 1 in delta mode; if it
+       does not, refusing keeps the keyframe intact. */
+    reset_state();
+    static uint8_t src[60 * 60 * 2];
+    make_source(src, 60, 60);
+    send_scaled_frame(60, 60, 4, src, 500);
+    send_img_end(0x00, 600);                       /* -> IMG_SHOWN */
+    fake_screen_reset();
+
+    uint8_t rle[8];
+    uint16_t n = rle_solid(rle, 64, 0x12, 0x34);
+    send_tile(3, 5, 8, rle, n, 700);
+    drain(701);
+
+    CHECK(kfTileDrops == 1, "the tile is counted as dropped");
+    CHECK(fake_screen_len == 0, "and nothing is drawn over the keyframe");
+}
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -982,6 +1124,10 @@ int main(void)
     case_img_end_does_not_overtake_the_ring();
     case_a_repeated_chunk_is_refused();
     case_a_chunk_arriving_out_of_order_is_refused();
+    case_a_scaled_keyframe_fills_the_panel();
+    case_a_scale_that_would_overflow_is_refused();
+    case_scale_zero_means_one_to_one();
+    case_tiles_are_refused_while_scaled();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);

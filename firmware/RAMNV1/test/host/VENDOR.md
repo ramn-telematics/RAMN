@@ -7,7 +7,7 @@ Generated, not written. Do not hand-edit it — a refresh overwrites it.
 | | |
 |---|---|
 | Source repo | https://github.com/ramn-telematics/ramn-protocol |
-| Pinned revision | `aa472a3731576f6acc4e5bfba5acd5f0d6684534` |
+| Pinned revision | `34a0fe4692408b6ee132cdca4210e27beede98e8` |
 | Path in source | `c_conformance/ramn_test_vectors.h` |
 
 ### Refreshing

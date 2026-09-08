@@ -819,7 +819,11 @@ static void ProcessESP32Response(void)
 
 		// ------------------------------------------------------------------
 		// TYPE 0x81: IMG_START — start of a keyframe
-		// Format: [0x0A][0xCC][0x81][W_HI][W_LO][H_HI][H_LO][CH_HI][CH_LO][X_OFF][Y_OFF][CHK]
+		// Format: [LEN][0xCC][0x81][W_HI][W_LO][H_HI][H_LO][CH_HI][CH_LO][X_OFF][Y_OFF][SCALE][CHK]
+		//
+		// SCALE is how many times ECU A repeats each source pixel in both axes.
+		// It is the last field so that a sender predating it still parses: a
+		// 12-byte IMG_START has no byte 11, and 0 reaches ECU A as 1:1.
 		// ------------------------------------------------------------------
 		if (msgType == RAMN_MSG_TYPE_IMG_START)
 		{
@@ -830,6 +834,7 @@ static void ProcessESP32Response(void)
 			uint16_t ch = (uint16_t)((uint16_t)msg[8] | ((uint16_t)msg[7] << 8));
 			uint8_t  xo = msg[9];
 			uint8_t  yo = msg[10];
+			uint8_t  sc = (msgLen >= 11U) ? msg[11] : 0U;
 
 			// A new keyframe while the previous one is still waiting for its
 			// ACK means that ACK never arrived -- and the timeout branch in
@@ -854,7 +859,7 @@ static void ProcessESP32Response(void)
 			canData[5]  = (uint8_t)(ch >> 8);
 			canData[6]  = xo;
 			canData[7]  = yo;
-			canData[8]  = 0x00U;
+			canData[8]  = sc;      // pixel repeat factor, 0 or 1 = as-is
 			canData[9]  = 0x00U;
 			canData[10] = 0x01U;   // VERSION
 			uint8_t xorChk = 0U;

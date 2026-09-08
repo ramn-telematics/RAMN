@@ -55,6 +55,23 @@ static ImageState_t imgState = IMG_IDLE;
 // Keyframe metadata
 static uint16_t kfWidth        = 0;
 static uint16_t kfHeight       = 0;
+
+// Source-pixel repeat factor, from byte 8 of IMG_START. The sender ships a
+// genuinely smaller image and the panel is filled here, which costs the link
+// scale^2 times less than sending 240x240 with each block painted flat and
+// hoping the RLE finds the runs -- it only partly does. Measured on a
+// photographic frame: 3x3 flattened at full size is 824 chunks, the same
+// picture sent as 80x80 and scaled here is 206.
+//
+// 1 means send-as-is and keeps the original streaming path untouched.
+static uint8_t  kfScale        = 1U;
+// One source row is assembled before anything reaches the panel: the decoder
+// emits an arbitrary run of bytes with no notion of where a row ends, and the
+// ST7789's auto-increment only lands correctly if each expanded row is written
+// whole and in order.
+static uint8_t  kfRowBuf[LCD_WIDTH * 2];
+static uint8_t  kfRowOut[LCD_WIDTH * 2];
+static uint16_t kfRowFill      = 0;
 static uint16_t kfTotalChunks  = 0;
 static uint8_t  kfXOffset      = 0;
 static uint8_t  kfYOffset      = 0;
@@ -400,6 +417,8 @@ static void SCREENIMAGE_Init(void)
         (int)screenActive, (int)RAMN_SCREENIMAGE_DisplayRequested, (int)imgState);
     if (len > 0) RAMN_UART_SendFromTask((uint8_t*)buf, (uint32_t)len);
 #endif
+    kfScale   = 1U;
+    kfRowFill = 0U;
     RAMN_SPI_DrawRectangle(0, 0, LCD_WIDTH, LCD_HEIGHT, COLOR_BLACK);
     RAMN_SPI_DrawString(50, 108, COLOR_WHITE, COLOR_BLACK, "  Streaming...");
 }
@@ -435,6 +454,41 @@ static void SCREENIMAGE_Deinit(void)
     kfTileShort     = 0;
     tileActive      = False;
     RLE_StreamReset(&tileStream);
+}
+
+// Repeat every source pixel kfScale times across and kfScale times down.
+//
+// Called only with kfScale > 1 and an even byte count, from the periodic task
+// -- RAMN_SPI_WriteImageChunk blocks on the DMA's task notification, so
+// writing the same row buffer several times in a row is safe.
+static void WriteScaledPixels(const uint8_t* px, uint16_t len)
+{
+    const uint16_t rowBytes = (uint16_t)(kfWidth * 2U);
+    uint16_t i = 0U;
+
+    while (i < len)
+    {
+        uint16_t take = (uint16_t)(rowBytes - kfRowFill);
+        if (take > (uint16_t)(len - i)) take = (uint16_t)(len - i);
+        for (uint16_t k = 0U; k < take; k++) kfRowBuf[kfRowFill + k] = px[i + k];
+        kfRowFill = (uint16_t)(kfRowFill + take);
+        i         = (uint16_t)(i + take);
+
+        if (kfRowFill < rowBytes) break;      // still short of a whole row
+
+        uint16_t o = 0U;
+        for (uint16_t sx = 0U; sx < rowBytes; sx += 2U)
+        {
+            for (uint8_t r = 0U; r < kfScale; r++)
+            {
+                kfRowOut[o]      = kfRowBuf[sx];
+                kfRowOut[o + 1U] = kfRowBuf[sx + 1U];
+                o = (uint16_t)(o + 2U);
+            }
+        }
+        for (uint8_t r = 0U; r < kfScale; r++) RAMN_SPI_WriteImageChunk(kfRowOut, o);
+        kfRowFill = 0U;
+    }
 }
 
 static void SCREENIMAGE_Update(uint32_t tick)
@@ -565,7 +619,8 @@ static void SCREENIMAGE_Update(uint32_t tick)
 
             if (decodedLen > 0U)
             {
-                RAMN_SPI_WriteImageChunk(kfDecodeBuf, decodedLen);
+                if (kfScale > 1U) WriteScaledPixels(kfDecodeBuf, decodedLen);
+                else              RAMN_SPI_WriteImageChunk(kfDecodeBuf, decodedLen);
                 kfDecodedBytes += decodedLen;
             }
 
@@ -728,6 +783,20 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         if (kfWidth  > (uint16_t)LCD_WIDTH)  kfWidth  = (uint16_t)LCD_WIDTH;
         if (kfHeight > (uint16_t)LCD_HEIGHT) kfHeight = (uint16_t)LCD_HEIGHT;
 
+        // Byte 8 is the scale factor. A sender that predates it sends 0, and
+        // a short frame has no byte 8 at all; both mean 1:1. Anything that
+        // would not fit the panel is refused rather than clamped -- a wrong
+        // scale does not crop the image, it shears every row after the first,
+        // and a 1:1 picture in the corner is far easier to recognise as wrong.
+        kfScale = (dlcLen >= 9U) ? data[8] : 1U;
+        if (kfScale == 0U) kfScale = 1U;
+        if (((uint32_t)kfWidth  * kfScale) > (uint32_t)LCD_WIDTH ||
+            ((uint32_t)kfHeight * kfScale) > (uint32_t)LCD_HEIGHT)
+        {
+            kfScale = 1U;
+        }
+        kfRowFill = 0U;
+
         prevDecodedBytes  = kfDecodedBytes;
         prevFramesRx      = kfFramesRx;
         prevRingDrops     = kfRingDrops;
@@ -753,8 +822,8 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // Defer ST7789 window open to Update() — SPI must be called from Periodic task only.
         kfPendingXOff  = kfXOffset;
         kfPendingYOff  = kfYOffset;
-        kfPendingW     = kfWidth;
-        kfPendingH     = kfHeight;
+        kfPendingW     = (uint16_t)(kfWidth  * kfScale);
+        kfPendingH     = (uint16_t)(kfHeight * kfScale);
         kfWindowNeeded = True;
 
         // Say "I got IMG_START" on the bus. Without this, an ECU A that never
@@ -936,6 +1005,18 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
             return;
         }
         if (dlcLen < 5U) return;
+
+        // Tiles carry source-space coordinates and no scale of their own, so
+        // against a scaled keyframe they would land at a fraction of their
+        // real position and at a fraction of their real size. The sender is
+        // expected to hold scale at 1 whenever it sends deltas; if it does
+        // not, refusing the tile leaves the keyframe intact where drawing it
+        // would smear a wrong patch across the picture.
+        if (kfScale > 1U)
+        {
+            if (kfTileDrops < 0xFFFFU) kfTileDrops++;
+            return;
+        }
 
         uint8_t tileX    = data[0];
         uint8_t tileY    = data[1];

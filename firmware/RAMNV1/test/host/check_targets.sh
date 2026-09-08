@@ -120,7 +120,8 @@ done
 # is built in its own function precisely so a second call site cannot grow that
 # handler's frame; this is what checks that it stayed that way.
 ECUA_CHAINS="SCREENIMAGE_ProcessRxCANMessage,SendImageAck
-SCREENIMAGE_Update,SendImageAck"
+SCREENIMAGE_Update,SendImageAck
+SCREENIMAGE_Update,WriteScaledPixels"
 
 echo "stack budgets, ECU A image screen (CAN RX task: ${PERIODIC_STACK}B total)"
 su_a="$TMP/stack_ecua.su"
