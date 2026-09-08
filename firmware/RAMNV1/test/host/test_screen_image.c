@@ -99,6 +99,9 @@ static void reset_state(void)
     kfTileDrops       = 0;
     kfTileShort       = 0;
     tileActive        = False;
+    kfExpectedSeq     = 0;
+    kfSeqBroken       = False;
+    kfDupSkips        = 0;
     RLE_StreamReset(&tileStream);
     fake_reset();
     /* The activity timeout reads xTaskGetTickCount(), so the fake clock is part
@@ -118,6 +121,10 @@ static void send_img_end(uint8_t status, uint32_t tick)
     h.Identifier = IMG_CAN_ID_END;
     h.DataLength = FDCAN_DLC_BYTES_8;
     SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+    /* IMG_END rides the ring behind the chunks it terminates, so the ACK comes
+       out of the periodic task rather than the CAN task. Every caller here
+       wants the answer, so drain for it. */
+    drain(tick);
 }
 
 /* The single 0x303 frame ECU A sends in reply to IMG_END, or NULL. */
@@ -839,6 +846,109 @@ static void case_tiles_before_a_keyframe_are_dropped(void)
     CHECK(fake_screen_len == 0, "and nothing is drawn");
 }
 
+static void case_img_end_does_not_overtake_the_ring(void)
+{
+    h_case_begin("IMG_END waits for the chunks that came before it");
+    /* IMG_END is handled in the ReceiveCAN task; chunks are decoded by the
+       10 ms Periodic task draining kfRingBuf. Nothing orders the two, so a
+       keyframe whose chunks are still queued is measured -- and acknowledged
+       -- as truncated.
+
+       This stayed hidden while ECU D forwarded two chunks per SPI transaction:
+       the ring drained between bursts. Raising the transaction to 512 bytes
+       (7 chunks) put a whole burst plus IMG_END on the bus inside one 10 ms
+       tick, and every keyframe since ACKs truncated. Hardware, 2026-09-08:
+       23 chunks accepted, drop=0/0, decoded=51968/115200. 51968 bytes is
+       exactly the 10 chunks that had been drained when IMG_END landed.
+
+       Every other case here calls drain() before send_img_end(), so the whole
+       suite encoded the assumption the hardware just broke. */
+    reset_state();
+
+    static uint8_t stream[240 * 240 / 128 * 3];
+    for (size_t i = 0; i < sizeof stream; i += 3) {
+        stream[i] = 0xFF;                    /* run of 128 */
+        stream[i + 1] = 0x12; stream[i + 2] = 0x34;
+    }
+
+    uint16_t chunks = (uint16_t)((sizeof stream + RAMN_PIPE_SPI_CHUNK_PAYLOAD - 1) /
+                                 RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+    send_img_start(240, 240, chunks, 200);
+
+    /* The burst as the wire delivers it: no periodic tick in between. */
+    uint16_t seq = 0;
+    for (size_t off = 0; off < sizeof stream; off += RAMN_PIPE_SPI_CHUNK_PAYLOAD) {
+        size_t n = sizeof stream - off;
+        if (n > RAMN_PIPE_SPI_CHUNK_PAYLOAD) n = RAMN_PIPE_SPI_CHUNK_PAYLOAD;
+        send_img_data(seq++, &stream[off], (uint8_t)n, 201);
+    }
+    send_img_end(0x00, 201);
+    drain(202);
+
+    CHECK(fake_screen_len == 240 * 240 * 2, "the whole frame still reaches the panel");
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL && ack->len == 8, "an 8-byte ACK came back")) return;
+    uint32_t decoded = (uint32_t)ack->data[2]
+                     | ((uint32_t)ack->data[3] << 8)
+                     | ((uint32_t)ack->data[4] << 16);
+    CHECK(decoded == 240u * 240u * 2u,
+          "and the ACK reports the whole frame, not what happened to be drained");
+    CHECK((ack->data[1] & 0x01U) == 0U, "with the truncated flag clear");
+}
+
+static void case_a_repeated_chunk_is_refused(void)
+{
+    h_case_begin("a chunk delivered twice is not decoded twice");
+    /* The RLE stream is one continuous byte sequence cut at fixed offsets, so
+       a chunk appended twice shifts every block after it -- the same damage as
+       a dropped chunk. SEQ_HI/SEQ_LO are read off the frame and then ignored.
+
+       The ESP32 decides whether ECU D took the staged MISO bytes by looking at
+       MOSI, and re-presents the stage when the master's write did not parse as
+       a poll. On a full-duplex bus ECU D has already clocked those bytes out,
+       so it forwards them a second time. Hardware, 2026-09-08: IMG_START
+       announced 1388 chunks, ECU D forwarded 1542, and ECU A decoded
+       127,900 bytes against a 115,200-byte frame -- the 154 duplicates at 61
+       bytes each, times this stream's 1.36x expansion, is 12,770 against the
+       12,700 of overshoot measured. */
+    reset_state();
+
+    send_img_start(240, 240, 4, 300);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};   /* one run of two pixels */
+    send_img_data(0, payload, sizeof payload, 301);
+    send_img_data(1, payload, sizeof payload, 301);
+    send_img_data(1, payload, sizeof payload, 301);   /* the same chunk again */
+    send_img_data(2, payload, sizeof payload, 301);
+    drain(302);
+
+    CHECK(fake_screen_len == 3u * 4u,
+          "three distinct chunks paint three chunks' worth of pixels");
+    CHECK(kfDecodedBytes == 3u * 4u, "and the byte count matches what was sent once");
+}
+
+static void case_a_chunk_arriving_out_of_order_is_refused(void)
+{
+    h_case_begin("a gap in the chunk sequence is caught, not decoded");
+    /* A missing chunk desynchronises the stream exactly as a duplicate does.
+       Splicing the next chunk in over the gap produces a plausible-looking
+       image made of the wrong bytes, so the gap has to end the frame. */
+    reset_state();
+
+    send_img_start(240, 240, 4, 400);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 401);
+    send_img_data(2, payload, sizeof payload, 401);   /* chunk 1 never arrived */
+    drain(402);
+    send_img_end(0x00, 403);
+
+    CHECK(fake_screen_len == 1u * 4u, "only the chunk before the gap is drawn");
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL && ack->len == 8, "an 8-byte ACK came back")) return;
+    CHECK((ack->data[1] & 0x01U) != 0U, "and the ACK says the frame was truncated");
+}
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -869,6 +979,9 @@ int main(void)
     case_a_truncated_tile_is_not_drawn();
     case_a_tile_missing_its_first_chunk_is_refused();
     case_tiles_before_a_keyframe_are_dropped();
+    case_img_end_does_not_overtake_the_ring();
+    case_a_repeated_chunk_is_refused();
+    case_a_chunk_arriving_out_of_order_is_refused();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);

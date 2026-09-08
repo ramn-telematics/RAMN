@@ -128,6 +128,12 @@ static uint32_t lastActivityTick = 0;
 // writes happen -- which is what makes streaming decode possible at all.
 #define KFRING_KIND_IMG   0U   // keyframe chunk  (0x301)
 #define KFRING_KIND_TILE  1U   // delta tile chunk (0x305)
+// IMG_END rides the ring rather than being answered where it arrives. It is
+// handled on the CAN RX task; the chunks it terminates are decoded on the 10 ms
+// periodic task, and nothing else orders the two. Answered on arrival it
+// overtakes its own frame: the ACK measures whatever happened to be drained,
+// and imgState reaches IMG_SHOWN while the panel is still being written.
+#define KFRING_KIND_END   2U   // end of keyframe  (0x302), data[0] = status
 
 typedef struct {
     uint8_t data[KFRING_PAYLOAD];
@@ -142,6 +148,27 @@ typedef struct {
 static KFRingEntry_t        kfRingBuf[KFRING_ENTRIES];
 static volatile uint8_t     kfRingWriteIdx = 0;
 static volatile uint8_t     kfRingReadIdx  = 0;
+
+// The keyframe RLE stream is one continuous byte sequence cut at fixed offsets,
+// so a chunk decoded twice shifts every block after it exactly as a lost one
+// does. SEQ_HI/SEQ_LO were read off each 0x301 frame and then ignored, which
+// left the decoder trusting arrival order on a link that does not guarantee it:
+// the ESP32 re-presents its staged SPI response whenever ECU D's write did not
+// parse as a poll, and on a full-duplex bus ECU D has already clocked those
+// bytes out and forwarded them. Checking the sequence here makes a repeat free
+// and a gap loud, so the link is allowed to be redundant but never silent.
+// Defined below with the ACK layout it builds; the ring drain answers IMG_END
+// and so needs it ahead of that.
+#define IMG_ACK_START  0x02U
+#define IMG_ACK_END    0x00U
+#define IMG_ACK_LATE   0x03U
+static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated);
+
+static uint16_t             kfExpectedSeq = 0;   // CAN RX task only
+// Written on the CAN RX task, read by the periodic task when it answers
+// IMG_END, so the same volatile treatment as the ring indices.
+static volatile RAMN_Bool_t kfSeqBroken   = False;   // a chunk is missing; frame is dead
+static volatile uint16_t    kfDupSkips    = 0;       // chunks the link delivered twice
 
 // ============================================================================
 // TILE ASSEMBLY BUFFER — accumulates RLE-decoded bytes for one delta tile
@@ -428,6 +455,21 @@ static void SCREENIMAGE_Update(uint32_t tick)
         {
             KFRingEntry_t* entry = &kfRingBuf[ri];
 
+            if (entry->kind == KFRING_KIND_END)
+            {
+                // Every chunk ahead of this entry has now been decoded and
+                // written, so these numbers describe the whole frame.
+                RAMN_Bool_t truncated = (RLE_StreamMidBlock(&kfStream) != False) ||
+                                        (kfSeqBroken != False);
+                SendImageAck(IMG_ACK_END, entry->data[0], truncated);
+                imgState = IMG_SHOWN;
+
+                ri = (ri + 1U) % KFRING_ENTRIES;
+                __DMB();
+                kfRingReadIdx = ri;
+                continue;
+            }
+
             if (entry->kind == KFRING_KIND_TILE)
             {
                 // First chunk of a tile: latch its geometry and start a fresh
@@ -600,6 +642,9 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 //   [1] flags        : bit0 truncated (a half-read RLE block at IMG_END)
 //                      bit1 chunks dropped, ring full
 //                      bit2 chunks dropped, wrong state
+//                      bit3 a chunk never arrived; the frame was abandoned
+//                      bit4 the link delivered a chunk twice (harmless: the
+//                           repeat was skipped, not decoded)
 //   [2..4]           : bytes written to the panel, 24-bit little-endian
 //                      (a full 240x240 keyframe is 115,200)
 //   [5]              : 0x301 frames accepted                (saturating 255)
@@ -613,10 +658,6 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 // SCREENIMAGE_ProcessRxCANMessage's frame: that runs on the CAN RX task, whose
 // whole stack is 1 KB (RAMN_ReceiveCANBuffer[256] in main.c).
 // ============================================================================
-#define IMG_ACK_START  0x02U
-#define IMG_ACK_END    0x00U
-#define IMG_ACK_LATE   0x03U
-
 static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated)
 {
     FDCAN_TxHeaderTypeDef ackHdr;
@@ -634,6 +675,8 @@ static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated
     if (truncated    != False) flags |= 0x01U;
     if (kfRingDrops  != 0U)    flags |= 0x02U;
     if (kfStateDrops != 0U)    flags |= 0x04U;
+    if (kfSeqBroken  != False) flags |= 0x08U;
+    if (kfDupSkips   != 0U)    flags |= 0x10U;
 
     // On a START ack the current counters are all zero by definition, so report
     // the frame that just ended instead -- that is the interesting one.
@@ -697,6 +740,9 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         kfRingReadIdx     = 0;
         RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
         kfCarryValid   = False;
+        kfExpectedSeq  = 0;           // IMG_START is the only resynchronisation
+        kfSeqBroken    = False;
+        kfDupSkips     = 0;
         tileAssemblyPos   = 0;
         tileActive        = False;
         RLE_StreamReset(&tileStream);
@@ -744,6 +790,32 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         }
         if (dlcLen < 4U) return;   // must have at least SEQ_HI, SEQ_LO, REAL_LEN, one RLE byte
 
+        // ---- Sequence gate ----
+        // Checked before the ring is touched so a repeat costs no ring space.
+        {
+            uint16_t seq = (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+
+            // Once a chunk is missing every byte after it is misaligned, so the
+            // frame is over. Waiting for the next IMG_START is the only honest
+            // recovery: there is nothing to resynchronise against mid-stream.
+            if (kfSeqBroken != False) return;
+
+            if (seq != kfExpectedSeq)
+            {
+                // Behind: the link delivered this one again. Costs nothing to
+                // ignore, and re-presenting is how the SPI stage recovers a
+                // response ECU D may not have taken.
+                if ((uint16_t)(kfExpectedSeq - seq) <= 0x7FFFU)
+                {
+                    if (kfDupSkips < 0xFFFFU) kfDupSkips++;
+                    return;
+                }
+                // Ahead: a chunk never arrived.
+                kfSeqBroken = True;
+                return;
+            }
+        }
+
         // Enqueue into ring buffer — writer (ReceiveCAN task) side
         uint8_t wi      = kfRingWriteIdx;
         uint8_t next_wi = (uint8_t)((wi + 1U) % KFRING_ENTRIES);
@@ -778,6 +850,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         entry->len  = payLen;
         entry->kind = KFRING_KIND_IMG;
         if (kfFramesRx < 0xFFFFU) kfFramesRx++;
+        kfExpectedSeq++;
 
         __DMB();
         kfRingWriteIdx = next_wi;
@@ -799,11 +872,31 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
 
         uint8_t status = (dlcLen >= 5U) ? data[4] : 0xFFU;
 
-        // A half-read block at IMG_END means the stream stopped mid-way -- a
-        // dropped 0x301 frame, or a sender that ended early. The pixels drawn
-        // so far are still valid, but the frame is incomplete, so say so in
-        // the ACK rather than reporting success on a partial image.
-        RAMN_Bool_t truncated = RLE_StreamMidBlock(&kfStream);
+        // Queue the end behind the chunks it terminates. Answering here instead
+        // read a decoder that had not run yet: with ECU D forwarding 7 chunks
+        // per SPI transaction a whole burst plus its IMG_END lands inside one
+        // 10 ms tick, so every keyframe was measured a fraction decoded and
+        // ACKed truncated while the panel went on to receive all of it.
+        uint8_t wi      = kfRingWriteIdx;
+        uint8_t next_wi = (uint8_t)((wi + 1U) % KFRING_ENTRIES);
+        if (next_wi != kfRingReadIdx)
+        {
+            KFRingEntry_t* endEntry = &kfRingBuf[wi];
+            endEntry->data[0] = status;
+            endEntry->len     = 1U;
+            endEntry->kind    = KFRING_KIND_END;
+            __DMB();
+            kfRingWriteIdx = next_wi;
+            return;
+        }
+
+        // Ring full: there is no room to order this behind the chunks, and an
+        // unanswered IMG_END is the one outcome worth avoiding -- ECU D cannot
+        // tell it apart from an ECU A that is not receiving at all. Answer now
+        // and let the ring-drop flag say the numbers are understated.
+        if (kfRingDrops < 0xFFFFU) kfRingDrops++;
+        RAMN_Bool_t truncated = (RLE_StreamMidBlock(&kfStream) != False) ||
+                                (kfSeqBroken != False);
         SendImageAck(IMG_ACK_END, status, truncated);
 
         imgState = IMG_SHOWN;
