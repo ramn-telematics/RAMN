@@ -98,6 +98,7 @@ static void reset_state(void)
     tileAssemblyPos   = 0;
     kfTileDrops       = 0;
     kfTileShort       = 0;
+    tileActive        = False;
     RLE_StreamReset(&tileStream);
     fake_reset();
     /* The activity timeout reads xTaskGetTickCount(), so the fake clock is part
@@ -789,6 +790,42 @@ static void case_a_truncated_tile_is_not_drawn(void)
     CHECK(fake_screen_len == 0, "and no partial tile is written");
 }
 
+static void case_a_tile_missing_its_first_chunk_is_refused(void)
+{
+    h_case_begin("a tile whose first chunk was lost is refused, not misplaced");
+    /* Every chunk carries its own coordinates, but geometry is latched only on
+       chunk 0. If chunk 0 is dropped -- ring full, or a lost CAN frame -- the
+       remaining chunks would decode into whatever tile was current and paint at
+       the WRONG place, confidently. Nothing drops on the host, so only a lossy
+       bus produces this; it has to be refused by construction. */
+    reach_img_shown();
+
+    /* One good tile at (1,1), so there is a previous geometry to inherit. */
+    uint8_t rle[64];
+    uint16_t n = rle_solid(rle, 64, 0x11, 0x11);
+    send_tile(1, 1, 8, rle, n, 900);
+    drain(901);
+    size_t after_good = fake_screen_len;
+    CHECK(after_good == 8 * 8 * 2, "the good tile is drawn");
+
+    /* Now a DIFFERENT tile at (7,9) whose first chunk never arrives. */
+    uint16_t before = kfTileDrops;
+    send_tile_chunk(7, 9, 8, 0x81, rle, (uint8_t)n, 902);   /* seq 1, and last */
+    drain(903);
+
+    CHECK(kfTileDrops == before + 1, "the orphaned chunk is refused");
+    CHECK(fake_screen_len == after_good, "and nothing more is painted");
+
+    /* The panel model proves it did not land on the earlier tile either. */
+    size_t painted = 0;
+    for (int y = 0; y < 240; y++)
+        for (int x = 0; x < 240; x++) {
+            size_t o = ((size_t)y * 240 + x) * 2;
+            if (fake_panel[o] || fake_panel[o + 1]) painted++;
+        }
+    CHECK(painted == 8 * 8, "exactly the one good tile is on the panel");
+}
+
 static void case_tiles_before_a_keyframe_are_dropped(void)
 {
     h_case_begin("delta tiles before any keyframe are dropped");
@@ -830,6 +867,7 @@ int main(void)
     case_a_tile_that_would_overhang_is_refused();
     case_a_bad_tile_size_is_refused();
     case_a_truncated_tile_is_not_drawn();
+    case_a_tile_missing_its_first_chunk_is_refused();
     case_tiles_before_a_keyframe_are_dropped();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",

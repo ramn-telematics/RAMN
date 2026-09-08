@@ -155,6 +155,9 @@ static uint16_t tileAssemblyPos = 0;
 static uint8_t curTileX    = 0;
 static uint8_t curTileY    = 0;
 static uint8_t curTileSize = 0;   // pixel width/height: 8, 16, or 40
+// True between a tile's first chunk and its last. Continuation chunks are only
+// believed while a tile is open AND their coordinates match the open one.
+static RAMN_Bool_t tileActive = False;
 
 // Counts tile chunks refused before they reach the ring: an impossible size, a
 // tile that would hang off the edge of the panel, or a length that disagrees
@@ -403,6 +406,7 @@ static void SCREENIMAGE_Deinit(void)
     kfWindowNeeded  = False;
     kfTileDrops     = 0;
     kfTileShort     = 0;
+    tileActive      = False;
     RLE_StreamReset(&tileStream);
 }
 
@@ -434,7 +438,26 @@ static void SCREENIMAGE_Update(uint32_t tick)
                     curTileY    = entry->tileY;
                     curTileSize = entry->tileSize;
                     tileAssemblyPos = 0U;
+                    tileActive  = True;
                     RLE_StreamReset(&tileStream);
+                }
+                else if ((tileActive == False) ||
+                         (entry->tileX    != curTileX) ||
+                         (entry->tileY    != curTileY) ||
+                         (entry->tileSize != curTileSize))
+                {
+                    // A continuation chunk whose geometry does not match the
+                    // tile in progress: this tile's FIRST chunk was lost. Every
+                    // chunk carries its own coordinates, so decoding it into
+                    // whatever tile happened to be open paints it at the wrong
+                    // place -- confidently, with no way to tell afterwards.
+                    // Nothing drops on the host, so only a lossy bus gets here.
+                    if (kfTileDrops < 0xFFFFU) kfTileDrops++;
+                    tileActive = False;
+                    ri = (ri + 1U) % KFRING_ENTRIES;
+                    __DMB();
+                    kfRingReadIdx = ri;
+                    continue;
                 }
 
                 uint16_t room = (uint16_t)(TILE_RAW_MAX - tileAssemblyPos);
@@ -461,6 +484,7 @@ static void SCREENIMAGE_Update(uint32_t tick)
                         kfTileShort++;
                     }
                     tileAssemblyPos = 0U;
+                    tileActive = False;
                 }
 
                 ri = (ri + 1U) % KFRING_ENTRIES;
@@ -674,6 +698,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
         kfCarryValid   = False;
         tileAssemblyPos   = 0;
+        tileActive        = False;
         RLE_StreamReset(&tileStream);
 
         imgState                       = KEYFRAME_RX;
