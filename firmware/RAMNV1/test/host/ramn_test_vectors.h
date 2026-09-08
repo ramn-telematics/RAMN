@@ -388,6 +388,15 @@ static const ramn_rle_vector_t ramn_rle_reject_vectors[3] = {
 #define RAMN_PIPE_CAN_ID_DATA 0x301
 #define RAMN_PIPE_CAN_ID_END 0x302
 
+/* Delta geometry. DELTA_CHUNK_PAYLOAD is what ECU D can fit
+ * beside its 5-byte tile header in a 64-byte frame; it
+ * truncates anything longer without a word, so an encoder
+ * cutting at a different number loses the tail of every
+ * chunk. Both ends assert against these. */
+#define RAMN_DELTA_TILE_GRID_PX 8
+#define RAMN_DELTA_CAN_HEADER 5
+#define RAMN_DELTA_CHUNK_PAYLOAD 59
+
 typedef struct {
     uint16_t       seq;
     uint8_t        real_len;

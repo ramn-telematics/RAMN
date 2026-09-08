@@ -79,6 +79,10 @@ extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
 // against the 2 that fit in 160.
 #define SPI_TRANSACTION_SIZE 512
 
+// Tile RLE bytes one 0x305 frame carries: 64 minus the 5-byte tile header.
+#define DELTA_CAN_HEADER     5U
+#define DELTA_CHUNK_PAYLOAD  (CAN_MAX_PAYLOAD_BYTES - DELTA_CAN_HEADER)
+
 #define SPI_TX_BUFFER_SIZE SPI_TRANSACTION_SIZE  // one flush = one transaction
 
 // Double buffers for TX (CAN → ESP32)
@@ -976,7 +980,12 @@ static void ProcessESP32Response(void)
 			canData[1] = tileY;
 			canData[2] = tileSize;
 			canData[3] = chunkSeq;
-			uint8_t copyLen = (payLen <= 59U) ? payLen : 59U;
+			// 64 minus the 5-byte [X][Y][SIZE][SEQ][LEN] header above. The
+			// encoder must cut its tile chunks at exactly this, because
+			// anything longer is truncated right here without a word.
+			// RAMN_DELTA_CHUNK_PAYLOAD in the vendored vectors is the same
+			// number, and the host tests assert they agree.
+			uint8_t copyLen = (payLen <= DELTA_CHUNK_PAYLOAD) ? payLen : DELTA_CHUNK_PAYLOAD;
 			canData[4] = copyLen;
 			for (uint8_t k = 0U; k < copyLen; k++) canData[5U + k] = msg[8U + k];
 			SendImageCANFrame(DELTA_CAN_ID_TILE_CHUNK, FDCAN_DLC_BYTES_64, True, canData);

@@ -16,6 +16,18 @@
 #include "harness.h"
 #include "fakes.h"
 #include "ramn_test_vectors.h"
+
+/* The delta chunk size is derived in ramn-protocol and copied into ECU D and
+   the ESP32 encoder. If any of the three drifts, tiles are truncated silently
+   -- ECU D just copies fewer bytes and says nothing. Fail the build instead. */
+#if defined(RAMN_DELTA_CHUNK_PAYLOAD) && defined(DELTA_CHUNK_PAYLOAD)
+#if RAMN_DELTA_CHUNK_PAYLOAD != DELTA_CHUNK_PAYLOAD
+#error "ECU D's delta chunk size disagrees with the protocol's"
+#endif
+#endif
+#if defined(RAMN_DELTA_CHUNK_PAYLOAD) && (RAMN_DELTA_CHUNK_PAYLOAD != 59)
+#error "vendored vectors predate the delta geometry constants -- refresh them"
+#endif
 #include "conformance_shared.h"
 
 /* A stale vendored header means fewer tests run, silently. Make it a build
