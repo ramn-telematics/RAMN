@@ -22,6 +22,7 @@ int      fake_screen_writes;
 int      fake_screen_odd_drops;
 int      fake_window_opens;
 uint16_t fake_window_w, fake_window_h;
+void (*fake_screen_on_write)(void);
 
 void fake_screen_reset(void)
 {
@@ -36,6 +37,7 @@ void fake_screen_reset(void)
     win_x = win_y = 0;
     win_w = FAKE_PANEL_W; win_h = FAKE_PANEL_H;
     win_pos = 0;
+    fake_screen_on_write = NULL;
 }
 
 void RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len)
@@ -64,6 +66,10 @@ void RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len)
         }
         win_pos++;
     }
+
+    /* The real call blocks here waiting on the DMA-complete notification, so
+       anything the CAN RX task does lands at exactly this point. */
+    if (fake_screen_on_write) fake_screen_on_write();
 }
 
 void RAMN_SPI_OpenImageWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)

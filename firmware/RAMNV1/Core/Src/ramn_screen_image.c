@@ -64,7 +64,11 @@ static uint16_t kfHeight       = 0;
 // picture sent as 80x80 and scaled here is 206.
 //
 // 1 means send-as-is and keeps the original streaming path untouched.
-static uint8_t  kfScale        = 1U;
+static uint8_t  kfScale        = 1U;   // the DRAIN's scale: latched at the ring's START entry
+// The CAN RX task's own copy, latched where IMG_START arrives. Delta tiles are
+// refused on that task, so its gate needs the scale of the frame ARRIVING, not
+// the one the drain is still painting with.
+static uint8_t  rxScale        = 1U;
 // One source row is assembled before anything reaches the panel: the decoder
 // emits an arbitrary run of bytes with no notion of where a row ends, and the
 // ST7789's auto-increment only lands correctly if each expanded row is written
@@ -96,9 +100,8 @@ static uint16_t kfStateDrops = 0;   // 0x301 frames dropped: not in KEYFRAME_RX
 // The START ack is the one ECU D reliably receives, so it carries these: an END
 // ack that never arrives cannot report anything, and "nothing" is the case we
 // most need described.
-static uint32_t prevDecodedBytes = 0;
-static uint16_t prevFramesRx     = 0;
-static uint16_t prevRingDrops    = 0;
+// (the previous frame's numbers now live in prevStats, below, filled in by the
+// drain when it reaches an IMG_END rather than by whoever happens to run next)
 
 // Screen hold state — mirrors the regcode pattern.
 // screenActive is the authoritative "stay on screen" flag.
@@ -150,7 +153,48 @@ static uint32_t lastActivityTick = 0;
 // periodic task, and nothing else orders the two. Answered on arrival it
 // overtakes its own frame: the ACK measures whatever happened to be drained,
 // and imgState reaches IMG_SHOWN while the panel is still being written.
-#define KFRING_KIND_END   2U   // end of keyframe  (0x302), data[0] = status
+#define KFRING_KIND_END   2U   // end of keyframe  (0x302) + the RX task's counters
+// IMG_START rides the ring for the same reason IMG_END does, and it is the more
+// dangerous of the two. It used to be applied where it arrived, on the CAN RX
+// task, which meant it zeroed kfRingWriteIdx and kfRingReadIdx out from under a
+// drain that was still painting the previous keyframe. Two things follow, both
+// measured in test_screen_image.c:
+//
+//   between paints  every entry the previous frame left in the ring, its
+//                   IMG_END included, is discarded by the producer. The frame
+//                   is not torn or partial -- it never reaches the glass. One
+//                   whole picture in two goes missing.
+//
+//   during a paint  the drain holds a local copy of the read index across a
+//                   blocking SPI write (~29 ms for a full panel), so zeroing
+//                   the indices leaves it walking entries the producer has
+//                   begun refilling. It decodes the OLD frame's bytes with the
+//                   NEW frame's geometry, into the new frame's window: 168 rows
+//                   of the previous picture, 72 rows never written, and the new
+//                   frame nowhere. Nothing counts it; the only symptom is on
+//                   the glass.
+//
+// The paint is ~29 ms regardless of how small the source is, because the panel
+// is always 240x240 -- so the lower the resolution, the larger the share of
+// each frame period spent inside that window. That is why this shows up at
+// 60x60 and not at 240x240.
+//
+// Queued instead, the frame boundary is just another entry in the same FIFO:
+// the previous keyframe finishes painting into its own window before the next
+// one opens, because that is what the order in the ring means.
+//
+//   data[0..1] width   data[2..3] height  data[4..5] total chunks
+//   data[6] x offset   data[7] y offset   data[8] scale
+//
+// It also carries the OUTGOING frame's arrival counters, snapshotted just
+// before they are zeroed. A keyframe whose IMG_END never arrived still has to
+// be reportable -- the START ack exists precisely because the END ack is the
+// one that goes missing -- and by the time the drain reaches this entry the CAN
+// RX task has long since reset those counters for the new frame.
+//
+//   data[9..10] framesRx    data[11..12] ringDrops  data[13..14] stateDrops
+//   data[15..16] dupSkips   data[17] seqBroken
+#define KFRING_KIND_START 3U
 
 typedef struct {
     uint8_t data[KFRING_PAYLOAD];
@@ -179,7 +223,36 @@ static volatile uint8_t     kfRingReadIdx  = 0;
 #define IMG_ACK_START  0x02U
 #define IMG_ACK_END    0x00U
 #define IMG_ACK_LATE   0x03U
-static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated);
+
+// What one keyframe is worth reporting. Passed in rather than read off globals
+// because the two halves of it are counted on DIFFERENT TASKS: framesRx and the
+// drop counters on the CAN RX task as frames arrive, decoded on the periodic
+// task as they are painted. Once the frame boundary rides the ring, those two
+// tasks are no longer at the same frame -- the RX task can already be counting
+// frame N+1 while the drain is still answering IMG_END for frame N. Reading
+// globals at that moment reports the wrong frame's numbers, which is how a
+// diagnostic quietly starts lying at exactly the load where it is needed.
+//
+// So the RX task's counters travel WITH the IMG_END entry, snapshotted at the
+// instant the frame ended, and the drain adds only what it owns.
+typedef struct {
+    uint32_t    decoded;      // bytes written to the panel (periodic task)
+    uint16_t    framesRx;     // 0x301 accepted           (CAN RX task)
+    uint16_t    ringDrops;    // 0x301 dropped, ring full (CAN RX task)
+    uint16_t    stateDrops;   // 0x301 dropped, bad state (CAN RX task)
+    uint16_t    dupSkips;     // 0x301 delivered twice    (CAN RX task)
+    RAMN_Bool_t seqBroken;    // a chunk never arrived    (CAN RX task)
+    RAMN_Bool_t truncated;    // a half-read RLE block at IMG_END
+} ImgFrameStats_t;
+
+static void SendImageAck(uint8_t stage, uint8_t endStatus, const ImgFrameStats_t* st);
+
+// The last frame the drain finished, for the next START ack to report.
+// Periodic task only.
+static ImgFrameStats_t prevStats;
+// Whether an IMG_END entry described that frame. A frame whose IMG_END was lost
+// still has to be reported, and prevStats is the only place left to do it.
+static RAMN_Bool_t     kfEndSeen = False;
 
 static uint16_t             kfExpectedSeq = 0;   // CAN RX task only
 // Written on the CAN RX task, read by the periodic task when it answers
@@ -216,12 +289,11 @@ static uint16_t kfTileShort = 0;
 // only be called from the Periodic task registered with RAMN_SPI_Init.
 // ============================================================================
 
-// Keyframe: open a new ST7789 write window before streaming pixel data
-static volatile RAMN_Bool_t kfWindowNeeded = False;
-static uint8_t  kfPendingXOff = 0;
-static uint8_t  kfPendingYOff = 0;
-static uint16_t kfPendingW    = 0;
-static uint16_t kfPendingH    = 0;
+// The keyframe window is opened by the KFRING_KIND_START entry as the drain
+// reaches it, so there is no deferred-window flag any more. A flag was a second
+// channel carrying the frame boundary alongside the ring, and the two could not
+// be kept in order: the flag was applied at the top of Update, ahead of chunks
+// still queued from the previous frame.
 
 // Delta tiles are assembled and written by Update straight out of the ring, so
 // there is no staging copy and no single slot to overflow. The old design
@@ -418,6 +490,7 @@ static void SCREENIMAGE_Init(void)
     if (len > 0) RAMN_UART_SendFromTask((uint8_t*)buf, (uint32_t)len);
 #endif
     kfScale   = 1U;
+    rxScale   = 1U;
     kfRowFill = 0U;
     RAMN_SPI_DrawRectangle(0, 0, LCD_WIDTH, LCD_HEIGHT, COLOR_BLACK);
     RAMN_SPI_DrawString(50, 108, COLOR_WHITE, COLOR_BLACK, "  Streaming...");
@@ -449,7 +522,7 @@ static void SCREENIMAGE_Deinit(void)
     kfRingDrops     = 0;
     kfStateDrops    = 0;
     tileAssemblyPos = 0;
-    kfWindowNeeded  = False;
+    kfEndSeen       = False;
     kfTileDrops     = 0;
     kfTileShort     = 0;
     tileActive      = False;
@@ -493,13 +566,6 @@ static void WriteScaledPixels(const uint8_t* px, uint16_t len)
 
 static void SCREENIMAGE_Update(uint32_t tick)
 {
-    // ---- Open keyframe ST7789 window (deferred from IMG_START handler) ----
-    if (kfWindowNeeded != False)
-    {
-        kfWindowNeeded = False;
-        RAMN_SPI_OpenImageWindow(kfPendingXOff, kfPendingYOff, kfPendingW, kfPendingH);
-    }
-
     // ---- Drain keyframe ring buffer → RLE decode → SPI ----
     // Runs in both KEYFRAME_RX and IMG_SHOWN (to flush trailing chunks after IMG_END).
     {
@@ -509,14 +575,89 @@ static void SCREENIMAGE_Update(uint32_t tick)
         {
             KFRingEntry_t* entry = &kfRingBuf[ri];
 
+            if (entry->kind == KFRING_KIND_START)
+            {
+                // Reaching this entry is what "the previous keyframe is
+                // finished" means: every chunk of it is ahead in the ring and
+                // has already been decoded and written. Only now is it safe to
+                // repoint the decoder at a new picture.
+                //
+                // If no IMG_END entry came through for that frame, nothing has
+                // described it yet -- and an unreported frame is the case the
+                // START ack was added for. Build its numbers here instead,
+                // from what this task painted plus the arrival counters the
+                // entry carries.
+                if (kfEndSeen == False)
+                {
+                    prevStats.decoded    = kfDecodedBytes;
+                    prevStats.framesRx   = (uint16_t)((uint16_t)entry->data[9]  |
+                                                     ((uint16_t)entry->data[10] << 8));
+                    prevStats.ringDrops  = (uint16_t)((uint16_t)entry->data[11] |
+                                                     ((uint16_t)entry->data[12] << 8));
+                    prevStats.stateDrops = (uint16_t)((uint16_t)entry->data[13] |
+                                                     ((uint16_t)entry->data[14] << 8));
+                    prevStats.dupSkips   = (uint16_t)((uint16_t)entry->data[15] |
+                                                     ((uint16_t)entry->data[16] << 8));
+                    prevStats.seqBroken  = (entry->data[17] != 0U) ? True : False;
+                    prevStats.truncated  = RLE_StreamMidBlock(&kfStream);
+                }
+                kfEndSeen = False;
+
+                SendImageAck(IMG_ACK_START, 0U, &prevStats);
+
+                kfWidth       = (uint16_t)((uint16_t)entry->data[0] |
+                                          ((uint16_t)entry->data[1] << 8));
+                kfHeight      = (uint16_t)((uint16_t)entry->data[2] |
+                                          ((uint16_t)entry->data[3] << 8));
+                kfTotalChunks = (uint16_t)((uint16_t)entry->data[4] |
+                                          ((uint16_t)entry->data[5] << 8));
+                kfXOffset     = entry->data[6];
+                kfYOffset     = entry->data[7];
+                kfScale       = entry->data[8];
+
+                kfDecodedBytes = 0;
+                kfRowFill      = 0U;
+                kfCarryValid   = False;
+                RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
+
+                tileAssemblyPos = 0;
+                tileActive      = False;
+                RLE_StreamReset(&tileStream);
+
+                RAMN_SPI_OpenImageWindow(kfXOffset, kfYOffset,
+                                         (uint16_t)(kfWidth  * kfScale),
+                                         (uint16_t)(kfHeight * kfScale));
+
+                ri = (ri + 1U) % KFRING_ENTRIES;
+                __DMB();
+                kfRingReadIdx = ri;
+                continue;
+            }
+
             if (entry->kind == KFRING_KIND_END)
             {
                 // Every chunk ahead of this entry has now been decoded and
-                // written, so these numbers describe the whole frame.
-                RAMN_Bool_t truncated = (RLE_StreamMidBlock(&kfStream) != False) ||
-                                        (kfSeqBroken != False);
-                SendImageAck(IMG_ACK_END, entry->data[0], truncated);
-                imgState = IMG_SHOWN;
+                // written, so these numbers describe the whole frame. The
+                // arrival half of them was snapshotted into the entry when the
+                // frame ended; only `decoded` is this task's to add.
+                ImgFrameStats_t st;
+                st.decoded    = kfDecodedBytes;
+                st.framesRx   = (uint16_t)((uint16_t)entry->data[1] |
+                                          ((uint16_t)entry->data[2] << 8));
+                st.ringDrops  = (uint16_t)((uint16_t)entry->data[3] |
+                                          ((uint16_t)entry->data[4] << 8));
+                st.stateDrops = (uint16_t)((uint16_t)entry->data[5] |
+                                          ((uint16_t)entry->data[6] << 8));
+                st.dupSkips   = (uint16_t)((uint16_t)entry->data[7] |
+                                          ((uint16_t)entry->data[8] << 8));
+                st.seqBroken  = (entry->data[9] != 0U) ? True : False;
+                st.truncated  = ((RLE_StreamMidBlock(&kfStream) != False) ||
+                                 (st.seqBroken != False)) ? True : False;
+
+                SendImageAck(IMG_ACK_END, entry->data[0], &st);
+                prevStats = st;               // for the next frame's START ack
+                kfEndSeen = True;
+                imgState  = IMG_SHOWN;
 
                 ri = (ri + 1U) % KFRING_ENTRIES;
                 __DMB();
@@ -713,7 +854,7 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 // SCREENIMAGE_ProcessRxCANMessage's frame: that runs on the CAN RX task, whose
 // whole stack is 1 KB (RAMN_ReceiveCANBuffer[256] in main.c).
 // ============================================================================
-static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated)
+static void SendImageAck(uint8_t stage, uint8_t endStatus, const ImgFrameStats_t* st)
 {
     FDCAN_TxHeaderTypeDef ackHdr;
     ackHdr.Identifier          = IMG_CAN_ID_ACK;
@@ -727,17 +868,15 @@ static void SendImageAck(uint8_t stage, uint8_t endStatus, RAMN_Bool_t truncated
     ackHdr.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
 
     uint8_t flags = 0U;
-    if (truncated    != False) flags |= 0x01U;
-    if (kfRingDrops  != 0U)    flags |= 0x02U;
-    if (kfStateDrops != 0U)    flags |= 0x04U;
-    if (kfSeqBroken  != False) flags |= 0x08U;
-    if (kfDupSkips   != 0U)    flags |= 0x10U;
+    if (st->truncated  != False) flags |= 0x01U;
+    if (st->ringDrops  != 0U)    flags |= 0x02U;
+    if (st->stateDrops != 0U)    flags |= 0x04U;
+    if (st->seqBroken  != False) flags |= 0x08U;
+    if (st->dupSkips   != 0U)    flags |= 0x10U;
 
-    // On a START ack the current counters are all zero by definition, so report
-    // the frame that just ended instead -- that is the interesting one.
-    uint32_t decoded = (stage == IMG_ACK_START) ? prevDecodedBytes : kfDecodedBytes;
-    uint16_t rx      = (stage == IMG_ACK_START) ? prevFramesRx     : kfFramesRx;
-    uint16_t drops   = (stage == IMG_ACK_START) ? prevRingDrops    : kfRingDrops;
+    uint32_t decoded = st->decoded;
+    uint16_t rx      = st->framesRx;
+    uint16_t drops   = st->ringDrops;
 
     uint32_t overrun = RAMN_FDCAN_Status.CANRxOverrunCnt;
 
@@ -773,70 +912,103 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         screenActivatedTick = tick;
         lastActivityTick    = tick;
 
-        kfWidth       = (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
-        kfHeight      = (uint16_t)((uint16_t)data[2] | ((uint16_t)data[3] << 8));
-        kfTotalChunks = (uint16_t)((uint16_t)data[4] | ((uint16_t)data[5] << 8));
-        kfXOffset     = data[6];
-        kfYOffset     = data[7];
+        // Geometry is PARSED here and LATCHED IN THE DRAIN. Nothing this handler
+        // writes may be read by the drain for the frame it is still painting --
+        // that is the whole point of putting the boundary in the ring.
+        uint16_t w  = (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
+        uint16_t h  = (uint16_t)((uint16_t)data[2] | ((uint16_t)data[3] << 8));
+        uint16_t tc = (uint16_t)((uint16_t)data[4] | ((uint16_t)data[5] << 8));
 
         // Clamp dimensions to physical screen size
-        if (kfWidth  > (uint16_t)LCD_WIDTH)  kfWidth  = (uint16_t)LCD_WIDTH;
-        if (kfHeight > (uint16_t)LCD_HEIGHT) kfHeight = (uint16_t)LCD_HEIGHT;
+        if (w > (uint16_t)LCD_WIDTH)  w = (uint16_t)LCD_WIDTH;
+        if (h > (uint16_t)LCD_HEIGHT) h = (uint16_t)LCD_HEIGHT;
 
         // Byte 8 is the scale factor. A sender that predates it sends 0, and
         // a short frame has no byte 8 at all; both mean 1:1. Anything that
         // would not fit the panel is refused rather than clamped -- a wrong
         // scale does not crop the image, it shears every row after the first,
         // and a 1:1 picture in the corner is far easier to recognise as wrong.
-        kfScale = (dlcLen >= 9U) ? data[8] : 1U;
-        if (kfScale == 0U) kfScale = 1U;
-        if (((uint32_t)kfWidth  * kfScale) > (uint32_t)LCD_WIDTH ||
-            ((uint32_t)kfHeight * kfScale) > (uint32_t)LCD_HEIGHT)
+        uint8_t sc = (dlcLen >= 9U) ? data[8] : 1U;
+        if (sc == 0U) sc = 1U;
+        if (((uint32_t)w * sc) > (uint32_t)LCD_WIDTH ||
+            ((uint32_t)h * sc) > (uint32_t)LCD_HEIGHT)
         {
-            kfScale = 1U;
+            sc = 1U;
         }
-        kfRowFill = 0U;
 
-        prevDecodedBytes  = kfDecodedBytes;
-        prevFramesRx      = kfFramesRx;
-        prevRingDrops     = kfRingDrops;
+        // State this task owns outright: the sequence gate, the tile gate, and
+        // the arrival counters. All of it is safe to reset here precisely
+        // because the drain never reads it -- the drain gets its copy of these
+        // numbers inside the IMG_END entry.
+        uint16_t    outFramesRx   = kfFramesRx;
+        uint16_t    outRingDrops  = kfRingDrops;
+        uint16_t    outStateDrops = kfStateDrops;
+        uint16_t    outDupSkips   = kfDupSkips;
+        RAMN_Bool_t outSeqBroken  = kfSeqBroken;
 
-        kfDecodedBytes    = 0;
-        kfFramesRx        = 0;
-        kfRingDrops       = 0;
-        kfStateDrops      = 0;
-        kfRingWriteIdx    = 0;
-        kfRingReadIdx     = 0;
-        RLE_StreamReset(&kfStream);   // a new keyframe starts a new stream
-        kfCarryValid   = False;
-        kfExpectedSeq  = 0;           // IMG_START is the only resynchronisation
-        kfSeqBroken    = False;
-        kfDupSkips     = 0;
-        tileAssemblyPos   = 0;
-        tileActive        = False;
-        RLE_StreamReset(&tileStream);
+        rxScale       = sc;
+        kfExpectedSeq = 0;           // IMG_START is the only resynchronisation
+        kfSeqBroken   = False;
+        kfDupSkips    = 0;
+        kfFramesRx    = 0;
+        kfRingDrops   = 0;
+        kfStateDrops  = 0;
+
+        {
+            uint8_t wi      = kfRingWriteIdx;
+            uint8_t next_wi = (uint8_t)((wi + 1U) % KFRING_ENTRIES);
+            if (next_wi == kfRingReadIdx)
+            {
+                // No room to order this behind the previous frame's chunks.
+                // Letting the chunks through anyway decodes them into the
+                // window the PREVIOUS keyframe opened, at the previous
+                // geometry -- precisely the corruption this entry exists to
+                // prevent. Kill the frame instead: the gate refuses every
+                // chunk, IMG_END reports the gap flag, and the next IMG_START
+                // recovers. A missing picture is recoverable and counted; a
+                // sheared one that nothing counts is neither.
+                kfSeqBroken = True;
+                if (kfRingDrops < 0xFFFFU) kfRingDrops++;
+            }
+            else
+            {
+                KFRingEntry_t* e = &kfRingBuf[wi];
+                e->data[0] = (uint8_t)(w  & 0xFFU);  e->data[1] = (uint8_t)(w  >> 8);
+                e->data[2] = (uint8_t)(h  & 0xFFU);  e->data[3] = (uint8_t)(h  >> 8);
+                e->data[4] = (uint8_t)(tc & 0xFFU);  e->data[5] = (uint8_t)(tc >> 8);
+                e->data[6] = data[6];
+                e->data[7] = data[7];
+                e->data[8] = sc;
+                e->data[9]  = (uint8_t)(outFramesRx   & 0xFFU);
+                e->data[10] = (uint8_t)(outFramesRx   >> 8);
+                e->data[11] = (uint8_t)(outRingDrops  & 0xFFU);
+                e->data[12] = (uint8_t)(outRingDrops  >> 8);
+                e->data[13] = (uint8_t)(outStateDrops & 0xFFU);
+                e->data[14] = (uint8_t)(outStateDrops >> 8);
+                e->data[15] = (uint8_t)(outDupSkips   & 0xFFU);
+                e->data[16] = (uint8_t)(outDupSkips   >> 8);
+                e->data[17] = (outSeqBroken != False) ? 1U : 0U;
+                e->len     = 18U;
+                e->kind    = KFRING_KIND_START;
+                __DMB();
+                kfRingWriteIdx = next_wi;
+            }
+        }
 
         imgState                       = KEYFRAME_RX;
         RAMN_SCREENIMAGE_DisplayRequested = True;
 
-        // Defer ST7789 window open to Update() — SPI must be called from Periodic task only.
-        kfPendingXOff  = kfXOffset;
-        kfPendingYOff  = kfYOffset;
-        kfPendingW     = (uint16_t)(kfWidth  * kfScale);
-        kfPendingH     = (uint16_t)(kfHeight * kfScale);
-        kfWindowNeeded = True;
-
-        // Say "I got IMG_START" on the bus. Without this, an ECU A that never
-        // reaches IMG_END is indistinguishable from one that is not receiving
-        // anything at all -- both are simply silent.
-        SendImageAck(IMG_ACK_START, 0U, False);
+        // The START ack goes out when the drain REACHES the entry, not here.
+        // It reports the previous keyframe, and the previous keyframe is not
+        // finished until the drain says so -- sent from here it described a
+        // frame that still had chunks queued behind it.
 
 #ifdef SCREENIMAGE_DEBUG
         {
             char buf[80];
             int  len = snprintf(buf, sizeof(buf),
-                "IMG START: %ux%u chunks=%u x=%u y=%u\r\n",
-                kfWidth, kfHeight, kfTotalChunks, kfXOffset, kfYOffset);
+                "IMG START: %ux%u chunks=%u x=%u y=%u scale=%u\r\n",
+                w, h, tc, data[6], data[7], sc);
             if (len > 0) RAMN_UART_SendFromTask((uint8_t*)buf, (uint32_t)len);
         }
 #endif
@@ -935,7 +1107,9 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // are completely different faults.
         if (imgState != KEYFRAME_RX)
         {
-            SendImageAck(IMG_ACK_LATE, 0U, False);
+            ImgFrameStats_t late;
+            memset(&late, 0, sizeof late);
+            SendImageAck(IMG_ACK_LATE, 0U, &late);
             return;
         }
 
@@ -950,9 +1124,21 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         uint8_t next_wi = (uint8_t)((wi + 1U) % KFRING_ENTRIES);
         if (next_wi != kfRingReadIdx)
         {
+            // The counters travel with the entry. By the time the drain reads
+            // this the CAN RX task may already be counting the NEXT keyframe,
+            // so a global read there reports the wrong frame.
             KFRingEntry_t* endEntry = &kfRingBuf[wi];
             endEntry->data[0] = status;
-            endEntry->len     = 1U;
+            endEntry->data[1] = (uint8_t)(kfFramesRx   & 0xFFU);
+            endEntry->data[2] = (uint8_t)(kfFramesRx   >> 8);
+            endEntry->data[3] = (uint8_t)(kfRingDrops  & 0xFFU);
+            endEntry->data[4] = (uint8_t)(kfRingDrops  >> 8);
+            endEntry->data[5] = (uint8_t)(kfStateDrops & 0xFFU);
+            endEntry->data[6] = (uint8_t)(kfStateDrops >> 8);
+            endEntry->data[7] = (uint8_t)(kfDupSkips   & 0xFFU);
+            endEntry->data[8] = (uint8_t)(kfDupSkips   >> 8);
+            endEntry->data[9] = (kfSeqBroken != False) ? 1U : 0U;
+            endEntry->len     = 10U;
             endEntry->kind    = KFRING_KIND_END;
             __DMB();
             kfRingWriteIdx = next_wi;
@@ -966,7 +1152,18 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         if (kfRingDrops < 0xFFFFU) kfRingDrops++;
         RAMN_Bool_t truncated = (RLE_StreamMidBlock(&kfStream) != False) ||
                                 (kfSeqBroken != False);
-        SendImageAck(IMG_ACK_END, status, truncated);
+        // Answered off the live counters: this path only runs when the ring is
+        // already full, which the 0x02 flag says, so the numbers are
+        // approximate by construction.
+        ImgFrameStats_t st;
+        st.decoded    = kfDecodedBytes;
+        st.framesRx   = kfFramesRx;
+        st.ringDrops  = kfRingDrops;
+        st.stateDrops = kfStateDrops;
+        st.dupSkips   = kfDupSkips;
+        st.seqBroken  = kfSeqBroken;
+        st.truncated  = truncated;
+        SendImageAck(IMG_ACK_END, status, &st);
 
         imgState = IMG_SHOWN;
 
@@ -989,7 +1186,12 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         if (imgState == IMG_IDLE) return;   // keyframe must precede delta frames
         if (dlcLen < 2U) return;
 
-        tileAssemblyPos = 0;
+        // tileAssemblyPos used to be zeroed here. It belongs to the periodic
+        // task -- the drain assembles tiles out of the ring -- and this handler
+        // runs on the CAN RX task, so the write could land in the middle of a
+        // tile being assembled and silently shift its rows. It was also
+        // redundant: a tile's first chunk zeroes it in the drain, in order.
+        // Same defect as the IMG_START reset above, one queue over.
 
         imgState                       = IMG_SHOWN;
         RAMN_SCREENIMAGE_DisplayRequested = True;
@@ -1012,7 +1214,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // expected to hold scale at 1 whenever it sends deltas; if it does
         // not, refusing the tile leaves the keyframe intact where drawing it
         // would smear a wrong patch across the picture.
-        if (kfScale > 1U)
+        if (rxScale > 1U)
         {
             if (kfTileDrops < 0xFFFFU) kfTileDrops++;
             return;

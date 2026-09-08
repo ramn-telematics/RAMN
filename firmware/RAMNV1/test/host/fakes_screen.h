@@ -24,4 +24,11 @@ extern uint16_t fake_window_w, fake_window_h;
 extern uint8_t fake_panel[FAKE_PANEL_W * FAKE_PANEL_H * 2];
 extern int     fake_panel_oob;    /* writes that ran past the current window */
 
+/* Called at the end of every RAMN_SPI_WriteImageChunk. The real write blocks
+   in ulTaskNotifyTake while the DMA runs, and the CAN RX task is free to run
+   in that window -- which is the only way a CAN frame can land in the MIDDLE
+   of a ring drain. A single-threaded test cannot otherwise express that
+   interleaving, and it is exactly where the frame-boundary races live. */
+extern void (*fake_screen_on_write)(void);
+
 void fake_screen_reset(void);

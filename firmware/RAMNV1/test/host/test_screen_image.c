@@ -108,7 +108,10 @@ static void reset_state(void)
     kfTileShort       = 0;
     tileActive        = False;
     kfScale           = 1;
+    rxScale           = 1;
     kfRowFill         = 0;
+    memset(&prevStats, 0, sizeof prevStats);
+    kfEndSeen         = False;
     kfExpectedSeq     = 0;
     kfSeqBroken       = False;
     kfDupSkips        = 0;
@@ -396,6 +399,11 @@ static void case_img_start_is_acknowledged_on_the_bus(void)
        no 0x303 of any kind ever reached ECU D. */
     reset_state();
     send_img_start(240, 240, 1, 100);
+    /* The START ack now rides the ring with the frame boundary, so it comes out
+       of the periodic task -- the same reason send_img_end() drains. Sent where
+       IMG_START arrives, it described a previous frame that still had chunks
+       queued behind it. */
+    drain(100);
 
     const CapturedFrame_t *ack = last_ack();
     if (!CHECK_OK(ack != NULL, "IMG_START alone produces a 0x303")) return;
@@ -448,6 +456,7 @@ static void case_start_ack_carries_the_previous_frame(void)
 
     fake_reset();                       /* forget the first frame's ACKs */
     send_img_start(240, 240, 1, 200);   /* second keyframe */
+    drain(200);
 
     const CapturedFrame_t *ack = last_ack();
     if (!CHECK_OK(ack != NULL && ack->len == 8, "the second START is acked")) return;
@@ -469,6 +478,7 @@ static void case_ack_carries_the_can_rx_overrun_count(void)
     reset_state();
     RAMN_FDCAN_Status.CANRxOverrunCnt = 9;
     send_img_start(240, 240, 1, 100);
+    drain(100);
 
     const CapturedFrame_t *ack = last_ack();
     if (!CHECK_OK(ack != NULL && ack->len == 8, "the START is acked")) return;
@@ -477,6 +487,7 @@ static void case_ack_carries_the_can_rx_overrun_count(void)
     fake_reset();                                 /* also zeroes the fake driver counters */
     RAMN_FDCAN_Status.CANRxOverrunCnt = 100000;   /* must not wrap into a small number */
     send_img_start(240, 240, 1, 200);
+    drain(200);
     const CapturedFrame_t *big = last_ack();
     if (!CHECK_OK(big != NULL, "acked again")) return;
     CHECK(big->data[7] == 255, "and saturates rather than wrapping");
@@ -1091,6 +1102,138 @@ static void case_tiles_are_refused_while_scaled(void)
     CHECK(fake_screen_len == 0, "and nothing is drawn over the keyframe");
 }
 
+/* ------------------------------------------------------------------ */
+/* Frame boundaries under load                                          */
+/*                                                                      */
+/* At 100 ms and a low resolution the pipeline finally keeps up, which  */
+/* means IMG_START for frame N+1 can arrive while ECU A is still        */
+/* painting frame N. Painting is the slow half: a full panel is 115,200 */
+/* bytes at 32 MHz, ~29 ms, and it blocks the periodic task the whole   */
+/* time. Every case above drains to quiescence between frames, so none  */
+/* of them can see what happens when the frames overlap.                */
+/* ------------------------------------------------------------------ */
+
+/* A run-encoded solid colour: 3 bytes per 128 pixels, so a whole 60x60
+   frame is 87 bytes -- two chunks, and the ring can hold several frames'
+   worth undrained. Solid colours also make "whose pixel is this?" a
+   question the panel model can answer. */
+static uint16_t rle_runs(uint8_t *out, uint8_t lo, uint8_t hi, uint32_t pixels)
+{
+    uint16_t o = 0;
+    while (pixels) {
+        uint32_t n = (pixels > 128u) ? 128u : pixels;
+        out[o++] = (uint8_t)(0x80u | (n - 1u));
+        out[o++] = lo;
+        out[o++] = hi;
+        pixels -= n;
+    }
+    return o;
+}
+
+/* IMG_END without the drain send_img_end() does -- these cases need the
+   ring left deliberately full. */
+static void feed_img_end(uint8_t status, uint32_t tick)
+{
+    uint8_t b[8];
+    memset(b, 0, sizeof b);
+    b[4] = status;
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof(h));
+    h.Identifier = IMG_CAN_ID_END;
+    h.DataLength = FDCAN_DLC_BYTES_8;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+}
+
+/* Queue a whole solid 60x60 scale-4 frame WITHOUT draining it. */
+static void queue_solid_frame(uint8_t lo, uint8_t hi, uint32_t tick)
+{
+    uint8_t stream[256];
+    uint16_t n = rle_runs(stream, lo, hi, 60u * 60u);
+    uint16_t chunks = (uint16_t)((n + RAMN_PIPE_SPI_CHUNK_PAYLOAD - 1) /
+                                 RAMN_PIPE_SPI_CHUNK_PAYLOAD);
+    send_img_start_scaled(60, 60, chunks, 4, tick);
+    uint16_t seq = 0;
+    for (uint16_t off = 0; off < n; off = (uint16_t)(off + RAMN_PIPE_SPI_CHUNK_PAYLOAD)) {
+        uint16_t take = (uint16_t)(n - off);
+        if (take > RAMN_PIPE_SPI_CHUNK_PAYLOAD) take = RAMN_PIPE_SPI_CHUNK_PAYLOAD;
+        send_img_data(seq++, &stream[off], (uint8_t)take, tick);
+    }
+    feed_img_end(0x00, tick);
+}
+
+/* How many panel pixels carry this exact colour. */
+static size_t panel_count(uint8_t lo, uint8_t hi)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < sizeof fake_panel; i += 2)
+        if (fake_panel[i] == lo && fake_panel[i + 1] == hi) n++;
+    return n;
+}
+
+static void case_a_new_keyframe_does_not_discard_the_one_still_queued(void)
+{
+    h_case_begin("a keyframe arriving while the previous one is still queued does not erase it");
+    /* Frame A is queued whole and never drained -- the periodic task is busy
+       painting, which is the normal state of affairs at 10 fps. Then frame B's
+       IMG_START arrives. IMG_START runs on the CAN RX task and zeroes
+       kfRingWriteIdx and kfRingReadIdx, so every entry frame A left in the
+       ring, its IMG_END included, is thrown away by the producer. Frame A is
+       not torn or partial: it never reaches the glass at all. */
+    reset_state();
+    queue_solid_frame(0x11, 0x22, 200);
+    queue_solid_frame(0x33, 0x44, 300);
+    drain(400);
+
+    CHECK(fake_window_opens == 2, "each keyframe opens its own window");
+    CHECK(fake_screen_len == 2u * 240u * 240u * 2u,
+          "and both frames' pixels reach the panel, not just the last one");
+}
+
+/* Fires from inside RAMN_SPI_WriteImageChunk on the Nth write, standing in for
+   the CAN RX task running while the periodic task is blocked on the DMA. */
+static int      preempt_at;
+static int      preempt_seen;
+static uint32_t preempt_tick;
+static void preempt_with_img_start(void)
+{
+    if (++preempt_seen != preempt_at) return;
+    void (*save)(void) = fake_screen_on_write;
+    fake_screen_on_write = NULL;          /* the injected frame must not recurse */
+    queue_solid_frame(0x33, 0x44, preempt_tick);
+    fake_screen_on_write = save;
+}
+
+static void case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel(void)
+{
+    h_case_begin("a keyframe starting while the panel is mid-write does not shear the picture");
+    /* The window above is not a knife edge: the drain holds the CPU inside a
+       blocking SPI write for ~29 ms out of every 100, so this is where roughly
+       a third of frame boundaries land. Resetting the ring indices under a
+       running drain leaves the drain's local read index pointing into a region
+       the producer has begun refilling: it keeps consuming frame A's entries
+       and decodes them with frame B's geometry, into frame B's window.
+       Nothing counts it and nothing reports it -- the only symptom is on the
+       glass. */
+    reset_state();
+    preempt_at   = 3;
+    preempt_seen = 0;
+    preempt_tick = 300;
+    queue_solid_frame(0x11, 0x22, 200);
+    fake_screen_on_write = preempt_with_img_start;
+    drain(400);
+    fake_screen_on_write = NULL;
+    drain(500);
+
+    /* Two solid frames, painted in order, leave the panel solid in frame B's
+       colour. Any pixel that is neither colour is a sheared row; any frame-A
+       pixel left visible is a band of the previous picture. */
+    size_t a = panel_count(0x11, 0x22);
+    size_t b = panel_count(0x33, 0x44);
+    CHECK(a + b == 240u * 240u, "every panel pixel belongs to one of the two frames");
+    CHECK(a == 0, "and frame A is fully painted over, leaving no band behind");
+    CHECK(fake_panel_oob == 0, "no write runs past the window it was opened for");
+}
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -1128,6 +1271,8 @@ int main(void)
     case_a_scale_that_would_overflow_is_refused();
     case_scale_zero_means_one_to_one();
     case_tiles_are_refused_while_scaled();
+    case_a_new_keyframe_does_not_discard_the_one_still_queued();
+    case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);
