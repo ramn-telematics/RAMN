@@ -170,6 +170,9 @@ static uint16_t kfChunksSent     = 0;
 static uint8_t  kfXOffset        = 0;
 static uint8_t  kfYOffset        = 0;
 static uint32_t kfAckWaitTick    = 0;
+// Measured IMG_END -> ACK round trip, printed by the periodic task.
+static uint32_t    kfAckLatencyMs    = 0;
+static RAMN_Bool_t kfAckLatencyPrint = False;
 #define KF_ACK_TIMEOUT_MS 2000U
 
 // Delta tracking
@@ -282,7 +285,8 @@ static RAMN_Bool_t RequestESP32Poll(void);
 static void ProcessESP32Response(void);
 static void PrintSPIStats(void);
 static void PrintImageACK(void);
-static void PrintImageACKTimeout(void);
+static void PrintImageACKTimeout(uint32_t waited);
+static void PrintImageACKLatency(void);
 
 // ============================================================================
 // INITIALIZATION
@@ -312,7 +316,9 @@ void RAMN_TELEMATICS_Init(uint32_t tick)
 	currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
 	kfAckReceived         = False;
 	deltaFirstTileOfFrame = False;
-	lastDeltaActivityTick = tick;
+	// Real time, to match the comparison in RAMN_TELEMATICS_Update -- see the
+	// note there on why `tick` cannot be used for a deadline.
+	lastDeltaActivityTick = (uint32_t)xTaskGetTickCount();
 
 	// Image-mode poll request: [0x03][0xBB][0x01][0xBA] + zero padding
 	RAMN_memset(pollImageTxBuffer, 0, SPI_RX_BUFFER_SIZE);
@@ -1222,12 +1228,33 @@ static void PrintImageACK(void)
 #endif
 }
 
-static void PrintImageACKTimeout(void)
+// `waited` is the MEASURED wait, not KF_ACK_TIMEOUT_MS. Printing the constant
+// says only "the branch that fires after 2 s fired", which is exactly what a
+// mismatched-clock comparison also prints while firing immediately -- the two
+// are indistinguishable in a log, and telling them apart is the whole question
+// when a keyframe looks slow.
+// Its own function, like PrintImageACK next door and for the same reason: the
+// snprintf locals belong to whoever calls it, and RAMN_TELEMATICS_Update is the
+// root of the deepest chain on the periodic task's 1 KB stack. Inlined here it
+// took that chain to 688 of its 704-byte budget -- the margin that has bricked
+// this ECU before.
+static void PrintImageACKLatency(void)
+{
+#ifdef ENABLE_UART
+	if (kfAckLatencyPrint == False) return;
+	kfAckLatencyPrint = False;
+	int len = snprintf(imgAckPrintBuf, sizeof(imgAckPrintBuf),
+	    "ECUA ACK: answered in %lums\r\n", (unsigned long)kfAckLatencyMs);
+	if (len > 0) RAMN_UART_SendFromTask((uint8_t*)imgAckPrintBuf, (uint32_t)len);
+#endif
+}
+
+static void PrintImageACKTimeout(uint32_t waited)
 {
 #ifdef ENABLE_UART
 	int len = snprintf(imgAckPrintBuf, sizeof(imgAckPrintBuf),
-	    "ECUA ACK: TIMEOUT after %ums (sent %u chunks)\r\n",
-	    (unsigned)KF_ACK_TIMEOUT_MS, kfChunksSent);
+	    "ECUA ACK: TIMEOUT after %lums (limit %ums, sent %u chunks)\r\n",
+	    (unsigned long)waited, (unsigned)KF_ACK_TIMEOUT_MS, kfChunksSent);
 	if (len > 0) RAMN_UART_SendFromTask((uint8_t*)imgAckPrintBuf, (uint32_t)len);
 #endif
 }
@@ -1308,6 +1335,51 @@ static void PrintSPIStats(void)
 #endif
 }
 
+// The keyframe-ACK wait and the delta idle timeout, in their own function so
+// that the tick they need is not a local of RAMN_TELEMATICS_Update: that is the
+// root of the deepest chain on the periodic task's 1 KB stack, and one extra
+// 32-bit local there took it from 672 to 688 of its 704-byte budget -- the
+// margin that has bricked this ECU before.
+static void UpdateStreamTimeouts(void)
+{
+	uint32_t now = (uint32_t)xTaskGetTickCount();
+
+	// KEYFRAME_SENT: wait for ACK from ECU A (0x303), timeout after 2 s
+	if (streamState == KEYFRAME_SENT)
+	{
+		if (kfAckReceived == True)
+		{
+			// How long ECU A took from IMG_END to answering. That is its whole
+			// decode-and-paint time for the frame, and it is the number that
+			// decides how fast keyframes can be sent -- worth one print.
+			kfAckLatencyMs        = (uint32_t)(now - kfAckWaitTick);
+			kfAckLatencyPrint     = True;
+			kfAckReceived         = False;
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+		}
+		else if ((int32_t)(now - kfAckWaitTick) >= (int32_t)KF_ACK_TIMEOUT_MS)
+		{
+			// ACK timed out — give up and return to idle. Say so: silence here
+			// and silence from a healthy ECU A look identical on the wire.
+			PrintImageACKTimeout((uint32_t)(now - kfAckWaitTick));
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+		}
+	}
+
+	// DELTA_ACTIVE: return to idle poll rate if no tile arrives within 2 s
+	if (streamState == DELTA_ACTIVE)
+	{
+		if ((int32_t)(now - lastDeltaActivityTick) >= (int32_t)DELTA_IDLE_TIMEOUT_MS)
+		{
+			streamState           = STREAM_IDLE;
+			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+			deltaFirstTileOfFrame = False;
+		}
+	}
+}
+
 // ============================================================================
 // PERIODIC UPDATE FUNCTION
 // ============================================================================
@@ -1316,6 +1388,22 @@ static void PrintSPIStats(void)
 // ============================================================================
 void RAMN_TELEMATICS_Update(uint32_t tick)
 {
+	// `tick` is the periodic task's xLastWakeTime. vTaskDelayUntil advances it
+	// by exactly SIM_LOOP_CLOCK_MS per iteration, so whenever this loop
+	// overruns its period it falls behind real time and never catches up --
+	// the same defect that used to tear down ECU A's image screen mid-keyframe.
+	//
+	// Four timeouts below are stamped with xTaskGetTickCount() (real time) in
+	// ProcessESP32Response and RequestESP32Poll, and were then compared against
+	// `tick`. Once the two diverge that subtraction is negative, wraps to about
+	// 4.29 billion, and every one of those timeouts fires on the first call
+	// after it is armed: the keyframe ACK wait ends instantly and drops the
+	// poll interval from 1 ms back to 50 ms, the delta stream is torn down
+	// between tiles, and the poll watchdogs trip on healthy polls.
+	//
+	// Read the clock those stamps were taken from, and compare as a SIGNED
+	// difference so a lagging or wrapped tick can never fire one early.
+
 	// ========================================================================
 	// ESP32 POLLING STATE MACHINE (NON-BLOCKING)
 	// ========================================================================
@@ -1325,7 +1413,8 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 
 	// WATCHDOG: Check if stuck in COMPLETE state for too long (should process immediately)
 	// This catches the case where Update() is being called but ProcessESP32Response() isn't running
-	if (spiPollState == SPI_POLL_COMPLETE && (tick - spiPollCompleteTick) >= 50)
+	if (spiPollState == SPI_POLL_COMPLETE &&
+	    ((int32_t)((uint32_t)xTaskGetTickCount() - spiPollCompleteTick) >= 50))
 	{
 		// CRITICAL FIX: Process the response BEFORE resetting state
 		// Otherwise we skip response processing and the ESP32 queue backs up!
@@ -1363,7 +1452,8 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 		case SPI_POLL_REQUESTED:
 			// Waiting for DMA completion (handled by callback)
 			// Check for timeout
-			if ((tick - spiPollRequestTick) >= SPI_POLL_TIMEOUT_MS)
+			if ((int32_t)((uint32_t)xTaskGetTickCount() - spiPollRequestTick) >=
+			    (int32_t)SPI_POLL_TIMEOUT_MS)
 			{
 				// CRITICAL: Abort the ongoing DMA transfer to prevent SPI peripheral from getting stuck
 				//extern SPI_HandleTypeDef hspi2;
@@ -1441,36 +1531,9 @@ void RAMN_TELEMATICS_Update(uint32_t tick)
 
 	// Report the last ACK from ECU A -- the only telemetry ECU A can produce.
 	PrintImageACK();
+	PrintImageACKLatency();
 
-	// KEYFRAME_SENT: wait for ACK from ECU A (0x303), timeout after 2 s
-	if (streamState == KEYFRAME_SENT)
-	{
-		if (kfAckReceived == True)
-		{
-			kfAckReceived         = False;
-			streamState           = STREAM_IDLE;
-			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
-		}
-		else if ((tick - kfAckWaitTick) >= KF_ACK_TIMEOUT_MS)
-		{
-			// ACK timed out — give up and return to idle. Say so: silence here
-			// and silence from a healthy ECU A look identical on the wire.
-			PrintImageACKTimeout();
-			streamState           = STREAM_IDLE;
-			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
-		}
-	}
-
-	// DELTA_ACTIVE: return to idle poll rate if no tile arrives within 2 s
-	if (streamState == DELTA_ACTIVE)
-	{
-		if ((tick - lastDeltaActivityTick) >= DELTA_IDLE_TIMEOUT_MS)
-		{
-			streamState           = STREAM_IDLE;
-			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
-			deltaFirstTileOfFrame = False;
-		}
-	}
+	UpdateStreamTimeouts();
 
 	// Periodically print SPI statistics to UART for monitoring
 	if ((tick - spiStatsLastPrintTick) >= SPI_STATS_PRINT_INTERVAL_MS)

@@ -112,6 +112,7 @@ static void reset_state(void)
     kfRowFill         = 0;
     memset(&prevStats, 0, sizeof prevStats);
     kfEndSeen         = False;
+    kfFramesSkipped   = 0;
     kfExpectedSeq     = 0;
     kfSeqBroken       = False;
     kfDupSkips        = 0;
@@ -1170,23 +1171,40 @@ static size_t panel_count(uint8_t lo, uint8_t hi)
     return n;
 }
 
-static void case_a_new_keyframe_does_not_discard_the_one_still_queued(void)
+static void case_a_superseded_keyframe_is_dropped_whole(void)
 {
-    h_case_begin("a keyframe arriving while the previous one is still queued does not erase it");
-    /* Frame A is queued whole and never drained -- the periodic task is busy
-       painting, which is the normal state of affairs at 10 fps. Then frame B's
-       IMG_START arrives. IMG_START runs on the CAN RX task and zeroes
-       kfRingWriteIdx and kfRingReadIdx, so every entry frame A left in the
-       ring, its IMG_END included, is thrown away by the producer. Frame A is
-       not torn or partial: it never reaches the glass at all. */
+    h_case_begin("a keyframe superseded before it is painted is dropped whole, and said so");
+    /* Both frames are queued before anything drains -- the periodic task is
+       busy painting, which is the normal state of affairs under load. Frame A
+       is stale before a pixel of it exists on the glass: painting it costs
+       ~29 ms of blocking SPI for a picture frame B overwrites immediately.
+       So it is dropped ENTIRELY, at its START entry, before the window opens.
+
+       The old code reached the same policy by accident and paid for it with
+       corruption: IMG_START emptied the ring from the CAN RX task, mid-paint,
+       mixing two frames in one window and counting nothing. The difference is
+       not whether a frame is dropped -- it is that the drop happens on a
+       boundary, costs no panel time, and appears on the bus. */
     reset_state();
     queue_solid_frame(0x11, 0x22, 200);
     queue_solid_frame(0x33, 0x44, 300);
     drain(400);
 
-    CHECK(fake_window_opens == 2, "each keyframe opens its own window");
-    CHECK(fake_screen_len == 2u * 240u * 240u * 2u,
-          "and both frames' pixels reach the panel, not just the last one");
+    CHECK(kfFramesSkipped == 1, "the superseded frame is counted, not lost quietly");
+    CHECK(fake_window_opens == 1, "no window is opened for it");
+    CHECK(fake_screen_len == 240u * 240u * 2u,
+          "and no panel time is spent on it: one frame painted, not two");
+    CHECK(panel_count(0x11, 0x22) == 0, "none of it reaches the glass");
+    CHECK(panel_count(0x33, 0x44) == 240u * 240u, "the newest frame is whole");
+
+    /* ECU D waits on an ACK per keyframe and gives up after 2 s. A silently
+       skipped frame costs it that whole wait -- far more than the paint the
+       skip saved -- so the skip has to be announced. */
+    RAMN_Bool_t sawSkip = False;
+    for (int i = 0; i < fake_can_tx_count; i++)
+        if (fake_can_tx[i].header.Identifier == IMG_CAN_ID_ACK &&
+            (fake_can_tx[i].data[1] & 0x20U)) sawSkip = True;
+    CHECK(sawSkip != False, "and an ACK carries the superseded flag for it");
 }
 
 /* Fires from inside RAMN_SPI_WriteImageChunk on the Nth write, standing in for
@@ -1229,6 +1247,13 @@ static void case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel(void)
        pixel left visible is a band of the previous picture. */
     size_t a = panel_count(0x11, 0x22);
     size_t b = panel_count(0x33, 0x44);
+    /* The skip decision is taken at the START entry and nowhere else. Taken
+       mid-frame it would mean that under a steady overload nothing ever
+       completes -- every frame's top third and no whole picture. Frame B is
+       queued here while frame A is already going to the panel, and A still
+       finishes. */
+    CHECK(kfFramesSkipped == 0, "a frame already being painted is finished, not abandoned");
+    CHECK(fake_screen_len == 2u * 240u * 240u * 2u, "so both frames are painted in full");
     CHECK(a + b == 240u * 240u, "every panel pixel belongs to one of the two frames");
     CHECK(a == 0, "and frame A is fully painted over, leaving no band behind");
     CHECK(fake_panel_oob == 0, "no write runs past the window it was opened for");
@@ -1271,7 +1296,7 @@ int main(void)
     case_a_scale_that_would_overflow_is_refused();
     case_scale_zero_means_one_to_one();
     case_tiles_are_refused_while_scaled();
-    case_a_new_keyframe_does_not_discard_the_one_still_queued();
+    case_a_superseded_keyframe_is_dropped_whole();
     case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel();
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",

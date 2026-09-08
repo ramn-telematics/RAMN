@@ -243,6 +243,7 @@ typedef struct {
     uint16_t    dupSkips;     // 0x301 delivered twice    (CAN RX task)
     RAMN_Bool_t seqBroken;    // a chunk never arrived    (CAN RX task)
     RAMN_Bool_t truncated;    // a half-read RLE block at IMG_END
+    RAMN_Bool_t superseded;   // dropped unpainted: a newer keyframe was queued
 } ImgFrameStats_t;
 
 static void SendImageAck(uint8_t stage, uint8_t endStatus, const ImgFrameStats_t* st);
@@ -253,6 +254,8 @@ static ImgFrameStats_t prevStats;
 // Whether an IMG_END entry described that frame. A frame whose IMG_END was lost
 // still has to be reported, and prevStats is the only place left to do it.
 static RAMN_Bool_t     kfEndSeen = False;
+// Keyframes dropped unpainted because a newer one was already queued.
+static uint16_t        kfFramesSkipped = 0;
 
 static uint16_t             kfExpectedSeq = 0;   // CAN RX task only
 // Written on the CAN RX task, read by the periodic task when it answers
@@ -577,6 +580,57 @@ static void SCREENIMAGE_Update(uint32_t tick)
 
             if (entry->kind == KFRING_KIND_START)
             {
+                // LATEST FRAME WINS.
+                //
+                // Painting is the slow half -- ~29 ms of blocking SPI for a
+                // full panel, whatever resolution the source arrived at -- and
+                // it is pure loss when a newer keyframe is already queued
+                // behind this one: those 29 ms buy a picture that is
+                // overwritten before anyone sees it, and every frame painted
+                // late pushes the next one later still.
+                //
+                // Discarding is nearly free by comparison: no SPI at all. So
+                // when a newer START is already in the ring, drop this whole
+                // frame unpainted and start on the newest one.
+                //
+                // Only frames that have NOT been started are skipped. Deciding
+                // this at the START entry, never mid-frame, is what keeps the
+                // guarantee that whatever is begun is finished: at a steady
+                // overload this shows every other frame whole rather than
+                // every frame's top third.
+                //
+                // The old code had this property by accident and paid for it
+                // with corruption -- IMG_START emptied the ring from the CAN
+                // RX task, mid-paint, mixing two frames in one window. Same
+                // policy, done where the ordering holds.
+                {
+                    uint8_t wsnap = kfRingWriteIdx;
+                    uint8_t scan  = (uint8_t)((ri + 1U) % KFRING_ENTRIES);
+                    uint8_t newest = ri;
+                    while (scan != wsnap)
+                    {
+                        if (kfRingBuf[scan].kind == KFRING_KIND_START) newest = scan;
+                        scan = (uint8_t)((scan + 1U) % KFRING_ENTRIES);
+                    }
+                    if (newest != ri)
+                    {
+                        // Say so on the bus. ECU D waits on an ACK per keyframe
+                        // and gives up after 2 s; a silently dropped frame
+                        // costs it that whole wait, which is far more than the
+                        // paint this skip saved.
+                        ImgFrameStats_t sk;
+                        memset(&sk, 0, sizeof sk);
+                        sk.superseded = True;
+                        SendImageAck(IMG_ACK_END, 0x01U, &sk);
+                        if (kfFramesSkipped < 0xFFFFU) kfFramesSkipped++;
+
+                        ri    = newest;
+                        __DMB();
+                        kfRingReadIdx = ri;
+                        entry = &kfRingBuf[ri];
+                    }
+                }
+
                 // Reaching this entry is what "the previous keyframe is
                 // finished" means: every chunk of it is ahead in the ring and
                 // has already been decoded and written. Only now is it safe to
@@ -600,6 +654,7 @@ static void SCREENIMAGE_Update(uint32_t tick)
                                                      ((uint16_t)entry->data[16] << 8));
                     prevStats.seqBroken  = (entry->data[17] != 0U) ? True : False;
                     prevStats.truncated  = RLE_StreamMidBlock(&kfStream);
+                    prevStats.superseded = False;
                 }
                 kfEndSeen = False;
 
@@ -653,6 +708,7 @@ static void SCREENIMAGE_Update(uint32_t tick)
                 st.seqBroken  = (entry->data[9] != 0U) ? True : False;
                 st.truncated  = ((RLE_StreamMidBlock(&kfStream) != False) ||
                                  (st.seqBroken != False)) ? True : False;
+                st.superseded = False;
 
                 SendImageAck(IMG_ACK_END, entry->data[0], &st);
                 prevStats = st;               // for the next frame's START ack
@@ -841,6 +897,10 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 //                      bit3 a chunk never arrived; the frame was abandoned
 //                      bit4 the link delivered a chunk twice (harmless: the
 //                           repeat was skipped, not decoded)
+//                      bit5 the frame was superseded before it was painted --
+//                           a newer keyframe was already queued behind it, so
+//                           it was dropped whole rather than spending ~29 ms
+//                           of panel time on a picture about to be overwritten
 //   [2..4]           : bytes written to the panel, 24-bit little-endian
 //                      (a full 240x240 keyframe is 115,200)
 //   [5]              : 0x301 frames accepted                (saturating 255)
@@ -873,6 +933,7 @@ static void SendImageAck(uint8_t stage, uint8_t endStatus, const ImgFrameStats_t
     if (st->stateDrops != 0U)    flags |= 0x04U;
     if (st->seqBroken  != False) flags |= 0x08U;
     if (st->dupSkips   != 0U)    flags |= 0x10U;
+    if (st->superseded != False) flags |= 0x20U;
 
     uint32_t decoded = st->decoded;
     uint16_t rx      = st->framesRx;
@@ -1163,6 +1224,7 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         st.dupSkips   = kfDupSkips;
         st.seqBroken  = kfSeqBroken;
         st.truncated  = truncated;
+        st.superseded = False;
         SendImageAck(IMG_ACK_END, status, &st);
 
         imgState = IMG_SHOWN;

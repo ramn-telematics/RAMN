@@ -155,6 +155,101 @@ static void case_short_and_malformed_are_rejected(void)
     CHECK(spiStats.spiRxNoRespFoundCnt == 1, "counted as no response found");
 }
 
+#ifdef TELEMATICS_HAS_STREAM_STATE
+static void case_the_keyframe_ack_wait_is_measured_against_its_own_clock(void)
+{
+    h_case_begin("the keyframe ACK wait is measured against the clock it was armed with");
+    /* kfAckWaitTick is stamped with xTaskGetTickCount() -- real time -- in
+       ProcessESP32Response. The wait used to be compared against
+       RAMN_TELEMATICS_Update's `tick` argument, which is xLastWakeTime:
+       vTaskDelayUntil advances that by exactly one period per iteration, so it
+       falls permanently behind real time whenever the loop overruns, and this
+       loop overruns whenever the SPI debug output is on. Subtracting a real
+       stamp from a lagging clock is negative, wraps to about 4.29 billion, and
+       clears the 2 s limit on the FIRST call after the wait was armed.
+
+       The cost was not the missing diagnostic. The timeout branch sets
+       currentPollIntervalMs back to SPI_POLL_INTERVAL_MS, so every keyframe
+       ended by dropping the ESP32 poll rate from 1 ms to 50 ms -- and the next
+       keyframe, which needs one poll per 15 chunks, was then fetched at the
+       idle rate. Same defect ECU A's image screen had, same fix: read the
+       clock the stamp came from, and compare as a signed difference. */
+    fake_reset();
+    fake_tick             = 500000u;
+    streamState           = KEYFRAME_SENT;
+    kfAckReceived         = False;
+    kfAckWaitTick         = (uint32_t)xTaskGetTickCount();
+    currentPollIntervalMs = 1u;
+
+    /* The real entry point, driven the way the overrunning periodic task drives
+       it: a `tick` argument far behind the clock the wait was armed with. This
+       is the exact call that used to end the wait instantly. */
+    RAMN_TELEMATICS_Update(0u);
+    CHECK(streamState == KEYFRAME_SENT,
+          "a tick argument behind real time does not end the wait");
+    CHECK(currentPollIntervalMs == 1u, "so the fast poll rate is kept for the next keyframe");
+
+    UpdateStreamTimeouts();
+    CHECK(streamState == KEYFRAME_SENT, "and neither does no elapsed time");
+
+    /* And the stamp itself ahead of the clock -- what a lagging comparison
+       clock looks like from the inside. Unsigned, this is ~4.29 billion. */
+    kfAckWaitTick = (uint32_t)xTaskGetTickCount() + 100u;
+    UpdateStreamTimeouts();
+    CHECK(streamState == KEYFRAME_SENT, "nor does a stamp taken ahead of the clock");
+    kfAckWaitTick = (uint32_t)xTaskGetTickCount();
+
+    fake_tick += KF_ACK_TIMEOUT_MS - 1u;
+    UpdateStreamTimeouts();
+    CHECK(streamState == KEYFRAME_SENT, "nor does one tick under the limit");
+
+    fake_tick += 1u;
+    UpdateStreamTimeouts();
+    CHECK(streamState == STREAM_IDLE, "a real 2 s wait does time out");
+    CHECK(currentPollIntervalMs == SPI_POLL_INTERVAL_MS, "and returns to the idle poll rate");
+}
+
+static void case_an_ack_that_arrives_reports_how_long_it_took(void)
+{
+    h_case_begin("an ACK that arrives reports the measured wait, not the limit");
+    /* "TIMEOUT after 2000ms" printed the CONSTANT. A mismatched-clock
+       comparison that fires instantly prints exactly the same line as a
+       genuine two-second wait, which is indistinguishable in a log -- and
+       telling those apart is the whole question when keyframes look slow. */
+    fake_reset();
+    fake_tick             = 900000u;
+    streamState           = KEYFRAME_SENT;
+    kfAckWaitTick         = (uint32_t)xTaskGetTickCount();
+    kfAckReceived         = True;
+    kfAckLatencyPrint     = False;
+    fake_tick += 37u;
+
+    UpdateStreamTimeouts();
+    CHECK(streamState == STREAM_IDLE, "the ACK ends the wait");
+    CHECK(kfAckLatencyPrint != False, "and the round trip is queued for printing");
+    CHECK(kfAckLatencyMs == 37u, "as the time actually measured");
+}
+
+static void case_the_delta_idle_timeout_uses_the_same_clock(void)
+{
+    h_case_begin("the delta idle timeout uses the same clock as its stamp");
+    /* Same mismatch, same consequence: DELTA_ACTIVE was torn down between
+       tiles, dropping the poll rate mid-stream. */
+    fake_reset();
+    fake_tick             = 700000u;
+    streamState           = DELTA_ACTIVE;
+    lastDeltaActivityTick = (uint32_t)xTaskGetTickCount();
+    currentPollIntervalMs = 1u;
+
+    UpdateStreamTimeouts();
+    CHECK(streamState == DELTA_ACTIVE, "a fresh tile does not end the stream");
+
+    fake_tick += DELTA_IDLE_TIMEOUT_MS;
+    UpdateStreamTimeouts();
+    CHECK(streamState == STREAM_IDLE, "but a real idle period does");
+}
+#endif
+
 int main(void)
 {
     printf("STM32 telematics SPI host tests\n");
@@ -165,6 +260,11 @@ int main(void)
     case_extended_id_does_not_alias_a_message_type();
     case_zero_payload_frames_are_legal();
     case_short_and_malformed_are_rejected();
+#ifdef TELEMATICS_HAS_STREAM_STATE
+    case_the_keyframe_ack_wait_is_measured_against_its_own_clock();
+    case_an_ack_that_arrives_reports_how_long_it_took();
+    case_the_delta_idle_timeout_uses_the_same_clock();
+#endif
 
     printf("\n-- against the golden vectors from ramn-protocol --\n");
     conformance_cases();
