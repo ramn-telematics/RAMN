@@ -2,6 +2,19 @@
    the FDCAN types/enums, the RAMN scalar types, and the FreeRTOS surface.
    Values are copied from the real STM32L5 HAL headers -- see VALUES.md. */
 #pragma once
+
+/* Carries the REAL main.h's include guard on purpose.
+ *
+ * A header that lives in Core/Inc and includes "main.h" resolves it relative to
+ * its own directory, so it opens Core/Inc/main.h -- the real one -- which
+ * pulls in the HAL and fails here. That is why most Core/Inc headers have a
+ * stub of their own in this directory. Defining __MAIN_H means the real
+ * header becomes a no-op wherever it is reached, so a module can include a
+ * genuine Core/Inc header (ramn_secoc_link.h, say) without needing that
+ * header stubbed too. */
+#ifndef __MAIN_H
+#define __MAIN_H
+#endif
 /* The real Core/Inc/main.h includes ramn_config.h, and modules rely on that:
    ramn_screen_image.c opens with `#ifdef ENABLE_SCREEN` BEFORE including the
    config itself. Pull in the project's own config here for the same reason --

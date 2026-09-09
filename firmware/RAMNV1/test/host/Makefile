@@ -12,12 +12,15 @@ CFLAGS   := -std=c11 -g -O0 -Wall -Wextra \
             -DTELEMATICS_HAS_STREAM_STATE \
             -Istubs -I. -I$(CORE)/Inc -I$(CORE)/Src
 BIN      := run_tests
-SRCS     := test_telematics_spi.c test_conformance.c fakes.c harness.c
+SECOC    := $(CORE)/Src/ramn_secoc.c $(CORE)/Src/ramn_blake2s.c \
+            $(CORE)/Src/ramn_secoc_keys.c $(CORE)/Src/ramn_secoc_session.c \
+            $(CORE)/Src/ramn_secoc_link.c
+SRCS     := test_telematics_spi.c test_conformance.c fakes.c harness.c $(SECOC)
 
 # ECU A's image receive path is a separate binary: it compiles a different
 # module white-box, and two files cannot each #include a .c into one link.
 BIN_A    := run_tests_ecua
-SRCS_A   := test_screen_image.c fakes_screen.c fakes.c harness.c
+SRCS_A   := test_screen_image.c fakes_screen.c fakes.c harness.c $(SECOC)
 # ENABLE_SCREEN comes from the real ramn_config.h for an ECU A build, so it is
 # not defined here -- doing so shadows the project's own definition.
 CFLAGS_A := $(CFLAGS) -Wno-unused-but-set-variable
@@ -37,8 +40,12 @@ ecud: $(BIN)
 ecua: $(BIN_A)
 	./$(BIN_A)
 
+# This suite exercises ECU D's half of the link, but ramn_config.h's default
+# target is ECU A, so the SENDER role is not selected by the config here. Ask
+# for it explicitly rather than switching the whole build to TARGET_ECUD, which
+# would also pull in ENABLE_UART and change what these tests compile.
 $(BIN): $(SRCS) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_telematics.c
-	$(CC) $(CFLAGS) -o $@ $(SRCS)
+	$(CC) $(CFLAGS) -DSECOC_LINK_ROLE_SENDER -o $@ $(SRCS)
 
 $(BIN_A): $(SRCS_A) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_screen_image.c
 	$(CC) $(CFLAGS_A) -o $@ $(SRCS_A)

@@ -293,6 +293,15 @@
 #endif
 
 
+// SecOC keeps its key in the emulated EEPROM, and ECU A -- which has no UDS,
+// KWP or XCP -- would otherwise have no EEPROM layer at all and no way to hold
+// a provisioned key. Enabling it there costs a flash page pair at 0x0803E000
+// and nothing else: the emulation layer takes over the hardware CRC unit, and
+// no RAMN module uses it (every caller goes through RAMN_CRC_SoftCalculate).
+#if defined(ENABLE_IMAGE_SECOC) && defined(ENABLE_SCREEN)
+#define ENABLE_EEPROM_EMULATION
+#endif
+
 #if defined(ENABLE_UDS) || defined(ENABLE_KWP) || defined(ENABLE_XCP)
 #define ENABLE_DIAG
 #define ENABLE_EEPROM_EMULATION
@@ -383,6 +392,84 @@
 #define DELTA_CAN_ID_FRAME_START  0x304U  // Delta frame start     (CAN-FD)
 #define DELTA_CAN_ID_TILE_CHUNK   0x305U  // Delta tile chunk      (CAN-FD + BRS)
 #define DELTA_CAN_ID_FRAME_END    0x306U  // Delta frame end       (CAN-FD)
+
+// SecOC session establishment. The provisioned key authenticates this exchange
+// once; everything above is then authenticated under the key it derives.
+// See ramn_secoc_session.h for the protocol and why both sides send a nonce.
+#define SESSION_CAN_ID_REQ        0x307U  // ECU D -> ECU A, "I want to stream"
+#define SESSION_CAN_ID_CHALLENGE  0x308U  // ECU A -> ECU D, nonce_A
+#define SESSION_CAN_ID_RESPONSE   0x309U  // ECU D -> ECU A, nonce_D + MAC
+#define SESSION_CAN_ID_CONFIRM    0x30AU  // ECU A -> ECU D, MAC
+
+// SecOC on the image stream --------------------------------------------------
+//
+// Authenticates every image message so that only the ECU holding the shared
+// key can put pixels on ECU A's panel. See ramn_secoc.h for the construction
+// and ramn_secoc_keys.h for where the key lives.
+//
+// This has to be PER CHUNK, not one authenticator at the end of a keyframe.
+// ECU A has no framebuffer -- ramn_screen_image.c decodes each chunk straight
+// to the ST7789 as it arrives -- so a keyframe-level MAC would verify long
+// after the attacker's pixels were already lit.
+//
+// Comment this out and every layout below collapses to the pre-SecOC wire
+// format, byte for byte, so the two can be compared on real hardware.
+#define ENABLE_IMAGE_SECOC
+
+#ifdef ENABLE_IMAGE_SECOC
+// FAIL CLOSED. ECU A refuses every image message until a session has been
+// established, rather than falling back to the provisioned key. A board whose
+// handshake has not completed shows nothing and says so in the 0x303 ACK,
+// which is the honest outcome: "the link is not authenticated" and "the link
+// is idle" must not look the same.
+#define IMAGE_SECOC_FAIL_CLOSED
+
+// How often ECU D may ask for a session, and how long ECU A holds a
+// half-finished handshake before it may be replaced. SESSION_REQ and
+// SESSION_CHALLENGE cannot be authenticated -- agreeing a key is what makes
+// authentication possible -- so anyone on the bus can send them; these bound
+// what that is worth. An established session is never touched by a handshake
+// in flight, so the worst case is wasted frames.
+#define SESSION_REQ_INTERVAL_MS   200U
+#define SESSION_PENDING_TIMEOUT_MS 1000U
+
+// Which half of the handshake this ECU performs. Exactly one, and only the
+// messages that role RECEIVES are compiled -- a verifier that also answered
+// SESSION_CHALLENGE would hand anyone on the bus a transcript-MAC oracle.
+#if defined(ENABLE_SCREEN)
+#define SECOC_LINK_ROLE_VERIFIER   // receives protected traffic, answers challenges
+#endif
+#if defined(ENABLE_TELEMATICS)
+#define SECOC_LINK_ROLE_SENDER     // sends protected traffic, asks for sessions
+#endif
+#endif
+
+#ifdef ENABLE_IMAGE_SECOC
+// Truncated authenticator carried by every image message.
+//
+// Four bytes is 1-in-4-billion per forgery attempt, and an attacker gets no
+// offline search: without the key the only way to test a guess is to put it on
+// the bus, where a wrong one corrupts the frame and lands in the drop counters
+// the 0x303 ACK already reports. It also makes the arithmetic below come out
+// exactly right -- see IMG_CHUNK_SPI_MSG_LEN in ramn_telematics.c.
+#define IMG_SECOC_MAC_BYTES       4U
+// Freshness bits on the wire, carried by IMG_START / DELTA_FRAME_START only.
+// Chunks inherit the freshness of the frame they belong to, so they spend no
+// bytes on it. 16 bits at a few frames per second is months before the
+// truncation period matters, and the receiver reconstructs the full 32.
+#define IMG_SECOC_FV_TRUNC_BITS  16U
+#else
+#define IMG_SECOC_MAC_BYTES       0U
+#define IMG_SECOC_FV_TRUNC_BITS   0U
+#endif
+
+// 0x301 keyframe chunk: [SEQ_HI][SEQ_LO][REAL_LEN][MAC...][RLE...]
+#define IMG_CAN_HEADER_BYTES     (3U + IMG_SECOC_MAC_BYTES)
+#define IMG_CAN_CHUNK_PAYLOAD    (64U - IMG_CAN_HEADER_BYTES)
+
+// 0x305 delta tile chunk: [X][Y][SIZE][SEQ][LEN][MAC...][RLE...]
+#define DELTA_CAN_HEADER_BYTES   (5U + IMG_SECOC_MAC_BYTES)
+#define DELTA_CAN_CHUNK_PAYLOAD  (64U - DELTA_CAN_HEADER_BYTES)
 
 // Check for bad configurations --------------------------------------
 

@@ -25,8 +25,24 @@
 #error "ECU D's delta chunk size disagrees with the protocol's"
 #endif
 #endif
-#if defined(RAMN_DELTA_CHUNK_PAYLOAD) && (RAMN_DELTA_CHUNK_PAYLOAD != 59)
-#error "vendored vectors predate the delta geometry constants -- refresh them"
+/* The literal this used to compare against (59) was the pre-SecOC size. The
+   number is not a constant of the protocol any more -- it is 64 minus the
+   header minus the authenticator -- so check the RELATIONSHIP instead, which
+   catches drift in either direction and in either repository. */
+#if defined(RAMN_DELTA_CHUNK_PAYLOAD) && defined(RAMN_DELTA_CAN_HEADER) && defined(RAMN_SECOC_MAC_BYTES)
+#if (RAMN_DELTA_CHUNK_PAYLOAD + RAMN_DELTA_CAN_HEADER + RAMN_SECOC_MAC_BYTES) != 64
+#error "vendored delta geometry does not fill a 64-byte CAN FD frame -- refresh the vectors"
+#endif
+#endif
+#if defined(RAMN_PIPE_CAN_FRAME_PAYLOAD) && defined(RAMN_PIPE_CAN_FRAME_HEADER) && defined(RAMN_SECOC_MAC_BYTES)
+#if (RAMN_PIPE_CAN_FRAME_PAYLOAD + RAMN_PIPE_CAN_FRAME_HEADER + RAMN_SECOC_MAC_BYTES) != 64
+#error "vendored chunk geometry does not fill a 64-byte CAN FD frame -- refresh the vectors"
+#endif
+#endif
+/* And that the vectors describe the SecOC setting this firmware is built for:
+   a header saying 4 MAC bytes against a build with none is silent truncation. */
+#if defined(RAMN_SECOC_MAC_BYTES) && (RAMN_SECOC_MAC_BYTES != IMG_SECOC_MAC_BYTES)
+#error "vendored vectors and ramn_config.h disagree on the SecOC MAC size"
 #endif
 #include "conformance_shared.h"
 

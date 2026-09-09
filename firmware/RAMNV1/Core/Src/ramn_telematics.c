@@ -18,6 +18,11 @@
 #include "ramn_config.h"
 #include "ramn_canfd.h"
 #include "ramn_uart.h"
+#ifdef ENABLE_IMAGE_SECOC
+#include "ramn_secoc.h"
+#include "ramn_secoc_keys.h"
+#include "ramn_secoc_link.h"
+#endif
 #include <stdio.h>
 
 // Define to enable UART debug output for SPI↔ESP32 communication.
@@ -82,12 +87,27 @@ extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
 // clocked for nothing: 512 carried 7 and wasted 36 bytes on every transaction.
 // 1020 is 15 of them exactly, and stays inside the 1024 the ESP32's DMA
 // descriptor is sized for. That is 1500 chunks/s, about 26% of the CAN bus.
-#define IMG_CHUNK_SPI_MSG_LEN 68U   // LEN+MARKER+TYPE+SEQ(2)+REAL_LEN+61+CHK
-#define SPI_TRANSACTION_SIZE 1020
+// [LEN][MARKER][TYPE][SEQ_HI][SEQ_LO][REAL_LEN] + payload + [CHK] = 6 + N + 1.
+// The payload is whatever a 0x301 frame has room for once its CAN header --
+// including the SecOC authenticator -- is subtracted, so this number follows
+// the wire format automatically instead of being restated.
+#define IMG_CHUNK_SPI_MSG_LEN (7U + IMG_CAN_CHUNK_PAYLOAD)
 
-// Tile RLE bytes one 0x305 frame carries: 64 minus the 5-byte tile header.
-#define DELTA_CAN_HEADER     5U
-#define DELTA_CHUNK_PAYLOAD  (CAN_MAX_PAYLOAD_BYTES - DELTA_CAN_HEADER)
+// SecOC shrinks the chunk payload from 61 to 57, which shrinks the SPI message
+// from 68 bytes to 64 -- and 64 divides 1024 exactly. The transaction gets
+// BIGGER and stops wasting the tail: 16 whole chunks per poll against 15, and
+// zero remainder clocked for nothing, right at the 1024 the ESP32's DMA
+// descriptor is sized for. The authenticator costs 7% of each frame's payload
+// and hands most of it back in link efficiency.
+#ifdef ENABLE_IMAGE_SECOC
+#define SPI_TRANSACTION_SIZE 1024   // 16 x 64
+#else
+#define SPI_TRANSACTION_SIZE 1020   // 15 x 68
+#endif
+
+// Tile RLE bytes one 0x305 frame carries: 64 minus its header (and MAC).
+#define DELTA_CAN_HEADER     DELTA_CAN_HEADER_BYTES
+#define DELTA_CHUNK_PAYLOAD  DELTA_CAN_CHUNK_PAYLOAD
 
 #define SPI_TX_BUFFER_SIZE SPI_TRANSACTION_SIZE  // one flush = one transaction
 
@@ -127,11 +147,11 @@ static volatile uint32_t spiStatsLastPrintTick = 0;
 // ============================================================================
 #define SPI_POLL_INTERVAL_MS 50   // Normal poll interval (ms) — reduced to 1 ms during streaming
 #define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response
-#define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // 15 packed IMG_CHUNKs per poll
+#define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // whole IMG_CHUNKs per poll
 
 /* One IMG_CHUNK SPI message is [LEN][MARKER][TYPE][SEQ_HI][SEQ_LO][REAL_LEN]
-   + 61 payload + [CHK] = 68 bytes. A transaction that cannot hold at least two
-   of them is not worth the poll. */
+   + IMG_CAN_CHUNK_PAYLOAD + [CHK]: 64 bytes with SecOC on, 68 with it off.
+   A transaction that cannot hold at least two of them is not worth the poll. */
 _Static_assert(SPI_TRANSACTION_SIZE >= (2 * IMG_CHUNK_SPI_MSG_LEN),
                "SPI transaction too small to carry two image chunks");
 _Static_assert(SPI_TRANSACTION_SIZE <= 1024,
@@ -295,8 +315,76 @@ static void PrintImageACKLatency(void);
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
+#ifdef ENABLE_IMAGE_SECOC
+// ============================================================================
+// SecOC -- SENDER SIDE
+//
+// One freshness domain covers the whole image stream. Keyframes and delta
+// frames draw from the same counter, so a recorded delta frame cannot be
+// replayed into the place of a later keyframe.
+// ============================================================================
+// The session -- key, freshness domain and handshake -- belongs to
+// ramn_secoc_link.c, dispatched from main.c as a peer of this module's own
+// ProcessRxCANMessage. It used to live here, which meant the frame builder and
+// nonce draw existed a second time in ramn_screen_image.c for ECU A's half of
+// the same exchange.
+
+// Image messages from the ESP32 dropped because no session was up. Reported in
+// the periodic SPI stats so a link that never handshakes is visible on UART
+// rather than looking like an ESP32 that stopped sending.
+static uint32_t             noSessionDrops = 0U;
+
+// Freshness of the frame being sent right now. Every chunk of that frame is
+// authenticated under it, which is exactly what lets a chunk spend zero wire
+// bytes carrying freshness of its own -- only the frame's opening message
+// (0x300 / 0x304) transmits it.
+static uint32_t imgCurrentFv = 0U;
+
+// Which session imgCurrentFv belongs to; see the note on ECU A's kfSessionGen.
+static uint32_t imgSessionGen = 0U;
+
+// Writes the authenticator into the LAST IMG_SECOC_MAC_BYTES of a frame that
+// is dlcLen bytes on the wire, over everything before it.
+//
+// Anchoring the MAC to the end of the frame rather than to the end of the
+// payload keeps its offset fixed no matter how many RLE bytes a chunk carries,
+// and it pulls the whole header -- sequence number, length byte, tile
+// coordinates -- inside the authenticated region. A receiver therefore cannot
+// be steered by a tampered length field: changing one changes the MAC input.
+static void SecOCTagFrame(uint32_t canId, uint8_t* data, uint8_t dlcLen, uint32_t fv)
+{
+	RAMN_SecOC_Ctx_t ctx;
+	ctx.dataId = (uint16_t)canId;
+	ctx.macLen = IMG_SECOC_MAC_BYTES;
+	// The SESSION key, never the provisioned root. The root is spent once, on
+	// the handshake in ramn_secoc_link.c, and does no per-frame work.
+	ctx.key    = RAMN_SecOC_LINK_Key();
+	ctx.fv     = RAMN_SecOC_LINK_Freshness();
+
+	uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
+	RAMN_SecOC_ComputeMac(&ctx, fv, data, authLen, &data[authLen]);
+}
+
+// Places the truncated freshness value of a new frame at offset off, and
+// returns the full value the frame's chunks will be authenticated under.
+static uint32_t SecOCBeginFrame(uint8_t* data, uint8_t off)
+{
+	uint32_t fv = RAMN_SecOC_TxFreshness(RAMN_SecOC_LINK_Freshness());
+	data[off]      = (uint8_t)((fv >> 8) & 0xFFU);
+	data[off + 1U] = (uint8_t)( fv       & 0xFFU);
+	return fv;
+}
+
+#endif
+
 void RAMN_TELEMATICS_Init(uint32_t tick)
 {
+#ifdef ENABLE_IMAGE_SECOC
+	// The session itself is initialised in main.c with the rest of the SecOC
+	// modules; this only clears what belongs to the stream.
+	imgCurrentFv = 0U;
+#endif
+
 	// Initialize TX buffers
 	activeBufferPos = 0;
 	flushBufferSize = 0;
@@ -891,6 +979,30 @@ static void ProcessESP32Response(void)
 			continue;
 		}
 
+#ifdef ENABLE_IMAGE_SECOC
+		// FAIL CLOSED, sender side. Every image message from the ESP32 is
+		// dropped until ECU A has confirmed a session, and each one nudges the
+		// handshake along (rate limited inside). Dropping rather than queueing
+		// is right: the ESP32 is sending live frames, so the next one is
+		// always more useful than the one we held.
+		if ((msgType == RAMN_MSG_TYPE_IMG_START) || (msgType == RAMN_MSG_TYPE_IMG_CHUNK) ||
+		    (msgType == RAMN_MSG_TYPE_IMG_END)   || (msgType == RAMN_MSG_TYPE_IMG_ABORT) ||
+		    (msgType == RAMN_MSG_TYPE_DELTA_FRAME) || (msgType == RAMN_MSG_TYPE_DELTA_FRAME_END))
+		{
+			if (RAMN_SecOC_LINK_EnsureSession(xTaskGetTickCount()) == 0U)
+			{
+				noSessionDrops++;
+				continue;
+			}
+			// A new session restarts its freshness counters, so the frame
+			// freshness cached from the previous one must go with it.
+			{
+				uint32_t gen = RAMN_SecOC_LINK_Generation();
+				if (gen != imgSessionGen) { imgSessionGen = gen; imgCurrentFv = 0U; }
+			}
+		}
+#endif
+
 		// ------------------------------------------------------------------
 		// TYPE 0x81: IMG_START — start of a keyframe
 		// Format: [LEN][0xCC][0x81][W_HI][W_LO][H_HI][H_LO][CH_HI][CH_LO][X_OFF][Y_OFF][SCALE][CHK]
@@ -923,8 +1035,12 @@ static void ProcessESP32Response(void)
 			streamState   = KEYFRAME_ACTIVE;
 			currentPollIntervalMs = 1U;
 
-			// Forward 0x300 IMG_START to ECU A
-			uint8_t canData[12];
+			// Forward 0x300 IMG_START to ECU A.
+			// With SecOC the frame grows to 20 bytes: the 12-byte body is
+			// untouched, the frame's truncated freshness follows it, and the
+			// authenticator sits in the last four. IMG_START is one frame per
+			// keyframe, so the two padding bytes cost nothing worth reclaiming.
+			uint8_t canData[20];
 			canData[0]  = (uint8_t)(w & 0xFFU);
 			canData[1]  = (uint8_t)(w >> 8);
 			canData[2]  = (uint8_t)(h & 0xFFU);
@@ -939,7 +1055,17 @@ static void ProcessESP32Response(void)
 			uint8_t xorChk = 0U;
 			for (uint8_t k = 0U; k < 11U; k++) xorChk ^= canData[k];
 			canData[11] = xorChk;
+#ifdef ENABLE_IMAGE_SECOC
+			// A new frame, so a new freshness value -- and every chunk and the
+			// IMG_END behind it are authenticated under this same value.
+			canData[14] = 0x00U;
+			canData[15] = 0x00U;
+			imgCurrentFv = SecOCBeginFrame(canData, 12U);
+			SecOCTagFrame(IMG_CAN_ID_START, canData, 20U, imgCurrentFv);
+			SendImageCANFrame(IMG_CAN_ID_START, FDCAN_DLC_BYTES_20, False, canData);
+#else
 			SendImageCANFrame(IMG_CAN_ID_START, FDCAN_DLC_BYTES_12, False, canData);
+#endif
 			continue;
 		}
 
@@ -969,7 +1095,8 @@ static void ProcessESP32Response(void)
 			while (srcOffset < payLen)
 			{
 				uint8_t remaining = (uint8_t)(payLen - srcOffset);
-				uint8_t frameLen  = (remaining <= 61U) ? remaining : 61U;
+				uint8_t frameLen  = (remaining <= IMG_CAN_CHUNK_PAYLOAD)
+				                    ? remaining : (uint8_t)IMG_CAN_CHUNK_PAYLOAD;
 
 				uint8_t canData[64];
 				RAMN_memset(canData, 0, sizeof(canData));
@@ -977,6 +1104,13 @@ static void ProcessESP32Response(void)
 				canData[1] = msg[4];    // SEQ_LO
 				canData[2] = frameLen;  // REAL_LEN -- true byte count carried in this frame
 				for (uint8_t k = 0U; k < frameLen; k++) canData[3U + k] = msg[6U + srcOffset + k];
+#ifdef ENABLE_IMAGE_SECOC
+				// Under the freshness of the keyframe this chunk belongs to.
+				// The sequence number is inside the authenticated region, so a
+				// chunk cannot be lifted out of one keyframe and replayed into
+				// another position of the same one.
+				SecOCTagFrame(IMG_CAN_ID_DATA, canData, 64U, imgCurrentFv);
+#endif
 				SendImageCANFrame(IMG_CAN_ID_DATA, FDCAN_DLC_BYTES_64, True, canData);
 
 				srcOffset = (uint8_t)(srcOffset + frameLen);
@@ -994,13 +1128,20 @@ static void ProcessESP32Response(void)
 			if (streamState != KEYFRAME_ACTIVE) continue;
 
 			// Forward 0x302 IMG_END
-			uint8_t canData[8];
+			uint8_t canData[12];
 			RAMN_memset(canData, 0, sizeof(canData));
 			canData[0] = (uint8_t)(kfChunksSent & 0xFFU);
 			canData[1] = (uint8_t)(kfChunksSent >> 8);
 			// CRC16 bytes (2-3) left as 0x00 — full CRC computation is optional
 			canData[4] = 0x00U;   // STATUS OK
+#ifdef ENABLE_IMAGE_SECOC
+			// Same freshness as the keyframe it closes: IMG_END is part of
+			// that frame, not a frame of its own.
+			SecOCTagFrame(IMG_CAN_ID_END, canData, 12U, imgCurrentFv);
+			SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_12, False, canData);
+#else
 			SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_8, False, canData);
+#endif
 
 			streamState   = KEYFRAME_SENT;
 			kfAckReceived = False;
@@ -1015,10 +1156,15 @@ static void ProcessESP32Response(void)
 		{
 			if (streamState == KEYFRAME_ACTIVE || streamState == KEYFRAME_SENT)
 			{
-				uint8_t canData[8];
+				uint8_t canData[12];
 				RAMN_memset(canData, 0, sizeof(canData));
 				canData[4] = 0x01U;   // STATUS abort
+#ifdef ENABLE_IMAGE_SECOC
+				SecOCTagFrame(IMG_CAN_ID_END, canData, 12U, imgCurrentFv);
+				SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_12, False, canData);
+#else
 				SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_8, False, canData);
+#endif
 			}
 			streamState           = STREAM_IDLE;
 			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
@@ -1048,11 +1194,22 @@ static void ProcessESP32Response(void)
 				deltaFrameSeq++;
 				deltaTileCount = 0U;
 
-				uint8_t startData[8];
+				uint8_t startData[16];
 				RAMN_memset(startData, 0, sizeof(startData));
 				startData[0] = deltaFrameSeq;
 				startData[1] = 0U;   // tile_count filled in DELTA_FRAME_END
+#ifdef ENABLE_IMAGE_SECOC
+				// A delta frame is a frame: it takes its own freshness, and
+				// its tiles inherit it. This message MUST be authenticated --
+				// it is what tells ECU A which freshness the tiles behind it
+				// are signed under, so an unauthenticated one would let an
+				// attacker choose that value.
+				imgCurrentFv = SecOCBeginFrame(startData, 8U);
+				SecOCTagFrame(DELTA_CAN_ID_FRAME_START, startData, 16U, imgCurrentFv);
+				SendImageCANFrame(DELTA_CAN_ID_FRAME_START, FDCAN_DLC_BYTES_16, False, startData);
+#else
 				SendImageCANFrame(DELTA_CAN_ID_FRAME_START, FDCAN_DLC_BYTES_8, False, startData);
+#endif
 
 				if (streamState != DELTA_ACTIVE)
 				{
@@ -1080,6 +1237,11 @@ static void ProcessESP32Response(void)
 			uint8_t copyLen = (payLen <= DELTA_CHUNK_PAYLOAD) ? payLen : DELTA_CHUNK_PAYLOAD;
 			canData[4] = copyLen;
 			for (uint8_t k = 0U; k < copyLen; k++) canData[5U + k] = msg[8U + k];
+#ifdef ENABLE_IMAGE_SECOC
+			// Tile coordinates and size are inside the authenticated region,
+			// so a valid tile cannot be relocated somewhere else on the panel.
+			SecOCTagFrame(DELTA_CAN_ID_TILE_CHUNK, canData, 64U, imgCurrentFv);
+#endif
 			SendImageCANFrame(DELTA_CAN_ID_TILE_CHUNK, FDCAN_DLC_BYTES_64, True, canData);
 			continue;
 		}
@@ -1135,6 +1297,16 @@ void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, c
 		RAMN_TELEMATICS_ProcessImageACK(pHeader, data, tick);
 		return;
 	}
+
+#ifdef ENABLE_IMAGE_SECOC
+	// The handshake messages are RAMN_SecOC_LINK_ProcessRxCANMessage's, called
+	// from main.c beside this function. They are still swallowed here so they
+	// are not forwarded to the ESP32: the session is between the two STM32s
+	// and the add-on board has no part in it.
+	if ((pHeader->IdType == FDCAN_STANDARD_ID) &&
+	    (pHeader->Identifier >= SESSION_CAN_ID_REQ) &&
+	    (pHeader->Identifier <= SESSION_CAN_ID_CONFIRM)) return;
+#endif
 
 	uint8_t msgBuf[73];  // MsgLen + Start + ID(4) + Len + Flags + Data(64 max) + Checksum
 	uint8_t offset = 0;
@@ -1376,7 +1548,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, bufferSize,
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu SecOC[Sess:%u NoSess:%lu Bad:%u] BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -1394,6 +1566,16 @@ static void PrintSPIStats(void)
 		streamState == STREAM_IDLE ? 0 : (streamState == KEYFRAME_ACTIVE ? 1 : 2), // Stream state indicator
 		kfAckRxCnt,
 		kfAckMissedCnt,
+#ifdef ENABLE_IMAGE_SECOC
+		// The three numbers that tell a link that never handshook apart from
+		// one that is being injected into. Without them, both look like an
+		// ESP32 that stopped sending.
+		(unsigned)RAMN_SecOC_LINK_Ready(),
+		noSessionDrops,
+		(unsigned)RAMN_SecOC_LINK_FailedCount(),
+#else
+		0U, 0UL, 0U,
+#endif
 		tec, rec, lec, dlec, busoff, errpass,
 		RAMN_FDCAN_Status.CANRxOverrunCnt);
 
@@ -1434,6 +1616,14 @@ static void UpdateStreamTimeouts(void)
 			PrintImageACKTimeout((uint32_t)(now - kfAckWaitTick));
 			streamState           = STREAM_IDLE;
 			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
+#ifdef ENABLE_IMAGE_SECOC
+			// Most likely cause of a silent ECU A is that it rebooted and no
+			// longer holds the session key we are streaming under. It cannot
+			// tell us so -- anything it sent would itself need a session -- so
+			// the timeout is the signal. Drop the session and the next image
+			// message re-handshakes.
+			RAMN_SecOC_LINK_Drop();
+#endif
 		}
 	}
 
@@ -1457,6 +1647,28 @@ static void UpdateStreamTimeouts(void)
 // ============================================================================
 void RAMN_TELEMATICS_Update(uint32_t tick)
 {
+#ifdef ENABLE_IMAGE_SECOC
+	// Bring the session up as soon as the bus is alive, not on the first image
+	// message that wants it.
+	//
+	// It cannot happen in RAMN_SecOC_LINK_Init: that runs before
+	// osKernelStart, where nothing can transmit. This is the first place with
+	// a live bus, so it is where bring-up belongs.
+	//
+	// Establishing it eagerly costs one frame at boot and buys two things.
+	// The first keyframe is no longer dropped waiting for a handshake. And --
+	// the reason that matters more -- the link is exercised even when the
+	// ESP32 is not streaming, so a board on a bench with nothing to display
+	// still shows whether the two ECUs can agree a key. Lazily, that path went
+	// untested until something happened to need it.
+	//
+	// xTaskGetTickCount() rather than `tick`, deliberately: see below. The
+	// rate limit inside EnsureSession must be measured against the same clock
+	// the send path uses, or the two disagree about how long ago a request
+	// went out.
+	if (RAMN_SecOC_LINK_Ready() == 0U) (void)RAMN_SecOC_LINK_EnsureSession(xTaskGetTickCount());
+#endif
+
 	// `tick` is the periodic task's xLastWakeTime. vTaskDelayUntil advances it
 	// by exactly SIM_LOOP_CLOCK_MS per iteration, so whenever this loop
 	// overruns its period it falls behind real time and never catches up --

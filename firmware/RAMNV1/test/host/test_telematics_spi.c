@@ -48,10 +48,50 @@ static size_t build_idle_response(uint8_t *out)
     return 4;
 }
 
+#ifdef ENABLE_IMAGE_SECOC
+/* Run the handshake as ECU A would, so ECU D has a session to stream under.
+ *
+ * ECU D fails closed: without this, every image message from the ESP32 is
+ * dropped and a SESSION_REQ goes out instead, which is the correct behaviour
+ * and makes every streaming fixture below assert on an empty bus. */
+static void establish_session_ecud(void)
+{
+    uint8_t nonceA[RAMN_SECOC_NONCE_BYTES];
+    for (unsigned i = 0; i < RAMN_SECOC_NONCE_BYTES; i++) nonceA[i] = (uint8_t)(0xA0 + i);
+
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier   = SESSION_CAN_ID_CHALLENGE;
+    h.IdType       = FDCAN_STANDARD_ID;
+    h.RxFrameType  = FDCAN_DATA_FRAME;
+    h.DataLength   = FDCAN_DLC_BYTES_8;
+    RAMN_SecOC_LINK_ProcessRxCANMessage(&h, nonceA, 0);
+
+    /* ECU D answers with nonce_D and a MAC; take its nonce back off the bus. */
+    uint8_t nonceD[RAMN_SECOC_NONCE_BYTES];
+    int found = -1;
+    for (int i = fake_can_tx_count - 1; i >= 0; i--)
+        if (fake_can_tx[i].header.Identifier == SESSION_CAN_ID_RESPONSE) { found = i; break; }
+    if (found < 0) return;
+    memcpy(nonceD, fake_can_tx[found].data, RAMN_SECOC_NONCE_BYTES);
+
+    uint8_t confirm[RAMN_SECOC_SESSION_MAC_BYTES];
+    RAMN_SecOC_SESSION_Mac(RAMN_SecOC_KEYS_GetImageKey(), SESSION_CAN_ID_CONFIRM,
+                           nonceD, nonceA, confirm);
+    h.Identifier = SESSION_CAN_ID_CONFIRM;
+    RAMN_SecOC_LINK_ProcessRxCANMessage(&h, confirm, 0);
+}
+#endif
+
 /* Drive one poll response through the decoder. */
 static void feed(const uint8_t *bytes, size_t n)
 {
     fake_reset();
+#ifdef ENABLE_IMAGE_SECOC
+    /* Cheap and idempotent: returns immediately once a session is up. */
+    if (RAMN_SecOC_LINK_Ready() == 0) establish_session_ecud();
+    fake_reset();
+#endif
     memset(&spiStats, 0, sizeof(spiStats));
     memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
     memcpy(spiRxBufferA, bytes, n);
@@ -373,6 +413,110 @@ static void case_the_delta_idle_timeout_uses_the_same_clock(void)
 }
 #endif
 
+
+#ifdef ENABLE_IMAGE_SECOC
+/* ------------------------------------------------------------------ */
+/* SecOC session -- sender side                                        */
+/* ------------------------------------------------------------------ */
+
+static const CapturedFrame_t *tx_with_id(uint32_t id)
+{
+    for (int i = fake_can_tx_count - 1; i >= 0; i--)
+        if (fake_can_tx[i].header.Identifier == id) return &fake_can_tx[i];
+    return NULL;
+}
+
+static void case_secoc_ecud_fails_closed_and_asks_for_a_session(void)
+{
+    h_case_begin("with no session, ECU D streams nothing and asks for one");
+
+    RAMN_SecOC_LINK_Init();
+    noSessionDrops = 0;
+
+    uint8_t msg[16];
+    size_t  n = build_img_start(msg, 60, 60, 25, 4);
+
+    fake_reset();
+    memset(&spiStats, 0, sizeof(spiStats));
+    memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
+    memcpy(spiRxBufferA, msg, n);
+    processRxBuffer = spiRxBufferA;
+    ProcessESP32Response();
+
+    CHECK(tx_with_id(IMG_CAN_ID_START) == NULL, "no keyframe goes on the bus");
+    CHECK(tx_with_id(SESSION_CAN_ID_REQ) != NULL, "a SESSION_REQ goes out instead");
+    CHECK(noSessionDrops > 0, "and the drop is counted, not silent");
+}
+
+static void case_secoc_ecud_asks_for_a_session_at_bring_up(void)
+{
+    h_case_begin("ECU D asks for a session as soon as the bus is alive");
+
+    /* No image data has arrived and none needs to: a session is an ECU-level
+       fact, so it is established when the link comes up rather than by the
+       first thing that happens to want it. It also means a board with nothing
+       to display still proves the two ECUs can agree a key. */
+    RAMN_SecOC_LINK_Init();
+    fake_reset();
+    fake_tick = 1;
+
+    RAMN_TELEMATICS_Update(fake_tick);
+
+    CHECK(tx_with_id(SESSION_CAN_ID_REQ) != NULL,
+          "a SESSION_REQ goes out with no image message having arrived");
+    CHECK(tx_with_id(IMG_CAN_ID_START) == NULL, "and nothing else does");
+}
+
+static void case_secoc_ecud_refuses_a_forged_confirm(void)
+{
+    h_case_begin("a SESSION_CONFIRM from someone without the key establishes nothing");
+
+    RAMN_SecOC_LINK_Init();
+    fake_reset();
+
+    uint8_t nonceA[RAMN_SECOC_NONCE_BYTES];
+    for (unsigned i = 0; i < RAMN_SECOC_NONCE_BYTES; i++) nonceA[i] = (uint8_t)(0xB0 + i);
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier  = SESSION_CAN_ID_CHALLENGE;
+    h.IdType      = FDCAN_STANDARD_ID;
+    h.RxFrameType = FDCAN_DATA_FRAME;
+    h.DataLength  = FDCAN_DLC_BYTES_8;
+    RAMN_SecOC_LINK_ProcessRxCANMessage(&h, nonceA, 0);
+    CHECK(tx_with_id(SESSION_CAN_ID_RESPONSE) != NULL, "ECU D answers the challenge");
+
+    /* Guess the confirm. Verifying it is what stops an attacker posing as
+       ECU A from leaving ECU D streaming under a key the real ECU A lacks. */
+    uint8_t bad[RAMN_SECOC_SESSION_MAC_BYTES];
+    memset(bad, 0x77, sizeof bad);
+    h.Identifier = SESSION_CAN_ID_CONFIRM;
+    RAMN_SecOC_LINK_ProcessRxCANMessage(&h, bad, 0);
+
+    CHECK(RAMN_SecOC_LINK_Ready() == 0, "no session is established");
+}
+
+static void case_secoc_ecud_rekeys_when_ecua_goes_silent(void)
+{
+    h_case_begin("a keyframe ACK that never arrives drops the session so it re-handshakes");
+
+    RAMN_SecOC_LINK_Init();
+    fake_reset();
+    establish_session_ecud();
+    if (!CHECK_OK(RAMN_SecOC_LINK_Ready() == 1, "a session is up")) return;
+
+    /* ECU A rebooting looks exactly like this from here: it stops answering,
+       and it cannot say why -- anything it sent would itself need a session. */
+    streamState   = KEYFRAME_SENT;
+    kfAckReceived = False;
+    kfAckWaitTick = 0;
+    fake_tick     = KF_ACK_TIMEOUT_MS + 1;
+    RAMN_TELEMATICS_Update(fake_tick);
+
+    CHECK(RAMN_SecOC_LINK_Ready() == 0,
+          "the session is dropped so the next frame re-handshakes");
+}
+#endif
+
 int main(void)
 {
     printf("STM32 telematics SPI host tests\n");
@@ -391,6 +535,12 @@ int main(void)
     case_the_keyframe_ack_wait_is_measured_against_its_own_clock();
     case_an_ack_that_arrives_reports_how_long_it_took();
     case_the_delta_idle_timeout_uses_the_same_clock();
+#ifdef ENABLE_IMAGE_SECOC
+    case_secoc_ecud_fails_closed_and_asks_for_a_session();
+    case_secoc_ecud_asks_for_a_session_at_bring_up();
+    case_secoc_ecud_refuses_a_forged_confirm();
+    case_secoc_ecud_rekeys_when_ecua_goes_silent();
+#endif
 #endif
 
     printf("\n-- against the golden vectors from ramn-protocol --\n");
