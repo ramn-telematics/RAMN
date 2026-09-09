@@ -448,6 +448,25 @@ static void case_secoc_ecud_fails_closed_and_asks_for_a_session(void)
     CHECK(noSessionDrops > 0, "and the drop is counted, not silent");
 }
 
+static void case_secoc_ecud_asks_for_a_session_at_bring_up(void)
+{
+    h_case_begin("ECU D asks for a session as soon as the bus is alive");
+
+    /* No image data has arrived and none needs to: a session is an ECU-level
+       fact, so it is established when the link comes up rather than by the
+       first thing that happens to want it. It also means a board with nothing
+       to display still proves the two ECUs can agree a key. */
+    RAMN_SecOC_LINK_Init();
+    fake_reset();
+    fake_tick = 1;
+
+    RAMN_TELEMATICS_Update(fake_tick);
+
+    CHECK(tx_with_id(SESSION_CAN_ID_REQ) != NULL,
+          "a SESSION_REQ goes out with no image message having arrived");
+    CHECK(tx_with_id(IMG_CAN_ID_START) == NULL, "and nothing else does");
+}
+
 static void case_secoc_ecud_refuses_a_forged_confirm(void)
 {
     h_case_begin("a SESSION_CONFIRM from someone without the key establishes nothing");
@@ -518,6 +537,7 @@ int main(void)
     case_the_delta_idle_timeout_uses_the_same_clock();
 #ifdef ENABLE_IMAGE_SECOC
     case_secoc_ecud_fails_closed_and_asks_for_a_session();
+    case_secoc_ecud_asks_for_a_session_at_bring_up();
     case_secoc_ecud_refuses_a_forged_confirm();
     case_secoc_ecud_rekeys_when_ecua_goes_silent();
 #endif

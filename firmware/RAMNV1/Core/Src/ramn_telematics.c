@@ -1647,6 +1647,28 @@ static void UpdateStreamTimeouts(void)
 // ============================================================================
 void RAMN_TELEMATICS_Update(uint32_t tick)
 {
+#ifdef ENABLE_IMAGE_SECOC
+	// Bring the session up as soon as the bus is alive, not on the first image
+	// message that wants it.
+	//
+	// It cannot happen in RAMN_SecOC_LINK_Init: that runs before
+	// osKernelStart, where nothing can transmit. This is the first place with
+	// a live bus, so it is where bring-up belongs.
+	//
+	// Establishing it eagerly costs one frame at boot and buys two things.
+	// The first keyframe is no longer dropped waiting for a handshake. And --
+	// the reason that matters more -- the link is exercised even when the
+	// ESP32 is not streaming, so a board on a bench with nothing to display
+	// still shows whether the two ECUs can agree a key. Lazily, that path went
+	// untested until something happened to need it.
+	//
+	// xTaskGetTickCount() rather than `tick`, deliberately: see below. The
+	// rate limit inside EnsureSession must be measured against the same clock
+	// the send path uses, or the two disagree about how long ago a request
+	// went out.
+	if (RAMN_SecOC_LINK_Ready() == 0U) (void)RAMN_SecOC_LINK_EnsureSession(xTaskGetTickCount());
+#endif
+
 	// `tick` is the periodic task's xLastWakeTime. vTaskDelayUntil advances it
 	// by exactly SIM_LOOP_CLOCK_MS per iteration, so whenever this loop
 	// overruns its period it falls behind real time and never catches up --
