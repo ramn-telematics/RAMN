@@ -1548,7 +1548,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, bufferSize,
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu SecOC[Sess:%u NoSess:%lu Bad:%u] BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -1566,6 +1566,16 @@ static void PrintSPIStats(void)
 		streamState == STREAM_IDLE ? 0 : (streamState == KEYFRAME_ACTIVE ? 1 : 2), // Stream state indicator
 		kfAckRxCnt,
 		kfAckMissedCnt,
+#ifdef ENABLE_IMAGE_SECOC
+		// The three numbers that tell a link that never handshook apart from
+		// one that is being injected into. Without them, both look like an
+		// ESP32 that stopped sending.
+		(unsigned)RAMN_SecOC_LINK_Ready(),
+		noSessionDrops,
+		(unsigned)RAMN_SecOC_LINK_FailedCount(),
+#else
+		0U, 0UL, 0U,
+#endif
 		tec, rec, lec, dlec, busoff, errpass,
 		RAMN_FDCAN_Status.CANRxOverrunCnt);
 
