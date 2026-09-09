@@ -58,6 +58,15 @@
 // Sits in the 0x0100-0xEFFF range the EEPROM layer leaves to applications.
 #define RAMN_SECOC_EEPROM_INDEX   0x0200U
 
+// NOTE ON WHAT THIS KEY IS FOR
+//
+// It is the ROOT key. It authenticates the session handshake once
+// (ramn_secoc_session.h) and does no per-frame work -- image messages are
+// authenticated under the session key derived from it. So the exposure of this
+// value is a few frames per session rather than hundreds per keyframe, and
+// swapping it for an OTP-held key later changes nothing above
+// RAMN_SecOC_KEYS_GetImageKey.
+
 // Loads the image stream key. Call once at startup, before any image traffic.
 void RAMN_SecOC_KEYS_Init(void);
 

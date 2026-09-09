@@ -52,15 +52,20 @@
 // own counter (RAMN_SecOC_RxFreshness). This is AUTOSAR's approach and it is
 // what keeps the wire cost to one or two bytes instead of four.
 //
-// KNOWN LIMIT, AND IT IS DELIBERATE
+// ACROSS A REBOOT
 //
-// The counter lives in RAM. A receiver that reboots forgets what it has seen
-// and re-synchronises to whatever arrives first, so a message recorded before
-// the reboot can be replayed after it. Closing that needs the counter
-// persisted, or a freshness-sync exchange at startup -- AUTOSAR specifies a
-// Freshness Value Manager for exactly this. RAMN_SecOC_RxAccept is the single
-// place a persisted counter would be written, so that upgrade lands in one
-// function. Within one uptime, replay is fully covered.
+// The counter lives in RAM, so on its own it covers replay only within one
+// uptime: a receiver that restarts forgets the highest value it has seen and
+// re-synchronises to whatever arrives first. That gap is closed a level up
+// rather than here -- ramn_secoc_session.h derives a fresh key per session, so
+// a frame recorded before a restart fails verification afterwards no matter
+// how its freshness value compares, because the key it was authenticated
+// under no longer exists.
+//
+// Counters therefore restart at zero with each session, safely. If you ever
+// use this module WITHOUT a session key -- one long-lived key, straight from
+// provisioning -- that protection is gone and the counter needs persisting;
+// RAMN_SecOC_RxAccept is the single place that would be written.
 //
 // REENTRANCY
 //

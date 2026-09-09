@@ -31,6 +31,8 @@
 #ifdef ENABLE_IMAGE_SECOC
 #include "ramn_secoc.h"
 #include "ramn_secoc_keys.h"
+#include "ramn_secoc_session.h"
+#include "ramn_trng.h"
 #endif
 #include <stdio.h>
 
@@ -898,16 +900,34 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 // so a frame that reaches the ring is a frame that will be painted. The ring
 // is the last place to say no.
 // ============================================================================
-// Zero-initialised by C, which is precisely the state RAMN_SecOC_FreshnessInit
-// produces: counter 0, not yet synchronised. Deliberately NOT reset in
-// SCREENIMAGE_Init -- that runs on every entry to the screen, and clearing the
-// high-water mark there would reopen the replay window each time the user
-// navigated away and back.
-static RAMN_SecOC_Freshness_t imgFreshness;
+// The ESTABLISHED session: the key every image message is verified under, and
+// the freshness domain that goes with it. Zero-initialised by C, which is
+// exactly RAMN_SECOC_SESSION_NONE -- no key, and image traffic refused.
+//
+// Deliberately NOT reset in SCREENIMAGE_Init: that runs on every entry to the
+// screen, and tearing the session down there would force a re-handshake (and
+// reopen the replay window) every time the user navigated away and back.
+static RAMN_SecOC_Session_t imgSession;
+
+// The session being NEGOTIATED, kept apart from the live one on purpose.
+// SESSION_REQ and SESSION_CHALLENGE cannot be authenticated -- agreeing a key
+// is what makes authentication possible -- so anyone on the bus can start a
+// handshake. Negotiating into scratch means that costs them some frames and
+// nothing else: the established session is replaced only when a response
+// actually verifies under the root key.
+static RAMN_SecOC_Session_t imgPending;
+static uint32_t             pendingTick     = 0U;
+static uint32_t             lastChallengeTick = 0U;
+static RAMN_Bool_t          challengeSent   = False;
 
 // Freshness of the frame being received. Established by the frame's opening
 // message (0x300 / 0x304) and reused to verify every chunk behind it.
 static uint32_t kfCurrentFv = 0U;
+
+// Image messages refused because no session was established. Distinct from
+// kfMacFails: one says "someone is injecting", the other says "the link never
+// came up", and they need completely different responses.
+static uint16_t kfNoSessionDrops = 0U;
 
 // Frames refused because their authenticator did not verify. Reported in the
 // 0x303 ACK: a bus that is being injected into and a bus that is merely quiet
@@ -920,8 +940,122 @@ static void SecOCImageCtx(RAMN_SecOC_Ctx_t* ctx, uint32_t canId)
 {
     ctx->dataId = (uint16_t)canId;
     ctx->macLen = IMG_SECOC_MAC_BYTES;
-    ctx->key    = RAMN_SecOC_KEYS_GetImageKey();
-    ctx->fv     = &imgFreshness;
+    // The SESSION key, never the provisioned root. The root is spent once, in
+    // the handshake below, and does no per-frame work.
+    ctx->key    = imgSession.key;
+    ctx->fv     = &imgSession.fv;
+}
+
+// 1 when image traffic may be verified at all. Everything above this is
+// refused while it returns 0 -- that is what IMAGE_SECOC_FAIL_CLOSED means.
+static uint8_t SecOCSessionReady(void)
+{
+    return (imgSession.state == RAMN_SECOC_SESSION_OK) ? 1U : 0U;
+}
+
+// ---------------------------------------------------------------------------
+// SESSION HANDSHAKE -- ECU A side, the responder
+//
+//   D -> A  0x307  SESSION_REQ        (unauthenticated: it has to be)
+//   A -> D  0x308  SESSION_CHALLENGE  nonce_A
+//   D -> A  0x309  SESSION_RESPONSE   nonce_D | MAC_root(nonce_A | nonce_D)
+//   A -> D  0x30A  SESSION_CONFIRM             MAC_root(nonce_D | nonce_A)
+// ---------------------------------------------------------------------------
+static void SendSessionFrame(uint32_t canId, const uint8_t* payload, uint32_t dlc)
+{
+    FDCAN_TxHeaderTypeDef h;
+    h.Identifier          = canId;
+    h.IdType              = FDCAN_STANDARD_ID;
+    h.TxFrameType         = FDCAN_DATA_FRAME;
+    h.DataLength          = dlc;
+    h.BitRateSwitch       = FDCAN_BRS_OFF;
+    h.FDFormat            = FDCAN_FD_CAN;
+    h.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+    h.MessageMarker       = 0U;
+    h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    RAMN_FDCAN_SendMessage(&h, payload);
+}
+
+// ECU D asked for a session. Answer with a fresh challenge -- into the PENDING
+// session, never the live one.
+static void HandleSessionReq(uint32_t tick)
+{
+    // Rate limit. SESSION_REQ is unauthenticated by construction, so it is the
+    // message an attacker can flood; capping the reply rate keeps that to
+    // wasted frames rather than a TRNG and bus workout. A handshake already in
+    // flight may still be superseded once it has had its chance, otherwise a
+    // lost SESSION_RESPONSE would wedge the link until reboot.
+    if ((challengeSent != False) &&
+        ((tick - lastChallengeTick) < (uint32_t)SESSION_REQ_INTERVAL_MS)) return;
+
+    RAMN_SecOC_SESSION_Reset(&imgPending);
+    for (uint8_t i = 0U; i < RAMN_SECOC_NONCE_BYTES; i += 4U)
+    {
+        uint32_t r = RAMN_RNG_Pop32();
+        imgPending.nonceA[i]      = (uint8_t)( r        & 0xFFU);
+        imgPending.nonceA[i + 1U] = (uint8_t)((r >>  8) & 0xFFU);
+        imgPending.nonceA[i + 2U] = (uint8_t)((r >> 16) & 0xFFU);
+        imgPending.nonceA[i + 3U] = (uint8_t)((r >> 24) & 0xFFU);
+    }
+    imgPending.state  = RAMN_SECOC_SESSION_PENDING;
+    pendingTick       = tick;
+    lastChallengeTick = tick;
+    challengeSent     = True;
+
+    SendSessionFrame(SESSION_CAN_ID_CHALLENGE, imgPending.nonceA, FDCAN_DLC_BYTES_8);
+}
+
+// ECU D answered. Verify against the ROOT key, and only then adopt.
+static void HandleSessionResponse(const uint8_t* data, uint8_t dlcLen, uint32_t tick)
+{
+    if (dlcLen < (uint8_t)(RAMN_SECOC_NONCE_BYTES + RAMN_SECOC_SESSION_MAC_BYTES)) return;
+    if (imgPending.state != RAMN_SECOC_SESSION_PENDING) return;
+
+    // A stale half-handshake is not answered: the nonce it was built around is
+    // old enough that ECU D has almost certainly given up and asked again.
+    if ((tick - pendingTick) > (uint32_t)SESSION_PENDING_TIMEOUT_MS)
+    {
+        RAMN_SecOC_SESSION_Reset(&imgPending);
+        challengeSent = False;
+        return;
+    }
+
+    for (uint8_t i = 0U; i < RAMN_SECOC_NONCE_BYTES; i++) imgPending.nonceD[i] = data[i];
+
+    const uint8_t* rootKey = RAMN_SecOC_KEYS_GetImageKey();
+    if (RAMN_SecOC_SESSION_CheckMac(rootKey, (uint16_t)SESSION_CAN_ID_RESPONSE,
+                                    imgPending.nonceA, imgPending.nonceD,
+                                    &data[RAMN_SECOC_NONCE_BYTES]) == 0U)
+    {
+        // Whoever sent this does not hold the provisioned key. The live
+        // session is untouched -- which is the whole reason for negotiating
+        // into scratch.
+        if (kfMacFails < 0xFFFFU) kfMacFails++;
+        RAMN_SecOC_SESSION_Reset(&imgPending);
+        challengeSent = False;
+        return;
+    }
+
+    RAMN_SecOC_SESSION_Derive(&imgPending, rootKey);
+    RAMN_SecOC_SESSION_Adopt(&imgPending);
+
+    // The new session replaces the old wholesale: key, freshness counters and
+    // all. Counters restart at zero safely because the key is new -- a frame
+    // recorded under the previous session cannot verify under this one however
+    // its freshness value compares. That is what closes the reboot replay hole
+    // a RAM-resident counter leaves open.
+    imgSession    = imgPending;
+    kfCurrentFv   = 0U;
+    challengeSent = False;
+    RAMN_SecOC_SESSION_Reset(&imgPending);
+
+    // Confirm, so ECU D knows to start streaming. Nonces in the opposite order
+    // and under a different Data ID, so this cannot be reflected back at us as
+    // a response.
+    uint8_t confirm[RAMN_SECOC_SESSION_MAC_BYTES];
+    RAMN_SecOC_SESSION_Mac(rootKey, (uint16_t)SESSION_CAN_ID_CONFIRM,
+                           imgSession.nonceD, imgSession.nonceA, confirm);
+    SendSessionFrame(SESSION_CAN_ID_CONFIRM, confirm, FDCAN_DLC_BYTES_8);
 }
 
 // 1 if the authenticator over the first (dlcLen - IMG_SECOC_MAC_BYTES) bytes
@@ -952,7 +1086,7 @@ static uint8_t SecOCOpenFrame(uint32_t canId, const uint8_t* data,
     uint32_t trunc = ((uint32_t)data[fvOffset] << 8) | (uint32_t)data[fvOffset + 1U];
     uint32_t full;
 
-    if (RAMN_SecOC_RxFreshness(&imgFreshness, trunc,
+    if (RAMN_SecOC_RxFreshness(&imgSession.fv, trunc,
                                IMG_SECOC_FV_TRUNC_BITS, &full) == 0U) return 0U;
 
     RAMN_SecOC_Ctx_t ctx;
@@ -960,7 +1094,7 @@ static uint8_t SecOCOpenFrame(uint32_t canId, const uint8_t* data,
     uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
     if (RAMN_SecOC_CheckMac(&ctx, full, data, authLen, &data[authLen]) == 0U) return 0U;
 
-    RAMN_SecOC_RxAccept(&imgFreshness, full);
+    RAMN_SecOC_RxAccept(&imgSession.fv, full);
     kfCurrentFv = full;
     return 1U;
 }
@@ -991,6 +1125,8 @@ static uint8_t SecOCOpenFrame(uint32_t canId, const uint8_t* data,
 //                           repeat was skipped, not decoded)
 //                      bit6 SecOC: one or more frames were refused because
 //                           their authenticator did not verify (since boot)
+//                      bit7 SecOC: image traffic arrived with no session
+//                           established and was refused (fail closed)
 //                      bit5 the frame was superseded before it was painted --
 //                           a newer keyframe was already queued behind it, so
 //                           it was dropped whole rather than spending ~29 ms
@@ -1034,6 +1170,10 @@ static void SendImageAck(uint8_t stage, uint8_t endStatus, const ImgFrameStats_t
     // injecting into the bus is not a property of one picture, and this is the
     // only way ECU A can say it is happening.
     if (kfMacFails != 0U)        flags |= 0x40U;
+    // bit7: image traffic arrived with NO SESSION and was refused. A different
+    // fault from bit6 and a different fix: "the link never came up" wants a
+    // handshake, "someone is injecting" wants a look at the bus.
+    if (kfNoSessionDrops != 0U)  flags |= 0x80U;
 #endif
 
     uint32_t decoded = st->decoded;
@@ -1063,6 +1203,23 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     uint8_t  dlcLen  = DLCtoUINT8(pHeader->DataLength);
 
     lastActivityTick = tick;
+
+#ifdef ENABLE_IMAGE_SECOC
+    // The handshake runs BEFORE the gate below, because it is what opens the
+    // gate. These two are the only messages in this range accepted without a
+    // session, and neither can put a pixel anywhere.
+    if (id == SESSION_CAN_ID_REQ)      { HandleSessionReq(tick); return; }
+    if (id == SESSION_CAN_ID_RESPONSE) { HandleSessionResponse(data, dlcLen, tick); return; }
+
+    // FAIL CLOSED. No session, no pixels -- not even under the provisioned
+    // key. An unauthenticated link and an idle one are different states and
+    // the 0x303 ACK reports them differently.
+    if (SecOCSessionReady() == 0U)
+    {
+        if (kfNoSessionDrops < 0xFFFFU) kfNoSessionDrops++;
+        return;
+    }
+#endif
 
     // ---- 0x300: IMG_START ----
     if (id == IMG_CAN_ID_START)

@@ -106,3 +106,24 @@ EE_Status RAMN_EEPROM_Read32(uint16_t index, uint32_t* pval)
 		{ *pval = fake_eeprom[i].val; return EE_OK; }
 	return EE_NO_DATA;
 }
+
+/* ---- TRNG ----------------------------------------------------------------
+ * Deterministic on purpose. ECU A draws its session nonce from here, and a
+ * test that wants to compute the expected session key has to know what it
+ * drew. fake_rng_set pins the sequence. */
+#include "ramn_trng.h"
+
+static uint32_t fake_rng_state = 0x12345678u;
+
+void fake_rng_set(uint32_t seed) { fake_rng_state = seed; }
+
+uint32_t RAMN_RNG_Pop32(void)
+{
+	/* xorshift32: cheap, non-repeating over the run, and reproducible. */
+	fake_rng_state ^= fake_rng_state << 13;
+	fake_rng_state ^= fake_rng_state >> 17;
+	fake_rng_state ^= fake_rng_state << 5;
+	return fake_rng_state;
+}
+uint8_t  RAMN_RNG_Pop8(void)  { return (uint8_t)(RAMN_RNG_Pop32() & 0xFFu); }
+uint16_t RAMN_RNG_Pop16(void) { return (uint16_t)(RAMN_RNG_Pop32() & 0xFFFFu); }

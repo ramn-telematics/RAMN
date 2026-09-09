@@ -393,6 +393,14 @@
 #define DELTA_CAN_ID_TILE_CHUNK   0x305U  // Delta tile chunk      (CAN-FD + BRS)
 #define DELTA_CAN_ID_FRAME_END    0x306U  // Delta frame end       (CAN-FD)
 
+// SecOC session establishment. The provisioned key authenticates this exchange
+// once; everything above is then authenticated under the key it derives.
+// See ramn_secoc_session.h for the protocol and why both sides send a nonce.
+#define SESSION_CAN_ID_REQ        0x307U  // ECU D -> ECU A, "I want to stream"
+#define SESSION_CAN_ID_CHALLENGE  0x308U  // ECU A -> ECU D, nonce_A
+#define SESSION_CAN_ID_RESPONSE   0x309U  // ECU D -> ECU A, nonce_D + MAC
+#define SESSION_CAN_ID_CONFIRM    0x30AU  // ECU A -> ECU D, MAC
+
 // SecOC on the image stream --------------------------------------------------
 //
 // Authenticates every image message so that only the ECU holding the shared
@@ -407,6 +415,24 @@
 // Comment this out and every layout below collapses to the pre-SecOC wire
 // format, byte for byte, so the two can be compared on real hardware.
 #define ENABLE_IMAGE_SECOC
+
+#ifdef ENABLE_IMAGE_SECOC
+// FAIL CLOSED. ECU A refuses every image message until a session has been
+// established, rather than falling back to the provisioned key. A board whose
+// handshake has not completed shows nothing and says so in the 0x303 ACK,
+// which is the honest outcome: "the link is not authenticated" and "the link
+// is idle" must not look the same.
+#define IMAGE_SECOC_FAIL_CLOSED
+
+// How often ECU D may ask for a session, and how long ECU A holds a
+// half-finished handshake before it may be replaced. SESSION_REQ and
+// SESSION_CHALLENGE cannot be authenticated -- agreeing a key is what makes
+// authentication possible -- so anyone on the bus can send them; these bound
+// what that is worth. An established session is never touched by a handshake
+// in flight, so the worst case is wasted frames.
+#define SESSION_REQ_INTERVAL_MS   200U
+#define SESSION_PENDING_TIMEOUT_MS 1000U
+#endif
 
 #ifdef ENABLE_IMAGE_SECOC
 // Truncated authenticator carried by every image message.

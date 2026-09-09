@@ -12,7 +12,8 @@ CFLAGS   := -std=c11 -g -O0 -Wall -Wextra \
             -DTELEMATICS_HAS_STREAM_STATE \
             -Istubs -I. -I$(CORE)/Inc -I$(CORE)/Src
 BIN      := run_tests
-SECOC    := $(CORE)/Src/ramn_secoc.c $(CORE)/Src/ramn_blake2s.c $(CORE)/Src/ramn_secoc_keys.c
+SECOC    := $(CORE)/Src/ramn_secoc.c $(CORE)/Src/ramn_blake2s.c \
+            $(CORE)/Src/ramn_secoc_keys.c $(CORE)/Src/ramn_secoc_session.c
 SRCS     := test_telematics_spi.c test_conformance.c fakes.c harness.c $(SECOC)
 
 # ECU A's image receive path is a separate binary: it compiles a different

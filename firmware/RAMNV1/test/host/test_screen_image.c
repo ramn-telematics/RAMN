@@ -49,12 +49,20 @@
 static RAMN_SecOC_Freshness_t test_fv;
 static uint32_t               test_current_fv = 0;
 
+/* Our own copy of the session key, derived independently from the two nonces
+   rather than read out of ECU A's session -- otherwise the fixtures would
+   agree with the implementation by construction and prove nothing about the
+   derivation. Filled in by establish_session, below. */
+static uint8_t test_session_key[RAMN_SECOC_KEY_BYTES];
+static int  establish_session(uint32_t tick);
+static void feed_frame(uint32_t id, const uint8_t *b, uint32_t dlc, uint32_t tick);
+
 static void secoc_tag(uint32_t id, uint8_t *b, uint8_t dlcLen, uint32_t fv)
 {
     RAMN_SecOC_Ctx_t ctx;
     ctx.dataId = (uint16_t)id;
     ctx.macLen = IMG_SECOC_MAC_BYTES;
-    ctx.key    = RAMN_SecOC_KEYS_GetImageKey();
+    ctx.key    = test_session_key;   /* the session key, as ECU D would */
     ctx.fv     = &test_fv;
     uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
     RAMN_SecOC_ComputeMac(&ctx, fv, b, authLen, &b[authLen]);
@@ -159,6 +167,11 @@ static void reset_state(void)
        bus -- but across test cases in one binary it would carry a deliberate
        rejection in one case into the "no flags set" assertion of the next. */
     kfMacFails        = 0;
+    kfNoSessionDrops  = 0;
+    /* ECU A fails closed, so a case that wants to stream needs a session
+       first. The cases that test the closed door establish none. */
+    establish_session(50);
+    imgState          = IMG_IDLE;
 #endif
     kfRingReadIdx     = 0;
     kfDecodedBytes    = 0;
@@ -215,6 +228,69 @@ static const CapturedFrame_t *last_ack(void)
         if (fake_can_tx[i].header.Identifier == IMG_CAN_ID_ACK) return &fake_can_tx[i];
     return NULL;
 }
+
+/* Most recent frame ECU A put on the bus with this ID, or NULL. */
+static const CapturedFrame_t *last_frame(uint32_t id)
+{
+    for (int i = fake_can_tx_count - 1; i >= 0; i--)
+        if (fake_can_tx[i].header.Identifier == id) return &fake_can_tx[i];
+    return NULL;
+}
+
+#ifdef ENABLE_IMAGE_SECOC
+static void feed_frame(uint32_t id, const uint8_t *b, uint32_t dlc, uint32_t tick)
+{
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = id;
+    h.DataLength = dlc;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+}
+
+/* Runs the handshake as ECU D would, and leaves both sides holding the same
+   session key. Returns 1 if ECU A ended up with a session. */
+static int establish_session(uint32_t tick)
+{
+    fake_reset();
+    /* The rate limit is real and correct on a bus; across test cases in one
+       binary it would refuse the second case's handshake. */
+    challengeSent = False;
+
+    uint8_t req[4] = {0, 0, 0, 0};
+    feed_frame(SESSION_CAN_ID_REQ, req, FDCAN_DLC_BYTES_4, tick);
+
+    const CapturedFrame_t *ch = last_frame(SESSION_CAN_ID_CHALLENGE);
+    if (ch == NULL) return 0;
+
+    uint8_t nonceA[RAMN_SECOC_NONCE_BYTES];
+    memcpy(nonceA, ch->data, RAMN_SECOC_NONCE_BYTES);
+
+    uint8_t nonceD[RAMN_SECOC_NONCE_BYTES];
+    for (unsigned i = 0; i < RAMN_SECOC_NONCE_BYTES; i++) nonceD[i] = (uint8_t)(0xD0 + i);
+
+    uint8_t resp[RAMN_SECOC_NONCE_BYTES + RAMN_SECOC_SESSION_MAC_BYTES];
+    memcpy(resp, nonceD, RAMN_SECOC_NONCE_BYTES);
+    RAMN_SecOC_SESSION_Mac(RAMN_SecOC_KEYS_GetImageKey(), SESSION_CAN_ID_RESPONSE,
+                           nonceA, nonceD, &resp[RAMN_SECOC_NONCE_BYTES]);
+    feed_frame(SESSION_CAN_ID_RESPONSE, resp, FDCAN_DLC_BYTES_16, tick);
+
+    RAMN_SecOC_Session_t mine;
+    RAMN_SecOC_SESSION_Reset(&mine);
+    memcpy(mine.nonceA, nonceA, RAMN_SECOC_NONCE_BYTES);
+    memcpy(mine.nonceD, nonceD, RAMN_SECOC_NONCE_BYTES);
+    RAMN_SecOC_SESSION_Derive(&mine, RAMN_SecOC_KEYS_GetImageKey());
+    memcpy(test_session_key, mine.key, RAMN_SECOC_KEY_BYTES);
+
+    RAMN_SecOC_FreshnessInit(&test_fv);
+    /* Mirror what both ECUs do on adopting a session: the per-frame freshness
+       goes back to zero along with the counters. ECU D does exactly this
+       (imgCurrentFv = 0), and a fixture that kept a value from the previous
+       session would sign against a freshness ECU A is no longer at. */
+    test_current_fv = 0;
+    fake_reset();
+    return (imgSession.state == RAMN_SECOC_SESSION_OK) ? 1 : 0;
+}
+#endif
 
 
 /* ------------------------------------------------------------------ */
@@ -1697,6 +1773,228 @@ static void case_secoc_freshness_reconstruction(void)
 }
 #endif /* ENABLE_IMAGE_SECOC */
 
+
+#ifdef ENABLE_IMAGE_SECOC
+/* ------------------------------------------------------------------ */
+/* SecOC session establishment                                         */
+/* ------------------------------------------------------------------ */
+
+/* Put ECU A back where it boots: no session, so nothing may be drawn.
+ *
+ * Built on reset_state rather than reimplementing it. reset_state clears the
+ * ring indices, the decoder and the fake clock as well as the counters, and a
+ * partial copy of it left stale ring entries that the next drain painted --
+ * which looks exactly like the fail-closed gate leaking. */
+static void no_session(void)
+{
+    reset_state();                            /* full clean state, session and all */
+    RAMN_SecOC_SESSION_Reset(&imgSession);    /* then take the session away */
+    RAMN_SecOC_SESSION_Reset(&imgPending);
+    challengeSent    = False;
+    kfMacFails       = 0;
+    kfNoSessionDrops = 0;
+    fake_reset();
+}
+
+static void case_secoc_fails_closed_before_any_handshake(void)
+{
+    h_case_begin("with no session, image traffic paints nothing -- fail closed");
+    no_session();
+
+    /* A perfectly well-formed keyframe, signed under the key the fixtures
+       hold. It still must not draw: ECU A has agreed no session, so it has no
+       key to check anything against and refuses on principle rather than
+       falling back to the provisioned one. */
+    send_img_start(240, 240, 1, 100);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 101);
+    drain(102);
+
+    CHECK(fake_screen_len == 0, "nothing reaches the panel");
+    CHECK(imgState == IMG_IDLE, "and no keyframe was opened");
+    CHECK(kfNoSessionDrops >= 2, "the refusals are counted separately from MAC failures");
+    CHECK(kfMacFails == 0, "and not misreported as forgery -- different fault, different fix");
+}
+
+static void case_secoc_the_ack_says_why_nothing_was_drawn(void)
+{
+    h_case_begin("and the ACK distinguishes 'no session' from 'being injected into'");
+    no_session();
+    send_img_start(240, 240, 1, 100);
+    drain(101);
+
+    /* Establish, then send a genuine keyframe so there is an ACK to read.
+       kfNoSessionDrops is cumulative, so the flag survives into it. */
+    establish_session(200);
+    kfMacFails = 0;
+    send_img_start(240, 240, 1, 300);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 301);
+    drain(302);
+    send_img_end(0x00, 303);
+
+    const CapturedFrame_t *ack = last_ack();
+    if (!CHECK_OK(ack != NULL, "the keyframe is acknowledged")) return;
+    CHECK((ack->data[1] & 0x80U) != 0U, "bit7 reports traffic refused for want of a session");
+    CHECK((ack->data[1] & 0x40U) == 0U, "and bit6 is clear: nothing failed verification");
+}
+
+static void case_secoc_a_forged_response_establishes_nothing(void)
+{
+    h_case_begin("a SESSION_RESPONSE from someone without the key establishes nothing");
+    no_session();
+
+    uint8_t req[4] = {0, 0, 0, 0};
+    feed_frame(SESSION_CAN_ID_REQ, req, FDCAN_DLC_BYTES_4, 100);
+    const CapturedFrame_t *ch = last_frame(SESSION_CAN_ID_CHALLENGE);
+    if (!CHECK_OK(ch != NULL, "ECU A answers with a challenge")) return;
+
+    /* Attacker picks a nonce and guesses the authenticator. */
+    uint8_t resp[RAMN_SECOC_NONCE_BYTES + RAMN_SECOC_SESSION_MAC_BYTES];
+    memset(resp, 0x5A, sizeof resp);
+    feed_frame(SESSION_CAN_ID_RESPONSE, resp, FDCAN_DLC_BYTES_16, 101);
+
+    CHECK(imgSession.state != RAMN_SECOC_SESSION_OK, "no session is established");
+    CHECK(last_frame(SESSION_CAN_ID_CONFIRM) == NULL, "and nothing is confirmed");
+    CHECK(kfMacFails == 1, "the attempt is counted");
+}
+
+static void case_secoc_a_handshake_cannot_tear_down_a_live_session(void)
+{
+    h_case_begin("an unauthenticated handshake cannot disturb an established session");
+    reset_state();                     /* establishes a session */
+    uint8_t liveKey[RAMN_SECOC_KEY_BYTES];
+    memcpy(liveKey, imgSession.key, sizeof liveKey);
+
+    /* SESSION_REQ and SESSION_CHALLENGE cannot be authenticated -- agreeing a
+       key is what makes authentication possible -- so anyone may send them.
+       That is only safe if the live session is untouched until a response
+       actually verifies. */
+    challengeSent = False;
+    uint8_t req[4] = {0, 0, 0, 0};
+    feed_frame(SESSION_CAN_ID_REQ, req, FDCAN_DLC_BYTES_4, 400);
+
+    uint8_t resp[RAMN_SECOC_NONCE_BYTES + RAMN_SECOC_SESSION_MAC_BYTES];
+    memset(resp, 0xA5, sizeof resp);
+    feed_frame(SESSION_CAN_ID_RESPONSE, resp, FDCAN_DLC_BYTES_16, 401);
+
+    CHECK(imgSession.state == RAMN_SECOC_SESSION_OK, "the session is still up");
+    CHECK(memcmp(imgSession.key, liveKey, sizeof liveKey) == 0, "under the same key");
+
+    /* And it still works. */
+    fake_screen_reset();
+    send_img_start(240, 240, 1, 410);
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};
+    send_img_data(0, payload, sizeof payload, 411);
+    drain(412);
+    CHECK(fake_screen_len == 4, "and the real sender still paints");
+}
+
+static void case_secoc_a_rekey_retires_the_previous_session(void)
+{
+    h_case_begin("frames recorded under a previous session do not verify after a rekey");
+    reset_state();
+
+    /* Capture a complete, genuine keyframe off the bus, exactly as an attacker
+       with a logger would. */
+    uint8_t startFrame[20], dataFrame[64];
+    memset(startFrame, 0, sizeof startFrame);
+    startFrame[0] = 240; startFrame[2] = 240; startFrame[4] = 1;
+    startFrame[8] = 1;   startFrame[10] = 0x01;
+    uint8_t chk = 0;
+    for (int i = 0; i < 11; i++) chk ^= startFrame[i];
+    startFrame[11] = chk;
+    secoc_open(IMG_CAN_ID_START, startFrame, 20, 12);
+
+    memset(dataFrame, 0, sizeof dataFrame);
+    dataFrame[2] = 3; dataFrame[3] = 0x81; dataFrame[4] = 0xAB; dataFrame[5] = 0xCD;
+    secoc_tag(IMG_CAN_ID_DATA, dataFrame, 64, test_current_fv);
+
+    /* They play once, as they should. */
+    feed_frame(IMG_CAN_ID_START, startFrame, FDCAN_DLC_BYTES_20, 500);
+    feed_frame(IMG_CAN_ID_DATA,  dataFrame,  FDCAN_DLC_BYTES_64, 501);
+    drain(502);
+    CHECK(fake_screen_len == 4, "the genuine keyframe paints");
+
+    /* Now ECU A reboots and re-handshakes -- the case a RAM-resident freshness
+       counter cannot cover on its own, because the counter is forgotten. */
+    uint8_t oldKey[RAMN_SECOC_KEY_BYTES];
+    memcpy(oldKey, imgSession.key, sizeof oldKey);
+    no_session();
+    establish_session(600);
+    CHECK(memcmp(imgSession.key, oldKey, sizeof oldKey) != 0,
+          "the new session has a different key");
+
+    /* Replay the recording, byte for byte. Its authenticators are genuine --
+       they were never forged -- so only the key change can refuse them. */
+    fake_screen_reset();
+    kfMacFails = 0;
+    feed_frame(IMG_CAN_ID_START, startFrame, FDCAN_DLC_BYTES_20, 700);
+    feed_frame(IMG_CAN_ID_DATA,  dataFrame,  FDCAN_DLC_BYTES_64, 701);
+    drain(702);
+
+    CHECK(fake_screen_len == 0, "the replay paints nothing across the rekey");
+    CHECK(imgState != KEYFRAME_RX, "and does not even open a keyframe");
+    CHECK(kfMacFails > 0, "it is refused as unauthentic");
+}
+
+static void case_secoc_the_session_key_is_not_the_root_key(void)
+{
+    h_case_begin("the provisioned key does no per-frame work");
+    reset_state();
+    CHECK(memcmp(imgSession.key, RAMN_SecOC_KEYS_GetImageKey(), RAMN_SECOC_KEY_BYTES) != 0,
+          "the session key differs from the provisioned root");
+    CHECK(memcmp(test_session_key, imgSession.key, RAMN_SECOC_KEY_BYTES) == 0,
+          "and both ends derived the same one independently");
+}
+
+static void case_secoc_both_nonces_feed_the_derivation(void)
+{
+    h_case_begin("both sides' nonces change the derived key");
+    const uint8_t *root = RAMN_SecOC_KEYS_GetImageKey();
+    RAMN_SecOC_Session_t a, b;
+
+    RAMN_SecOC_SESSION_Reset(&a);
+    memset(a.nonceA, 0x11, sizeof a.nonceA);
+    memset(a.nonceD, 0x22, sizeof a.nonceD);
+    RAMN_SecOC_SESSION_Derive(&a, root);
+
+    /* Only ECU A's nonce moves. If the derivation ignored it, an attacker who
+       replayed a recorded handshake could walk ECU A back onto an old key. */
+    b = a;
+    memset(b.nonceA, 0x12, sizeof b.nonceA);
+    RAMN_SecOC_SESSION_Derive(&b, root);
+    CHECK(memcmp(a.key, b.key, RAMN_SECOC_KEY_BYTES) != 0, "nonce_A changes the key");
+
+    /* And only ECU D's. */
+    b = a;
+    memset(b.nonceD, 0x23, sizeof b.nonceD);
+    RAMN_SecOC_SESSION_Derive(&b, root);
+    CHECK(memcmp(a.key, b.key, RAMN_SECOC_KEY_BYTES) != 0, "nonce_D changes the key");
+}
+
+static void case_secoc_the_handshake_resists_reflection(void)
+{
+    h_case_begin("a response cannot be reflected back as a confirm");
+    const uint8_t *root = RAMN_SecOC_KEYS_GetImageKey();
+    uint8_t nA[RAMN_SECOC_NONCE_BYTES], nD[RAMN_SECOC_NONCE_BYTES];
+    memset(nA, 0x31, sizeof nA);
+    memset(nD, 0x32, sizeof nD);
+
+    uint8_t respMac[RAMN_SECOC_SESSION_MAC_BYTES];
+    uint8_t confMac[RAMN_SECOC_SESSION_MAC_BYTES];
+    RAMN_SecOC_SESSION_Mac(root, SESSION_CAN_ID_RESPONSE, nA, nD, respMac);
+    RAMN_SecOC_SESSION_Mac(root, SESSION_CAN_ID_CONFIRM,  nD, nA, confMac);
+
+    CHECK(memcmp(respMac, confMac, sizeof respMac) != 0,
+          "the two transcript MACs differ");
+    CHECK(RAMN_SecOC_SESSION_CheckMac(root, SESSION_CAN_ID_CONFIRM, nD, nA, respMac) == 0,
+          "a response does not verify as a confirm");
+    CHECK(RAMN_SecOC_SESSION_CheckMac(root, SESSION_CAN_ID_RESPONSE, nA, nD, confMac) == 0,
+          "nor a confirm as a response");
+}
+#endif /* ENABLE_IMAGE_SECOC */
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -1748,6 +2046,14 @@ int main(void)
     case_secoc_a_chunk_cannot_be_moved_between_keyframes();
     case_secoc_a_tile_cannot_be_relocated_on_the_panel();
     case_secoc_a_valid_stream_still_paints();
+    case_secoc_fails_closed_before_any_handshake();
+    case_secoc_the_ack_says_why_nothing_was_drawn();
+    case_secoc_a_forged_response_establishes_nothing();
+    case_secoc_a_handshake_cannot_tear_down_a_live_session();
+    case_secoc_a_rekey_retires_the_previous_session();
+    case_secoc_the_session_key_is_not_the_root_key();
+    case_secoc_both_nonces_feed_the_derivation();
+    case_secoc_the_handshake_resists_reflection();
 #endif
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
