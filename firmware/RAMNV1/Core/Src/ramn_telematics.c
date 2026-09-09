@@ -145,8 +145,8 @@ static volatile uint32_t spiStatsLastPrintTick = 0;
 // ============================================================================
 // BIDIRECTIONAL SPI: ESP32 POLLING STATE MACHINE
 // ============================================================================
-#define SPI_POLL_INTERVAL_MS 50   // Normal poll interval (ms) — reduced to 1 ms during streaming
-#define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response
+#define SPI_POLL_INTERVAL_MS 10   // Normal poll interval (ms) — reduced to 1 ms during streaming
+#define SPI_POLL_TIMEOUT_MS 1    // Max wait for ESP32 response
 #define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // whole IMG_CHUNKs per poll
 
 /* One IMG_CHUNK SPI message is [LEN][MARKER][TYPE][SEQ_HI][SEQ_LO][REAL_LEN]
