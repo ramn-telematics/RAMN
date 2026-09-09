@@ -85,6 +85,23 @@ frame_of() {        # $1 = .su file, $2 = function name
     awk -F'\t' -v f=":$2" '$1 ~ (f "$") {print $2; exit}' "$1"
 }
 
+# SecOC verification runs inside SCREENIMAGE_ProcessRxCANMessage on the CAN RX
+# task, but it lives in two other translation units, so -fstack-usage on the
+# screen module alone cannot see it. Concatenate the three .su files and
+# measure the chain across all of them: BLAKE2s keeps a 64-byte block buffer in
+# its context and another 128 bytes of working state in the compression
+# function, and that lands on a 1 KB task stack.
+measure_stack_multi() {   # $1 = target macro, $2 = out .su, $3.. = source .c files
+    local target="$1" out="$2"; shift 2
+    : > "$out"
+    for src in "$@"; do
+        cp "$CORE/Src/$src" "$TMP/su_multi.c" || return 1
+        cc -std=c11 -O0 -w -D"$target" $INC -fstack-usage \
+           -c "$TMP/su_multi.c" -o "$TMP/su_multi.o" 2>"$TMP/err" || return 1
+        cat "$TMP/su_multi.su" >> "$out" 2>/dev/null || return 1
+    done
+}
+
 echo "stack budgets (periodic task: ${PERIODIC_STACK}B total, chain budget ${CHAIN_BUDGET}B)"
 
 for cfg in "off:" "CAN_DEBUG:-DTELEMATICS_CAN_DEBUG" "SPI_DEBUG:-DTELEMATICS_SPI_DEBUG"; do
@@ -149,5 +166,38 @@ $ECUA_CHAINS
 EOF
 fi
 
-[ $status -eq 0 ] && echo "per-target link surface ok" || echo "PER-TARGET CHECK FAILED"
+[ $status -eq 0 ] && # ---- SecOC verification depth on the CAN RX task --------------------------
+# RAMN_BLAKE2S_Init no longer calls Update (it stages the key block in the
+# context), so the deepest real chains run through Update and Final.
+SECOC_CHAINS="SCREENIMAGE_ProcessRxCANMessage,SecOCOpenFrame,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Update,blake2s_compress
+SCREENIMAGE_ProcessRxCANMessage,SecOCCheckFrame,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Final,blake2s_compress"
+
+echo "stack budgets, SecOC verify chain (CAN RX task: ${PERIODIC_STACK}B total)"
+su_s="$TMP/stack_secoc.su"
+if ! measure_stack_multi TARGET_ECUA "$su_s" ramn_screen_image.c ramn_secoc.c ramn_blake2s.c; then
+    echo "  could not measure stack usage -- skipped"
+else
+    while IFS= read -r chain; do
+        [ -z "$chain" ] && continue
+        total=0; missing=""; pretty=""
+        for fn in $(echo "$chain" | tr ',' ' '); do
+            u=$(frame_of "$su_s" "$fn")
+            if [ -z "$u" ]; then missing="$fn"; break; fi
+            total=$((total + u)); pretty="$pretty $fn($u)"
+        done
+        if [ -n "$missing" ]; then
+            echo "  [secoc] $missing: NOT FOUND -- renamed or removed?"; status=1
+        elif [ "$total" -gt "$CHAIN_BUDGET" ]; then
+            echo "  [secoc]$pretty = ${total}B > ${CHAIN_BUDGET}B -- WOULD OVERFLOW THE CAN RX TASK"
+            echo "        the BLAKE2s context is the big frame; make it static or shrink the chain"
+            status=1
+        else
+            echo "  [secoc]$pretty = ${total}/${CHAIN_BUDGET}B ok"
+        fi
+    done <<EOF
+$SECOC_CHAINS
+EOF
+fi
+
+echo "per-target link surface ok" || echo "PER-TARGET CHECK FAILED"
 exit $status

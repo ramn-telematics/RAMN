@@ -28,6 +28,10 @@
 #include "ramn_canfd.h"
 #include "ramn_utils.h"
 #include "ramn_uart.h"
+#ifdef ENABLE_IMAGE_SECOC
+#include "ramn_secoc.h"
+#include "ramn_secoc_keys.h"
+#endif
 #include <stdio.h>
 
 // Define to enable UART debug output for image screen state transitions.
@@ -883,6 +887,85 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
     return True;   // allow navigation when screen is not active
 }
 
+#ifdef ENABLE_IMAGE_SECOC
+// ============================================================================
+// SecOC -- RECEIVER SIDE
+//
+// This is where "only ECU D can draw" is actually enforced. Every check below
+// runs BEFORE the frame is allowed to touch any state: before the ring, before
+// the sequence gate, before imgState moves. There is no framebuffer between
+// this function and the panel -- the drain decodes straight to the ST7789 --
+// so a frame that reaches the ring is a frame that will be painted. The ring
+// is the last place to say no.
+// ============================================================================
+// Zero-initialised by C, which is precisely the state RAMN_SecOC_FreshnessInit
+// produces: counter 0, not yet synchronised. Deliberately NOT reset in
+// SCREENIMAGE_Init -- that runs on every entry to the screen, and clearing the
+// high-water mark there would reopen the replay window each time the user
+// navigated away and back.
+static RAMN_SecOC_Freshness_t imgFreshness;
+
+// Freshness of the frame being received. Established by the frame's opening
+// message (0x300 / 0x304) and reused to verify every chunk behind it.
+static uint32_t kfCurrentFv = 0U;
+
+// Frames refused because their authenticator did not verify. Reported in the
+// 0x303 ACK: a bus that is being injected into and a bus that is merely quiet
+// look identical otherwise, and they need very different responses.
+static uint16_t kfMacFails = 0U;
+
+// Fills in the SecOC context for an image message. A function rather than a
+// line in each caller so the key lookup and MAC length live in one place.
+static void SecOCImageCtx(RAMN_SecOC_Ctx_t* ctx, uint32_t canId)
+{
+    ctx->dataId = (uint16_t)canId;
+    ctx->macLen = IMG_SECOC_MAC_BYTES;
+    ctx->key    = RAMN_SecOC_KEYS_GetImageKey();
+    ctx->fv     = &imgFreshness;
+}
+
+// 1 if the authenticator over the first (dlcLen - IMG_SECOC_MAC_BYTES) bytes
+// checks out at this freshness value.
+static uint8_t SecOCCheckFrame(uint32_t canId, const uint8_t* data,
+                               uint8_t dlcLen, uint32_t fv)
+{
+    RAMN_SecOC_Ctx_t ctx;
+    SecOCImageCtx(&ctx, canId);
+
+    uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
+    return RAMN_SecOC_CheckMac(&ctx, fv, data, authLen, &data[authLen]);
+}
+
+// The opening message of a frame, which is the only one carrying freshness.
+// Order matters: rebuild the candidate value, verify the MAC UNDER it, and
+// only then advance the counter. Advancing first would let anyone walk the
+// counter forward with garbage and lock the real ECU D out permanently.
+//
+// Calls RAMN_SecOC_CheckMac directly rather than going through
+// SecOCCheckFrame. That looks like duplication and is not: this runs on the
+// CAN RX task's 1 KB stack, and the extra frame put the measured chain over
+// budget (test/host/check_targets.sh). One less level of nesting is worth the
+// two repeated lines here.
+static uint8_t SecOCOpenFrame(uint32_t canId, const uint8_t* data,
+                              uint8_t dlcLen, uint8_t fvOffset)
+{
+    uint32_t trunc = ((uint32_t)data[fvOffset] << 8) | (uint32_t)data[fvOffset + 1U];
+    uint32_t full;
+
+    if (RAMN_SecOC_RxFreshness(&imgFreshness, trunc,
+                               IMG_SECOC_FV_TRUNC_BITS, &full) == 0U) return 0U;
+
+    RAMN_SecOC_Ctx_t ctx;
+    SecOCImageCtx(&ctx, canId);
+    uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
+    if (RAMN_SecOC_CheckMac(&ctx, full, data, authLen, &data[authLen]) == 0U) return 0U;
+
+    RAMN_SecOC_RxAccept(&imgFreshness, full);
+    kfCurrentFv = full;
+    return 1U;
+}
+#endif
+
 // ============================================================================
 // 0x303 ACK -- ECU A's only report channel
 //
@@ -906,6 +989,8 @@ static RAMN_Bool_t SCREENIMAGE_UpdateInput(JoystickEventType event)
 //                      bit3 a chunk never arrived; the frame was abandoned
 //                      bit4 the link delivered a chunk twice (harmless: the
 //                           repeat was skipped, not decoded)
+//                      bit6 SecOC: one or more frames were refused because
+//                           their authenticator did not verify (since boot)
 //                      bit5 the frame was superseded before it was painted --
 //                           a newer keyframe was already queued behind it, so
 //                           it was dropped whole rather than spending ~29 ms
@@ -943,6 +1028,13 @@ static void SendImageAck(uint8_t stage, uint8_t endStatus, const ImgFrameStats_t
     if (st->seqBroken  != False) flags |= 0x08U;
     if (st->dupSkips   != 0U)    flags |= 0x10U;
     if (st->superseded != False) flags |= 0x20U;
+#ifdef ENABLE_IMAGE_SECOC
+    // bit6: at least one frame was refused because its authenticator did not
+    // verify. Cumulative since boot rather than per-keyframe -- someone
+    // injecting into the bus is not a property of one picture, and this is the
+    // only way ECU A can say it is happening.
+    if (kfMacFails != 0U)        flags |= 0x40U;
+#endif
 
     uint32_t decoded = st->decoded;
     uint16_t rx      = st->framesRx;
@@ -975,7 +1067,21 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     // ---- 0x300: IMG_START ----
     if (id == IMG_CAN_ID_START)
     {
+#ifdef ENABLE_IMAGE_SECOC
+        // 12-byte body, 2 bytes of truncated freshness at offset 12, then the
+        // authenticator in the last four of a 20-byte frame.
+        if (dlcLen < 20U) return;
+        if (SecOCOpenFrame(IMG_CAN_ID_START, data, 20U, 12U) == 0U)
+        {
+            // Refused before screenActive, before the ring, before imgState.
+            // An unauthenticated 0x300 does not get to reset this ECU's stream
+            // state, let alone choose the geometry of the next picture.
+            if (kfMacFails < 0xFFFFU) kfMacFails++;
+            return;
+        }
+#else
         if (dlcLen < 12U) return;
+#endif
 
         // Activate screen hold — mirrors regcode pattern
         screenActive        = True;
@@ -1101,6 +1207,18 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         }
         if (dlcLen < 4U) return;   // must have at least SEQ_HI, SEQ_LO, REAL_LEN, one RLE byte
 
+#ifdef ENABLE_IMAGE_SECOC
+        // Under the freshness of the keyframe this chunk claims to belong to.
+        // Checked before the sequence gate so a forged chunk cannot advance
+        // kfExpectedSeq and desynchronise a keyframe that is otherwise fine.
+        if (dlcLen < 64U) return;
+        if (SecOCCheckFrame(IMG_CAN_ID_DATA, data, 64U, kfCurrentFv) == 0U)
+        {
+            if (kfMacFails < 0xFFFFU) kfMacFails++;
+            return;
+        }
+#endif
+
         // ---- Sequence gate ----
         // Checked before the ring is touched so a repeat costs no ring space.
         {
@@ -1153,7 +1271,12 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
         // ever wrong or corrupted in transit.
         uint8_t payLen = data[2U];
         if (payLen > KFRING_PAYLOAD) payLen = KFRING_PAYLOAD;
-        if (payLen > (uint8_t)(dlcLen - 3U)) payLen = (uint8_t)(dlcLen - 3U);
+        // Never read into the authenticator, which occupies the last
+        // IMG_SECOC_MAC_BYTES of the frame. Without SecOC this is the old
+        // dlcLen - 3 exactly, since IMG_SECOC_MAC_BYTES is then 0.
+        if (payLen > (uint8_t)IMG_CAN_CHUNK_PAYLOAD) payLen = (uint8_t)IMG_CAN_CHUNK_PAYLOAD;
+        if (payLen > (uint8_t)(dlcLen - 3U - IMG_SECOC_MAC_BYTES))
+            payLen = (uint8_t)(dlcLen - 3U - IMG_SECOC_MAC_BYTES);
 
         KFRingEntry_t* entry = &kfRingBuf[wi];
         for (uint8_t i = 0U; i < payLen; i++)
@@ -1171,6 +1294,18 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     // ---- 0x302: IMG_END ----
     if (id == IMG_CAN_ID_END)
     {
+#ifdef ENABLE_IMAGE_SECOC
+        // Ahead of the late-ACK branch below on purpose. That branch answers
+        // on the bus, so verifying after it would hand anyone an unauthenticated
+        // way to make ECU A transmit.
+        if (dlcLen < 12U) return;
+        if (SecOCCheckFrame(IMG_CAN_ID_END, data, 12U, kfCurrentFv) == 0U)
+        {
+            if (kfMacFails < 0xFFFFU) kfMacFails++;
+            return;
+        }
+#endif
+
         // Answer even when the keyframe is not open. Staying silent here makes
         // "IMG_END never reached ECU A" and "IMG_END arrived but the keyframe
         // had already been torn down" indistinguishable on the bus, and they
@@ -1263,7 +1398,21 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
     if (id == DELTA_CAN_ID_FRAME_START)
     {
         if (imgState == IMG_IDLE) return;   // keyframe must precede delta frames
+#ifdef ENABLE_IMAGE_SECOC
+        // 8-byte body, freshness at offset 8, authenticator in the last four
+        // of a 16-byte frame. This one MUST be authenticated even though it
+        // paints nothing: it carries the freshness value every tile behind it
+        // is verified under, so leaving it open would let an attacker pick
+        // that value and replay a recorded set of tiles under it.
+        if (dlcLen < 16U) return;
+        if (SecOCOpenFrame(DELTA_CAN_ID_FRAME_START, data, 16U, 8U) == 0U)
+        {
+            if (kfMacFails < 0xFFFFU) kfMacFails++;
+            return;
+        }
+#else
         if (dlcLen < 2U) return;
+#endif
 
         // tileAssemblyPos used to be zeroed here. It belongs to the periodic
         // task -- the drain assembles tiles out of the ring -- and this handler
@@ -1286,6 +1435,19 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
             return;
         }
         if (dlcLen < 5U) return;
+
+#ifdef ENABLE_IMAGE_SECOC
+        // Before the geometry checks, so a forged tile is never even measured
+        // against the panel -- and before kfTileDrops, so the drop counters
+        // keep meaning "the sender and I disagree" rather than "someone is
+        // injecting". kfMacFails is the counter for the latter.
+        if (dlcLen < 64U) return;
+        if (SecOCCheckFrame(DELTA_CAN_ID_TILE_CHUNK, data, 64U, kfCurrentFv) == 0U)
+        {
+            if (kfMacFails < 0xFFFFU) kfMacFails++;
+            return;
+        }
+#endif
 
         // Tiles carry source-space coordinates and no scale of their own, so
         // against a scaled keyframe they would land at a fraction of their
@@ -1328,6 +1490,8 @@ static void SCREENIMAGE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
             return;
         }
         if (payLen > KFRING_PAYLOAD) payLen = KFRING_PAYLOAD;
+        // As with 0x301: stop short of the authenticator.
+        if (payLen > (uint8_t)DELTA_CAN_CHUNK_PAYLOAD) payLen = (uint8_t)DELTA_CAN_CHUNK_PAYLOAD;
 
         // Straight into the shared ring: decoding happens in Update, where the
         // SPI writes happen, so a tile's RLE stream can be carried across chunk

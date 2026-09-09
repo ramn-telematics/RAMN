@@ -19,6 +19,9 @@
 
 /* ENABLE_SCREEN comes from the Makefile (CFLAGS_A), as it does in the real build. */
 #include "../../Core/Src/ramn_screen_image.c"
+#ifdef ENABLE_IMAGE_SECOC
+#include "ramn_blake2s.h"   /* for the primitive-level vectors below */
+#endif
 
 #if !defined(RAMN_RLE_VECTOR_COUNT) || !defined(RAMN_PIPE_VECTOR_COUNT)
 #error "vendored ramn_test_vectors.h predates the RLE or pipeline vectors -- refresh it"
@@ -37,14 +40,59 @@
 /* Fixture builders                                                     */
 /* ------------------------------------------------------------------ */
 
+#ifdef ENABLE_IMAGE_SECOC
+/* The fixtures have to speak as ECU D now: an unauthenticated frame is
+   refused, which is the entire point. This mirrors the sender in
+   ramn_telematics.c -- same key (the built-in default, since the fake EEPROM
+   starts empty), same freshness discipline: the frame's opening message takes
+   a new value and everything behind it reuses it. */
+static RAMN_SecOC_Freshness_t test_fv;
+static uint32_t               test_current_fv = 0;
+
+static void secoc_tag(uint32_t id, uint8_t *b, uint8_t dlcLen, uint32_t fv)
+{
+    RAMN_SecOC_Ctx_t ctx;
+    ctx.dataId = (uint16_t)id;
+    ctx.macLen = IMG_SECOC_MAC_BYTES;
+    ctx.key    = RAMN_SecOC_KEYS_GetImageKey();
+    ctx.fv     = &test_fv;
+    uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
+    RAMN_SecOC_ComputeMac(&ctx, fv, b, authLen, &b[authLen]);
+}
+
+/* Opens a frame: new freshness, written truncated at fvOff, then tagged. */
+static void secoc_open(uint32_t id, uint8_t *b, uint8_t dlcLen, uint8_t fvOff)
+{
+    test_current_fv = RAMN_SecOC_TxFreshness(&test_fv);
+    b[fvOff]      = (uint8_t)((test_current_fv >> 8) & 0xFF);
+    b[fvOff + 1]  = (uint8_t)( test_current_fv       & 0xFF);
+    secoc_tag(id, b, dlcLen, test_current_fv);
+}
+#endif
+
+/* Maps a real byte count onto the DLC enum. Image frames are sent at a fixed
+   DLC per message type, so the builders pass the true wire length and this
+   picks the encoding -- rather than the old "64 for data, 12 for everything
+   else", which no longer holds now that IMG_START is 20 and IMG_END is 12. */
+static uint32_t dlc_for(uint8_t byteLen)
+{
+    switch (byteLen) {
+        case 8:  return FDCAN_DLC_BYTES_8;
+        case 12: return FDCAN_DLC_BYTES_12;
+        case 16: return FDCAN_DLC_BYTES_16;
+        case 20: return FDCAN_DLC_BYTES_20;
+        default: return FDCAN_DLC_BYTES_64;
+    }
+}
+
 static void feed_can(uint32_t id, const uint8_t *data, uint8_t byteLen, uint32_t tick)
 {
     FDCAN_RxHeaderTypeDef h;
     memset(&h, 0, sizeof(h));
     h.Identifier = id;
-    /* The bus always sends DLC 64 on image frames regardless of content --
+    /* The bus always sends DLC 64 on chunk frames regardless of content --
        that is why REAL_LEN exists. Mirror it rather than the true length. */
-    h.DataLength = (id == IMG_CAN_ID_DATA) ? FDCAN_DLC_BYTES_64 : FDCAN_DLC_BYTES_12;
+    h.DataLength = (id == IMG_CAN_ID_DATA) ? FDCAN_DLC_BYTES_64 : dlc_for(byteLen);
     uint8_t buf[64];
     memset(buf, 0, sizeof buf);
     memcpy(buf, data, byteLen);
@@ -55,7 +103,7 @@ static void feed_can(uint32_t id, const uint8_t *data, uint8_t byteLen, uint32_t
 static void send_img_start_scaled(uint16_t w, uint16_t h, uint16_t chunks,
                                   uint8_t scale, uint32_t tick)
 {
-    uint8_t b[12];
+    uint8_t b[20];
     memset(b, 0, sizeof b);
     b[8] = scale;
     b[0] = (uint8_t)(w & 0xFF);      b[1] = (uint8_t)(w >> 8);
@@ -65,7 +113,12 @@ static void send_img_start_scaled(uint16_t w, uint16_t h, uint16_t chunks,
     uint8_t chk = 0;
     for (int i = 0; i < 11; i++) chk ^= b[i];
     b[11] = chk;
+#ifdef ENABLE_IMAGE_SECOC
+    secoc_open(IMG_CAN_ID_START, b, 20, 12);
+    feed_can(IMG_CAN_ID_START, b, 20, tick);
+#else
     feed_can(IMG_CAN_ID_START, b, 12, tick);
+#endif
 }
 
 /* Unscaled, which is every case that predates the scale byte. */
@@ -83,6 +136,9 @@ static void send_img_data(uint16_t seq, const uint8_t *payload, uint8_t len, uin
     b[1] = (uint8_t)(seq & 0xFF);
     b[2] = len;
     memcpy(&b[3], payload, len);
+#ifdef ENABLE_IMAGE_SECOC
+    secoc_tag(IMG_CAN_ID_DATA, b, 64, test_current_fv);
+#endif
     feed_can(IMG_CAN_ID_DATA, b, 64, tick);
 }
 
@@ -98,6 +154,12 @@ static void reset_state(void)
     imgState          = IMG_IDLE;
     screenActive      = True;
     kfRingWriteIdx    = 0;
+#ifdef ENABLE_IMAGE_SECOC
+    /* Cumulative since boot in the firmware, which is what you want on a real
+       bus -- but across test cases in one binary it would carry a deliberate
+       rejection in one case into the "no flags set" assertion of the next. */
+    kfMacFails        = 0;
+#endif
     kfRingReadIdx     = 0;
     kfDecodedBytes    = 0;
     kfFramesRx        = 0;
@@ -127,13 +189,18 @@ static void reset_state(void)
 /* IMG_END as ECU D forwards it: 8 bytes, byte 4 = status. */
 static void send_img_end(uint8_t status, uint32_t tick)
 {
-    uint8_t b[8];
+    uint8_t b[12];
     memset(b, 0, sizeof b);
     b[4] = status;
     FDCAN_RxHeaderTypeDef h;
     memset(&h, 0, sizeof(h));
     h.Identifier = IMG_CAN_ID_END;
+#ifdef ENABLE_IMAGE_SECOC
+    secoc_tag(IMG_CAN_ID_END, b, 12, test_current_fv);
+    h.DataLength = FDCAN_DLC_BYTES_12;
+#else
     h.DataLength = FDCAN_DLC_BYTES_8;
+#endif
     SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
     /* IMG_END rides the ring behind the chunks it terminates, so the ACK comes
        out of the periodic task rather than the CAN task. Every caller here
@@ -176,6 +243,11 @@ static void send_tile_chunk(uint8_t tx, uint8_t ty, uint8_t size, uint8_t seq,
     memset(b, 0, sizeof b);
     b[0] = tx; b[1] = ty; b[2] = size; b[3] = seq; b[4] = len;
     memcpy(&b[5], rle, len);
+#ifdef ENABLE_IMAGE_SECOC
+    /* Tiles inherit the freshness of the frame that opened them, exactly as
+       they do on the bus. */
+    secoc_tag(DELTA_CAN_ID_TILE_CHUNK, b, 64, test_current_fv);
+#endif
     FDCAN_RxHeaderTypeDef h;
     memset(&h, 0, sizeof(h));
     h.Identifier = DELTA_CAN_ID_TILE_CHUNK;
@@ -196,12 +268,15 @@ static uint16_t rle_solid(uint8_t *out, uint16_t pixels, uint8_t hi, uint8_t lo)
     return n;
 }
 
-/* Cut an RLE stream into 59-byte chunks and send them as one tile, with bit 7
-   of the sequence set on the last -- exactly ECU D's framing. */
+/* Cut an RLE stream into DELTA_CAN_CHUNK_PAYLOAD-byte chunks and send them as
+   one tile, with bit 7 of the sequence set on the last -- exactly ECU D's
+   framing. The cut follows the configured wire format: SecOC takes four of
+   those bytes for the authenticator, so it is 55 with it on and 59 with it
+   off, and a fixture that kept saying 59 would have its tail truncated. */
 static void send_tile(uint8_t tx, uint8_t ty, uint8_t size,
                       const uint8_t *rle, uint16_t rleLen, uint32_t tick)
 {
-    const uint8_t CH = 59;
+    const uint8_t CH = (uint8_t)DELTA_CAN_CHUNK_PAYLOAD;
     uint16_t nchunks = (uint16_t)((rleLen + CH - 1) / CH);
     for (uint16_t i = 0; i < nchunks; i++) {
         uint16_t off = (uint16_t)(i * CH);
@@ -272,12 +347,12 @@ static void case_real_len_past_the_frame_is_clamped(void)
     uint8_t b[64];
     memset(b, 0, sizeof b);
     b[0] = 0; b[1] = 0;
-    b[2] = 200;              /* impossible: only 61 payload bytes exist */
+    b[2] = 200;              /* impossible: only IMG_CAN_CHUNK_PAYLOAD bytes exist */
     b[3] = 0x81; b[4] = 0xAB; b[5] = 0xCD;
     feed_can(IMG_CAN_ID_DATA, b, 64, 101);
     drain(102);
 
-    CHECK(fake_screen_len <= 61 * 2, "no read past the frame reaches the panel");
+    CHECK(fake_screen_len <= (size_t)IMG_CAN_CHUNK_PAYLOAD * 2, "no read past the frame reaches the panel");
 }
 
 static void case_a_split_block_across_frames(void)
@@ -708,7 +783,7 @@ static void case_a_tile_split_across_chunks(void)
         rle[n++] = (uint8_t)(px >> 8);
         px = (uint16_t)(px + run);
     }
-    CHECK(n > 59 * 4, "the fixture really does span many chunks");
+    CHECK(n > (uint16_t)DELTA_CAN_CHUNK_PAYLOAD * 4, "the fixture really does span many chunks");
 
     /* Reference: the whole stream decoded in one go. */
     static uint8_t want[TILE_RAW_MAX];
@@ -730,8 +805,10 @@ static void case_a_tile_split_across_chunks(void)
         static uint8_t naive[TILE_RAW_MAX];
         memset(naive, 0, sizeof naive);
         uint16_t pos = 0;
-        for (uint16_t off = 0; off < n && pos < TILE_RAW_MAX; off += 59) {
-            uint16_t len = (uint16_t)((n - off) > 59 ? 59 : (n - off));
+        for (uint16_t off = 0; off < n && pos < TILE_RAW_MAX; off += DELTA_CAN_CHUNK_PAYLOAD) {
+            uint16_t len = (uint16_t)((n - off) > (uint16_t)DELTA_CAN_CHUNK_PAYLOAD
+                                      ? (uint16_t)DELTA_CAN_CHUNK_PAYLOAD
+                                      : (uint16_t)(n - off));
             pos = (uint16_t)(pos + RLE_Decode(&rle[off], len, &naive[pos],
                                               (uint16_t)(TILE_RAW_MAX - pos)));
         }
@@ -1135,13 +1212,18 @@ static uint16_t rle_runs(uint8_t *out, uint8_t lo, uint8_t hi, uint32_t pixels)
    ring left deliberately full. */
 static void feed_img_end(uint8_t status, uint32_t tick)
 {
-    uint8_t b[8];
+    uint8_t b[12];
     memset(b, 0, sizeof b);
     b[4] = status;
     FDCAN_RxHeaderTypeDef h;
     memset(&h, 0, sizeof(h));
     h.Identifier = IMG_CAN_ID_END;
+#ifdef ENABLE_IMAGE_SECOC
+    secoc_tag(IMG_CAN_ID_END, b, 12, test_current_fv);
+    h.DataLength = FDCAN_DLC_BYTES_12;
+#else
     h.DataLength = FDCAN_DLC_BYTES_8;
+#endif
     SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
 }
 
@@ -1328,6 +1410,293 @@ static void case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel(void)
     CHECK(fake_panel_oob == 0, "no write runs past the window it was opened for");
 }
 
+
+#ifdef ENABLE_IMAGE_SECOC
+/* ------------------------------------------------------------------ */
+/* SecOC                                                               */
+/*                                                                     */
+/* These are the cases the feature exists for. Every other test in this*/
+/* file drives the happy path through authenticated fixtures, which    */
+/* proves a valid stream still paints; these prove an invalid one does */
+/* not. The assertion is always the same and always the panel: ECU A   */
+/* has no framebuffer, so "did not reach fake_screen" is the only      */
+/* statement worth making.                                             */
+/* ------------------------------------------------------------------ */
+
+/* One authenticated keyframe carrying a single solid-red pixel run. Returns
+   the number of panel bytes it produced, so a caller can assert on it. */
+static size_t one_pixel_keyframe(void)
+{
+    const uint8_t payload[3] = {0x81, 0xAB, 0xCD};   /* run of 2, colour ABCD */
+    send_img_start(240, 240, 1, 100);
+    send_img_data(0, payload, sizeof payload, 101);
+    drain(102);
+    return fake_screen_len;
+}
+
+static void case_secoc_a_forged_chunk_never_reaches_the_panel(void)
+{
+    h_case_begin("a chunk whose payload was altered in flight is refused");
+    reset_state();
+    send_img_start(240, 240, 1, 100);
+
+    /* Build a legitimate chunk, then flip one payload byte -- the exact thing
+       an attacker on the bus can do to a frame they captured. */
+    uint8_t b[64];
+    memset(b, 0, sizeof b);
+    b[0] = 0; b[1] = 0; b[2] = 3;
+    b[3] = 0x81; b[4] = 0xAB; b[5] = 0xCD;
+    secoc_tag(IMG_CAN_ID_DATA, b, 64, test_current_fv);
+    b[4] ^= 0xFF;                       /* one bit of one pixel */
+
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = IMG_CAN_ID_DATA;
+    h.DataLength = FDCAN_DLC_BYTES_64;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, 101);
+    drain(102);
+
+    CHECK(fake_screen_len == 0, "nothing reaches the panel");
+    CHECK(kfMacFails == 1, "and it is counted as an authentication failure");
+    CHECK(kfFramesRx == 0, "and it never entered the ring");
+}
+
+static void case_secoc_a_forged_authenticator_is_refused(void)
+{
+    h_case_begin("a chunk with a guessed authenticator is refused");
+    reset_state();
+    send_img_start(240, 240, 1, 100);
+
+    uint8_t b[64];
+    memset(b, 0, sizeof b);
+    b[0] = 0; b[1] = 0; b[2] = 3;
+    b[3] = 0x81; b[4] = 0xAB; b[5] = 0xCD;
+    /* No key, so the best an attacker can do is guess. */
+    b[60] = 0xDE; b[61] = 0xAD; b[62] = 0xBE; b[63] = 0xEF;
+
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = IMG_CAN_ID_DATA;
+    h.DataLength = FDCAN_DLC_BYTES_64;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, 101);
+    drain(102);
+
+    CHECK(fake_screen_len == 0, "nothing reaches the panel");
+    CHECK(kfMacFails == 1, "and it is counted");
+}
+
+static void case_secoc_an_unauthenticated_keyframe_cannot_open_a_stream(void)
+{
+    h_case_begin("an IMG_START with no authenticator does not reset the receiver");
+    reset_state();
+
+    /* First establish real state, so we can prove the forgery does not
+       disturb it -- refusing a frame is only half the property. */
+    send_img_start(240, 240, 1, 100);
+    uint16_t seqBefore = kfExpectedSeq;
+
+    uint8_t b[20];
+    memset(b, 0, sizeof b);
+    b[0] = 80; b[2] = 80; b[4] = 1; b[8] = 1;   /* plausible geometry */
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = IMG_CAN_ID_START;
+    h.DataLength = FDCAN_DLC_BYTES_20;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, 110);
+
+    CHECK(kfMacFails == 1, "the forged START is counted");
+    CHECK(kfExpectedSeq == seqBefore, "and the live keyframe's sequence gate is untouched");
+    CHECK(imgState == KEYFRAME_RX, "and the live keyframe is still open");
+}
+
+static void case_secoc_a_replayed_keyframe_is_refused(void)
+{
+    h_case_begin("a keyframe recorded off the bus and replayed is refused");
+    reset_state();
+
+    /* Capture a complete, genuine keyframe as it goes past. */
+    uint8_t startFrame[20];
+    memset(startFrame, 0, sizeof startFrame);
+    startFrame[0] = 240; startFrame[2] = 240; startFrame[4] = 1;
+    startFrame[8] = 1;   startFrame[10] = 0x01;
+    uint8_t chk = 0;
+    for (int i = 0; i < 11; i++) chk ^= startFrame[i];
+    startFrame[11] = chk;
+    secoc_open(IMG_CAN_ID_START, startFrame, 20, 12);
+
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = IMG_CAN_ID_START;
+    h.DataLength = FDCAN_DLC_BYTES_20;
+
+    /* It plays once, as it should. */
+    SCREENIMAGE_ProcessRxCANMessage(&h, startFrame, 100);
+    CHECK(imgState == KEYFRAME_RX, "the genuine keyframe opens");
+    CHECK(kfMacFails == 0, "with no authentication failure");
+
+    /* Byte-for-byte the same frame again. The authenticator is still valid --
+       it was never forged -- so only the freshness counter can refuse it. */
+    imgState = IMG_IDLE;
+    SCREENIMAGE_ProcessRxCANMessage(&h, startFrame, 200);
+    CHECK(imgState == IMG_IDLE, "the replay does not open a keyframe");
+    CHECK(kfMacFails == 1, "and is refused");
+}
+
+static void case_secoc_a_chunk_cannot_be_moved_between_keyframes(void)
+{
+    h_case_begin("a chunk lifted from one keyframe and replayed into the next is refused");
+    reset_state();
+
+    /* Frame one: capture its first chunk off the wire. */
+    send_img_start(240, 240, 1, 100);
+    uint8_t captured[64];
+    memset(captured, 0, sizeof captured);
+    captured[0] = 0; captured[1] = 0; captured[2] = 3;
+    captured[3] = 0x81; captured[4] = 0xAB; captured[5] = 0xCD;
+    secoc_tag(IMG_CAN_ID_DATA, captured, 64, test_current_fv);
+
+    /* Frame two opens with a new freshness value. */
+    send_img_end(0x00, 110);
+    reset_state();
+    send_img_start(240, 240, 1, 200);
+
+    /* The captured chunk is intact and correctly signed -- for the PREVIOUS
+       frame. Its sequence number even matches what this frame expects. */
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = IMG_CAN_ID_DATA;
+    h.DataLength = FDCAN_DLC_BYTES_64;
+    SCREENIMAGE_ProcessRxCANMessage(&h, captured, 201);
+    drain(202);
+
+    CHECK(fake_screen_len == 0, "it does not paint into the new keyframe");
+    CHECK(kfMacFails == 1, "it is refused: the freshness it was signed under is gone");
+}
+
+static void case_secoc_a_tile_cannot_be_relocated_on_the_panel(void)
+{
+    h_case_begin("a valid delta tile cannot be moved to different coordinates");
+    reach_img_shown();
+
+    uint8_t rle[8];
+    uint16_t n = rle_solid(rle, 4, 0x11, 0x22);
+
+    uint8_t b[64];
+    memset(b, 0, sizeof b);
+    b[0] = 0; b[1] = 0; b[2] = 8; b[3] = 0x80; b[4] = (uint8_t)n;
+    memcpy(&b[5], rle, n);
+    secoc_tag(DELTA_CAN_ID_TILE_CHUNK, b, 64, test_current_fv);
+
+    /* Move it across the panel. The RLE and the authenticator are untouched;
+       only the coordinates change -- which they cannot, because the tile
+       header is inside the authenticated region. */
+    b[0] = 20; b[1] = 20;
+
+    FDCAN_RxHeaderTypeDef h;
+    memset(&h, 0, sizeof h);
+    h.Identifier = DELTA_CAN_ID_TILE_CHUNK;
+    h.DataLength = FDCAN_DLC_BYTES_64;
+    SCREENIMAGE_ProcessRxCANMessage(&h, b, 300);
+    drain(301);
+
+    CHECK(fake_screen_len == 0, "the relocated tile paints nothing");
+    CHECK(kfMacFails == 1, "and is refused");
+}
+
+static void case_secoc_a_valid_stream_still_paints(void)
+{
+    h_case_begin("and none of this stops a genuine keyframe from painting");
+    reset_state();
+    size_t painted = one_pixel_keyframe();
+    CHECK(painted == 4, "two pixels reach the panel");
+    CHECK(kfMacFails == 0, "with no authentication failures");
+}
+
+/* ---- Unit-level checks on the module itself ---------------------------- */
+
+static void case_secoc_blake2s_matches_the_published_vectors(void)
+{
+    h_case_begin("BLAKE2s agrees with RFC 7693 and the keyed KAT");
+    RAMN_Blake2s_Ctx_t c;
+    uint8_t out[32];
+
+    /* RFC 7693 Appendix B. If this moves, every authenticator on the bus
+       changes and no two ECUs interoperate -- so it is worth pinning even
+       though nothing in RAMN hashes "abc". */
+    static const uint8_t abc[32] = {
+        0x50,0x8C,0x5E,0x8C,0x32,0x7C,0x14,0xE2,0xE1,0xA7,0x2B,0xA3,0x4E,0xEB,0x45,0x2F,
+        0x37,0x45,0x8B,0x20,0x9E,0xD6,0x3A,0x29,0x4D,0x99,0x9B,0x4C,0x86,0x67,0x59,0x82};
+    RAMN_BLAKE2S_Init(&c, 32, NULL, 0);
+    RAMN_BLAKE2S_Update(&c, (const uint8_t *)"abc", 3);
+    RAMN_BLAKE2S_Final(&c, out);
+    CHECK(memcmp(out, abc, 32) == 0, "unkeyed BLAKE2s-256(\"abc\") matches RFC 7693");
+
+    /* blake2-kat, key = 00..1f, empty message. This is the path SecOC uses. */
+    static const uint8_t keyed0[32] = {
+        0x48,0xA8,0x99,0x7D,0xA4,0x07,0x87,0x6B,0x3D,0x79,0xC0,0xD9,0x23,0x25,0xAD,0x3B,
+        0x89,0xCB,0xB7,0x54,0xD8,0x6A,0xB7,0x1A,0xEE,0x04,0x7A,0xD3,0x45,0xFD,0x2C,0x49};
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)i;
+    RAMN_BLAKE2S_Init(&c, 32, key, 32);
+    RAMN_BLAKE2S_Final(&c, out);
+    CHECK(memcmp(out, keyed0, 32) == 0, "keyed BLAKE2s matches the KAT");
+}
+
+static void case_secoc_the_data_id_separates_messages(void)
+{
+    h_case_begin("the same bytes under a different Data ID give a different authenticator");
+    RAMN_SecOC_Freshness_t fv;
+    RAMN_SecOC_FreshnessInit(&fv);
+
+    uint8_t payload[8] = {1,2,3,4,5,6,7,8};
+    uint8_t macA[4], macB[4];
+    RAMN_SecOC_Ctx_t a = { IMG_CAN_ID_DATA,        4, RAMN_SecOC_KEYS_GetImageKey(), &fv };
+    RAMN_SecOC_Ctx_t b = { DELTA_CAN_ID_TILE_CHUNK, 4, RAMN_SecOC_KEYS_GetImageKey(), &fv };
+
+    RAMN_SecOC_ComputeMac(&a, 7, payload, sizeof payload, macA);
+    RAMN_SecOC_ComputeMac(&b, 7, payload, sizeof payload, macB);
+    CHECK(memcmp(macA, macB, 4) != 0,
+          "a 0x301 body cannot be replayed as a valid 0x305");
+
+    /* And the freshness genuinely enters the computation. */
+    uint8_t macC[4];
+    RAMN_SecOC_ComputeMac(&a, 8, payload, sizeof payload, macC);
+    CHECK(memcmp(macA, macC, 4) != 0, "and a different freshness changes it too");
+}
+
+static void case_secoc_freshness_reconstruction(void)
+{
+    h_case_begin("the receiver rebuilds a full freshness value from the low bits");
+    RAMN_SecOC_Freshness_t fv;
+    RAMN_SecOC_FreshnessInit(&fv);
+    uint32_t full;
+
+    /* Un-synchronised: the first value seen establishes the counter. */
+    CHECK(RAMN_SecOC_RxFreshness(&fv, 5, 16, &full) == 1, "the first value is accepted");
+    RAMN_SecOC_RxAccept(&fv, full);
+    CHECK(full == 5, "and taken at face value");
+
+    /* Forward within the window. */
+    CHECK(RAMN_SecOC_RxFreshness(&fv, 6, 16, &full) == 1 && full == 6, "the next one follows");
+    RAMN_SecOC_RxAccept(&fv, full);
+
+    /* Backwards is a replay, whatever its authenticator says. */
+    CHECK(RAMN_SecOC_RxFreshness(&fv, 6, 16, &full) == 0, "the same value again is refused");
+    CHECK(RAMN_SecOC_RxFreshness(&fv, 5, 16, &full) == 0, "and an older one is refused");
+
+    /* Far ahead is refused too: accepting it would strand the real sender
+       beyond the window for good. */
+    CHECK(RAMN_SecOC_RxFreshness(&fv, 60000, 16, &full) == 0,
+          "a jump past the window is refused");
+
+    /* Across a truncation boundary the high bits must carry. */
+    RAMN_SecOC_FreshnessInit(&fv);
+    RAMN_SecOC_RxAccept(&fv, 0x0000FFFEUL);
+    CHECK(RAMN_SecOC_RxFreshness(&fv, 0x0002, 16, &full) == 1 && full == 0x00010002UL,
+          "low bits that wrapped are rebuilt into the next period, not the last");
+}
+#endif /* ENABLE_IMAGE_SECOC */
+
 int main(void)
 {
     printf("ECU A image screen host tests\n");
@@ -1368,6 +1737,18 @@ int main(void)
     case_a_superseded_keyframe_is_dropped_whole();
     case_draining_an_img_end_does_not_close_the_frame_after_it();
     case_a_keyframe_starting_mid_paint_does_not_corrupt_the_panel();
+#ifdef ENABLE_IMAGE_SECOC
+    case_secoc_blake2s_matches_the_published_vectors();
+    case_secoc_the_data_id_separates_messages();
+    case_secoc_freshness_reconstruction();
+    case_secoc_a_forged_chunk_never_reaches_the_panel();
+    case_secoc_a_forged_authenticator_is_refused();
+    case_secoc_an_unauthenticated_keyframe_cannot_open_a_stream();
+    case_secoc_a_replayed_keyframe_is_refused();
+    case_secoc_a_chunk_cannot_be_moved_between_keyframes();
+    case_secoc_a_tile_cannot_be_relocated_on_the_panel();
+    case_secoc_a_valid_stream_still_paints();
+#endif
 
     printf("\n%d checks | %d hard failures | %d known bugs confirmed",
            h_checks, h_failures - h_bugs_fixed, h_bugs_confirmed);

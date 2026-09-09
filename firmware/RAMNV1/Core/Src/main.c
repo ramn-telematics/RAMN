@@ -50,6 +50,9 @@
 #include "ramn_sensors.h"
 #include "ramn_actuators.h"
 #include "ramn_crc.h"
+#ifdef ENABLE_IMAGE_SECOC
+#include "ramn_secoc_keys.h"
+#endif
 #if defined(ENABLE_DIAG)
 #include "ramn_diag.h"
 #endif
@@ -527,6 +530,12 @@ int main(void)
 
 #if defined(ENABLE_EEPROM_EMULATION)
 	RAMN_EEPROM_Init();
+#endif
+
+#ifdef ENABLE_IMAGE_SECOC
+	// After the EEPROM layer, which is where a provisioned key lives, and
+	// before any image traffic can be sent or verified.
+	RAMN_SecOC_KEYS_Init();
 #endif
 
 #if defined(ENABLE_DIAG)

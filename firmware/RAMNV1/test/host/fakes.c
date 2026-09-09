@@ -71,3 +71,38 @@ size_t xStreamBufferSpacesAvailable(StreamBufferHandle_t h) { (void)h; return 40
 void RAMN_UART_SendFromTask(uint8_t* d, uint32_t n) { (void)d;(void)n; }
 void RAMN_UART_SendStringFromTask(const char* s) { (void)s; }
 SPI_HandleTypeDef hspi2;
+
+/* ---- Emulated EEPROM ------------------------------------------------------
+ * A tiny key/value store so ramn_secoc_keys.c can be exercised both
+ * un-provisioned (the default-key path a freshly flashed board takes) and
+ * provisioned. fake_eeprom_reset clears it back to empty. */
+#include "ramn_eeprom.h"
+
+#define FAKE_EEPROM_MAX 16
+static struct { uint16_t index; uint32_t val; uint8_t used; } fake_eeprom[FAKE_EEPROM_MAX];
+
+void fake_eeprom_reset(void)
+{
+	for (int i = 0; i < FAKE_EEPROM_MAX; i++) fake_eeprom[i].used = 0;
+}
+
+EE_Status RAMN_EEPROM_Init(void) { return EE_OK; }
+
+EE_Status RAMN_EEPROM_Write32(uint16_t index, uint32_t val)
+{
+	for (int i = 0; i < FAKE_EEPROM_MAX; i++)
+		if (fake_eeprom[i].used && fake_eeprom[i].index == index)
+		{ fake_eeprom[i].val = val; return EE_OK; }
+	for (int i = 0; i < FAKE_EEPROM_MAX; i++)
+		if (!fake_eeprom[i].used)
+		{ fake_eeprom[i].used = 1; fake_eeprom[i].index = index; fake_eeprom[i].val = val; return EE_OK; }
+	return EE_WRITE_ERROR;
+}
+
+EE_Status RAMN_EEPROM_Read32(uint16_t index, uint32_t* pval)
+{
+	for (int i = 0; i < FAKE_EEPROM_MAX; i++)
+		if (fake_eeprom[i].used && fake_eeprom[i].index == index)
+		{ *pval = fake_eeprom[i].val; return EE_OK; }
+	return EE_NO_DATA;
+}

@@ -18,6 +18,10 @@
 #include "ramn_config.h"
 #include "ramn_canfd.h"
 #include "ramn_uart.h"
+#ifdef ENABLE_IMAGE_SECOC
+#include "ramn_secoc.h"
+#include "ramn_secoc_keys.h"
+#endif
 #include <stdio.h>
 
 // Define to enable UART debug output for SPI↔ESP32 communication.
@@ -82,12 +86,27 @@ extern StreamBufferHandle_t CANTxDataStreamBufferHandle;
 // clocked for nothing: 512 carried 7 and wasted 36 bytes on every transaction.
 // 1020 is 15 of them exactly, and stays inside the 1024 the ESP32's DMA
 // descriptor is sized for. That is 1500 chunks/s, about 26% of the CAN bus.
-#define IMG_CHUNK_SPI_MSG_LEN 68U   // LEN+MARKER+TYPE+SEQ(2)+REAL_LEN+61+CHK
-#define SPI_TRANSACTION_SIZE 1020
+// [LEN][MARKER][TYPE][SEQ_HI][SEQ_LO][REAL_LEN] + payload + [CHK] = 6 + N + 1.
+// The payload is whatever a 0x301 frame has room for once its CAN header --
+// including the SecOC authenticator -- is subtracted, so this number follows
+// the wire format automatically instead of being restated.
+#define IMG_CHUNK_SPI_MSG_LEN (7U + IMG_CAN_CHUNK_PAYLOAD)
 
-// Tile RLE bytes one 0x305 frame carries: 64 minus the 5-byte tile header.
-#define DELTA_CAN_HEADER     5U
-#define DELTA_CHUNK_PAYLOAD  (CAN_MAX_PAYLOAD_BYTES - DELTA_CAN_HEADER)
+// SecOC shrinks the chunk payload from 61 to 57, which shrinks the SPI message
+// from 68 bytes to 64 -- and 64 divides 1024 exactly. The transaction gets
+// BIGGER and stops wasting the tail: 16 whole chunks per poll against 15, and
+// zero remainder clocked for nothing, right at the 1024 the ESP32's DMA
+// descriptor is sized for. The authenticator costs 7% of each frame's payload
+// and hands most of it back in link efficiency.
+#ifdef ENABLE_IMAGE_SECOC
+#define SPI_TRANSACTION_SIZE 1024   // 16 x 64
+#else
+#define SPI_TRANSACTION_SIZE 1020   // 15 x 68
+#endif
+
+// Tile RLE bytes one 0x305 frame carries: 64 minus its header (and MAC).
+#define DELTA_CAN_HEADER     DELTA_CAN_HEADER_BYTES
+#define DELTA_CHUNK_PAYLOAD  DELTA_CAN_CHUNK_PAYLOAD
 
 #define SPI_TX_BUFFER_SIZE SPI_TRANSACTION_SIZE  // one flush = one transaction
 
@@ -127,11 +146,11 @@ static volatile uint32_t spiStatsLastPrintTick = 0;
 // ============================================================================
 #define SPI_POLL_INTERVAL_MS 50   // Normal poll interval (ms) — reduced to 1 ms during streaming
 #define SPI_POLL_TIMEOUT_MS 10    // Max wait for ESP32 response
-#define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // 15 packed IMG_CHUNKs per poll
+#define SPI_RX_BUFFER_SIZE SPI_TRANSACTION_SIZE   // whole IMG_CHUNKs per poll
 
 /* One IMG_CHUNK SPI message is [LEN][MARKER][TYPE][SEQ_HI][SEQ_LO][REAL_LEN]
-   + 61 payload + [CHK] = 68 bytes. A transaction that cannot hold at least two
-   of them is not worth the poll. */
+   + IMG_CAN_CHUNK_PAYLOAD + [CHK]: 64 bytes with SecOC on, 68 with it off.
+   A transaction that cannot hold at least two of them is not worth the poll. */
 _Static_assert(SPI_TRANSACTION_SIZE >= (2 * IMG_CHUNK_SPI_MSG_LEN),
                "SPI transaction too small to carry two image chunks");
 _Static_assert(SPI_TRANSACTION_SIZE <= 1024,
@@ -295,8 +314,65 @@ static void PrintImageACKLatency(void);
 // ============================================================================
 // INITIALIZATION
 // ============================================================================
+#ifdef ENABLE_IMAGE_SECOC
+// ============================================================================
+// SecOC -- SENDER SIDE
+//
+// One freshness domain covers the whole image stream. Keyframes and delta
+// frames draw from the same counter, so a recorded delta frame cannot be
+// replayed into the place of a later keyframe.
+// ============================================================================
+static RAMN_SecOC_Freshness_t imgFreshness;
+
+// Freshness of the frame being sent right now. Every chunk of that frame is
+// authenticated under it, which is exactly what lets a chunk spend zero wire
+// bytes carrying freshness of its own -- only the frame's opening message
+// (0x300 / 0x304) transmits it.
+static uint32_t imgCurrentFv = 0U;
+
+// Writes the authenticator into the LAST IMG_SECOC_MAC_BYTES of a frame that
+// is dlcLen bytes on the wire, over everything before it.
+//
+// Anchoring the MAC to the end of the frame rather than to the end of the
+// payload keeps its offset fixed no matter how many RLE bytes a chunk carries,
+// and it pulls the whole header -- sequence number, length byte, tile
+// coordinates -- inside the authenticated region. A receiver therefore cannot
+// be steered by a tampered length field: changing one changes the MAC input.
+static void SecOCTagFrame(uint32_t canId, uint8_t* data, uint8_t dlcLen, uint32_t fv)
+{
+	RAMN_SecOC_Ctx_t ctx;
+	ctx.dataId = (uint16_t)canId;
+	ctx.macLen = IMG_SECOC_MAC_BYTES;
+	ctx.key    = RAMN_SecOC_KEYS_GetImageKey();
+	ctx.fv     = &imgFreshness;
+
+	uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
+	RAMN_SecOC_ComputeMac(&ctx, fv, data, authLen, &data[authLen]);
+}
+
+// Places the truncated freshness value of a new frame at offset off, and
+// returns the full value the frame's chunks will be authenticated under.
+static uint32_t SecOCBeginFrame(uint8_t* data, uint8_t off)
+{
+	uint32_t fv = RAMN_SecOC_TxFreshness(&imgFreshness);
+	data[off]      = (uint8_t)((fv >> 8) & 0xFFU);
+	data[off + 1U] = (uint8_t)( fv       & 0xFFU);
+	return fv;
+}
+#endif
+
 void RAMN_TELEMATICS_Init(uint32_t tick)
 {
+#ifdef ENABLE_IMAGE_SECOC
+	// The transmit counter starts at zero and only ever climbs. A receiver
+	// that has been up longer than this ECU will refuse the first frames as
+	// stale until its own counter is passed -- see the re-synchronisation note
+	// in ramn_secoc.h. Both ECUs power up together on a RAMN board, so this is
+	// a debug-session concern rather than a running-system one.
+	RAMN_SecOC_FreshnessInit(&imgFreshness);
+	imgCurrentFv = 0U;
+#endif
+
 	// Initialize TX buffers
 	activeBufferPos = 0;
 	flushBufferSize = 0;
@@ -923,8 +999,12 @@ static void ProcessESP32Response(void)
 			streamState   = KEYFRAME_ACTIVE;
 			currentPollIntervalMs = 1U;
 
-			// Forward 0x300 IMG_START to ECU A
-			uint8_t canData[12];
+			// Forward 0x300 IMG_START to ECU A.
+			// With SecOC the frame grows to 20 bytes: the 12-byte body is
+			// untouched, the frame's truncated freshness follows it, and the
+			// authenticator sits in the last four. IMG_START is one frame per
+			// keyframe, so the two padding bytes cost nothing worth reclaiming.
+			uint8_t canData[20];
 			canData[0]  = (uint8_t)(w & 0xFFU);
 			canData[1]  = (uint8_t)(w >> 8);
 			canData[2]  = (uint8_t)(h & 0xFFU);
@@ -939,7 +1019,17 @@ static void ProcessESP32Response(void)
 			uint8_t xorChk = 0U;
 			for (uint8_t k = 0U; k < 11U; k++) xorChk ^= canData[k];
 			canData[11] = xorChk;
+#ifdef ENABLE_IMAGE_SECOC
+			// A new frame, so a new freshness value -- and every chunk and the
+			// IMG_END behind it are authenticated under this same value.
+			canData[14] = 0x00U;
+			canData[15] = 0x00U;
+			imgCurrentFv = SecOCBeginFrame(canData, 12U);
+			SecOCTagFrame(IMG_CAN_ID_START, canData, 20U, imgCurrentFv);
+			SendImageCANFrame(IMG_CAN_ID_START, FDCAN_DLC_BYTES_20, False, canData);
+#else
 			SendImageCANFrame(IMG_CAN_ID_START, FDCAN_DLC_BYTES_12, False, canData);
+#endif
 			continue;
 		}
 
@@ -969,7 +1059,8 @@ static void ProcessESP32Response(void)
 			while (srcOffset < payLen)
 			{
 				uint8_t remaining = (uint8_t)(payLen - srcOffset);
-				uint8_t frameLen  = (remaining <= 61U) ? remaining : 61U;
+				uint8_t frameLen  = (remaining <= IMG_CAN_CHUNK_PAYLOAD)
+				                    ? remaining : (uint8_t)IMG_CAN_CHUNK_PAYLOAD;
 
 				uint8_t canData[64];
 				RAMN_memset(canData, 0, sizeof(canData));
@@ -977,6 +1068,13 @@ static void ProcessESP32Response(void)
 				canData[1] = msg[4];    // SEQ_LO
 				canData[2] = frameLen;  // REAL_LEN -- true byte count carried in this frame
 				for (uint8_t k = 0U; k < frameLen; k++) canData[3U + k] = msg[6U + srcOffset + k];
+#ifdef ENABLE_IMAGE_SECOC
+				// Under the freshness of the keyframe this chunk belongs to.
+				// The sequence number is inside the authenticated region, so a
+				// chunk cannot be lifted out of one keyframe and replayed into
+				// another position of the same one.
+				SecOCTagFrame(IMG_CAN_ID_DATA, canData, 64U, imgCurrentFv);
+#endif
 				SendImageCANFrame(IMG_CAN_ID_DATA, FDCAN_DLC_BYTES_64, True, canData);
 
 				srcOffset = (uint8_t)(srcOffset + frameLen);
@@ -994,13 +1092,20 @@ static void ProcessESP32Response(void)
 			if (streamState != KEYFRAME_ACTIVE) continue;
 
 			// Forward 0x302 IMG_END
-			uint8_t canData[8];
+			uint8_t canData[12];
 			RAMN_memset(canData, 0, sizeof(canData));
 			canData[0] = (uint8_t)(kfChunksSent & 0xFFU);
 			canData[1] = (uint8_t)(kfChunksSent >> 8);
 			// CRC16 bytes (2-3) left as 0x00 — full CRC computation is optional
 			canData[4] = 0x00U;   // STATUS OK
+#ifdef ENABLE_IMAGE_SECOC
+			// Same freshness as the keyframe it closes: IMG_END is part of
+			// that frame, not a frame of its own.
+			SecOCTagFrame(IMG_CAN_ID_END, canData, 12U, imgCurrentFv);
+			SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_12, False, canData);
+#else
 			SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_8, False, canData);
+#endif
 
 			streamState   = KEYFRAME_SENT;
 			kfAckReceived = False;
@@ -1015,10 +1120,15 @@ static void ProcessESP32Response(void)
 		{
 			if (streamState == KEYFRAME_ACTIVE || streamState == KEYFRAME_SENT)
 			{
-				uint8_t canData[8];
+				uint8_t canData[12];
 				RAMN_memset(canData, 0, sizeof(canData));
 				canData[4] = 0x01U;   // STATUS abort
+#ifdef ENABLE_IMAGE_SECOC
+				SecOCTagFrame(IMG_CAN_ID_END, canData, 12U, imgCurrentFv);
+				SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_12, False, canData);
+#else
 				SendImageCANFrame(IMG_CAN_ID_END, FDCAN_DLC_BYTES_8, False, canData);
+#endif
 			}
 			streamState           = STREAM_IDLE;
 			currentPollIntervalMs = SPI_POLL_INTERVAL_MS;
@@ -1048,11 +1158,22 @@ static void ProcessESP32Response(void)
 				deltaFrameSeq++;
 				deltaTileCount = 0U;
 
-				uint8_t startData[8];
+				uint8_t startData[16];
 				RAMN_memset(startData, 0, sizeof(startData));
 				startData[0] = deltaFrameSeq;
 				startData[1] = 0U;   // tile_count filled in DELTA_FRAME_END
+#ifdef ENABLE_IMAGE_SECOC
+				// A delta frame is a frame: it takes its own freshness, and
+				// its tiles inherit it. This message MUST be authenticated --
+				// it is what tells ECU A which freshness the tiles behind it
+				// are signed under, so an unauthenticated one would let an
+				// attacker choose that value.
+				imgCurrentFv = SecOCBeginFrame(startData, 8U);
+				SecOCTagFrame(DELTA_CAN_ID_FRAME_START, startData, 16U, imgCurrentFv);
+				SendImageCANFrame(DELTA_CAN_ID_FRAME_START, FDCAN_DLC_BYTES_16, False, startData);
+#else
 				SendImageCANFrame(DELTA_CAN_ID_FRAME_START, FDCAN_DLC_BYTES_8, False, startData);
+#endif
 
 				if (streamState != DELTA_ACTIVE)
 				{
@@ -1080,6 +1201,11 @@ static void ProcessESP32Response(void)
 			uint8_t copyLen = (payLen <= DELTA_CHUNK_PAYLOAD) ? payLen : DELTA_CHUNK_PAYLOAD;
 			canData[4] = copyLen;
 			for (uint8_t k = 0U; k < copyLen; k++) canData[5U + k] = msg[8U + k];
+#ifdef ENABLE_IMAGE_SECOC
+			// Tile coordinates and size are inside the authenticated region,
+			// so a valid tile cannot be relocated somewhere else on the panel.
+			SecOCTagFrame(DELTA_CAN_ID_TILE_CHUNK, canData, 64U, imgCurrentFv);
+#endif
 			SendImageCANFrame(DELTA_CAN_ID_TILE_CHUNK, FDCAN_DLC_BYTES_64, True, canData);
 			continue;
 		}

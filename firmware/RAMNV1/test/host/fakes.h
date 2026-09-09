@@ -10,3 +10,5 @@ void fake_reset(void);
 
 extern FDCAN_ProtocolStatusTypeDef fake_can_status;
 extern FDCAN_ErrorCountersTypeDef  fake_can_errors;
+
+void fake_eeprom_reset(void);

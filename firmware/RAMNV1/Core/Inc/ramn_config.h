@@ -293,6 +293,15 @@
 #endif
 
 
+// SecOC keeps its key in the emulated EEPROM, and ECU A -- which has no UDS,
+// KWP or XCP -- would otherwise have no EEPROM layer at all and no way to hold
+// a provisioned key. Enabling it there costs a flash page pair at 0x0803E000
+// and nothing else: the emulation layer takes over the hardware CRC unit, and
+// no RAMN module uses it (every caller goes through RAMN_CRC_SoftCalculate).
+#if defined(ENABLE_IMAGE_SECOC) && defined(ENABLE_SCREEN)
+#define ENABLE_EEPROM_EMULATION
+#endif
+
 #if defined(ENABLE_UDS) || defined(ENABLE_KWP) || defined(ENABLE_XCP)
 #define ENABLE_DIAG
 #define ENABLE_EEPROM_EMULATION
@@ -383,6 +392,48 @@
 #define DELTA_CAN_ID_FRAME_START  0x304U  // Delta frame start     (CAN-FD)
 #define DELTA_CAN_ID_TILE_CHUNK   0x305U  // Delta tile chunk      (CAN-FD + BRS)
 #define DELTA_CAN_ID_FRAME_END    0x306U  // Delta frame end       (CAN-FD)
+
+// SecOC on the image stream --------------------------------------------------
+//
+// Authenticates every image message so that only the ECU holding the shared
+// key can put pixels on ECU A's panel. See ramn_secoc.h for the construction
+// and ramn_secoc_keys.h for where the key lives.
+//
+// This has to be PER CHUNK, not one authenticator at the end of a keyframe.
+// ECU A has no framebuffer -- ramn_screen_image.c decodes each chunk straight
+// to the ST7789 as it arrives -- so a keyframe-level MAC would verify long
+// after the attacker's pixels were already lit.
+//
+// Comment this out and every layout below collapses to the pre-SecOC wire
+// format, byte for byte, so the two can be compared on real hardware.
+#define ENABLE_IMAGE_SECOC
+
+#ifdef ENABLE_IMAGE_SECOC
+// Truncated authenticator carried by every image message.
+//
+// Four bytes is 1-in-4-billion per forgery attempt, and an attacker gets no
+// offline search: without the key the only way to test a guess is to put it on
+// the bus, where a wrong one corrupts the frame and lands in the drop counters
+// the 0x303 ACK already reports. It also makes the arithmetic below come out
+// exactly right -- see IMG_CHUNK_SPI_MSG_LEN in ramn_telematics.c.
+#define IMG_SECOC_MAC_BYTES       4U
+// Freshness bits on the wire, carried by IMG_START / DELTA_FRAME_START only.
+// Chunks inherit the freshness of the frame they belong to, so they spend no
+// bytes on it. 16 bits at a few frames per second is months before the
+// truncation period matters, and the receiver reconstructs the full 32.
+#define IMG_SECOC_FV_TRUNC_BITS  16U
+#else
+#define IMG_SECOC_MAC_BYTES       0U
+#define IMG_SECOC_FV_TRUNC_BITS   0U
+#endif
+
+// 0x301 keyframe chunk: [SEQ_HI][SEQ_LO][REAL_LEN][MAC...][RLE...]
+#define IMG_CAN_HEADER_BYTES     (3U + IMG_SECOC_MAC_BYTES)
+#define IMG_CAN_CHUNK_PAYLOAD    (64U - IMG_CAN_HEADER_BYTES)
+
+// 0x305 delta tile chunk: [X][Y][SIZE][SEQ][LEN][MAC...][RLE...]
+#define DELTA_CAN_HEADER_BYTES   (5U + IMG_SECOC_MAC_BYTES)
+#define DELTA_CAN_CHUNK_PAYLOAD  (64U - DELTA_CAN_HEADER_BYTES)
 
 // Check for bad configurations --------------------------------------
 
