@@ -238,13 +238,26 @@ static const CapturedFrame_t *last_frame(uint32_t id)
 }
 
 #ifdef ENABLE_IMAGE_SECOC
+/* Deliver a frame the way the firmware does.
+ *
+ * main.c calls the screen manager and the SecOC link as PEERS, and the screen
+ * manager routes only 0x300-0x306 inward. Mirroring that here is what keeps
+ * the session out of the screen's business: a fixture that handed a handshake
+ * frame to SCREENIMAGE_ProcessRxCANMessage would be exercising a path the
+ * firmware does not have, and would hide a routing mistake rather than catch
+ * one. */
 static void feed_frame(uint32_t id, const uint8_t *b, uint32_t dlc, uint32_t tick)
 {
     FDCAN_RxHeaderTypeDef h;
     memset(&h, 0, sizeof h);
-    h.Identifier = id;
-    h.DataLength = dlc;
-    SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+    h.Identifier  = id;
+    h.DataLength  = dlc;
+    h.IdType      = FDCAN_STANDARD_ID;
+    h.RxFrameType = FDCAN_DATA_FRAME;
+
+    if ((id >= IMG_CAN_ID_START) && (id <= DELTA_CAN_ID_FRAME_END))
+        SCREENIMAGE_ProcessRxCANMessage(&h, b, tick);
+    RAMN_SecOC_LINK_ProcessRxCANMessage(&h, b, tick);
 }
 
 /* Runs the handshake as ECU D would, and leaves both sides holding the same
@@ -254,7 +267,7 @@ static int establish_session(uint32_t tick)
     fake_reset();
     /* The rate limit is real and correct on a bus; across test cases in one
        binary it would refuse the second case's handshake. */
-    challengeSent = False;
+    RAMN_SecOC_LINK_Init();
 
     uint8_t req[4] = {0, 0, 0, 0};
     feed_frame(SESSION_CAN_ID_REQ, req, FDCAN_DLC_BYTES_4, tick);
@@ -288,7 +301,7 @@ static int establish_session(uint32_t tick)
        session would sign against a freshness ECU A is no longer at. */
     test_current_fv = 0;
     fake_reset();
-    return (imgSession.state == RAMN_SECOC_SESSION_OK) ? 1 : 0;
+    return RAMN_SecOC_LINK_Ready() ? 1 : 0;
 }
 #endif
 
@@ -1788,9 +1801,7 @@ static void case_secoc_freshness_reconstruction(void)
 static void no_session(void)
 {
     reset_state();                            /* full clean state, session and all */
-    RAMN_SecOC_SESSION_Reset(&imgSession);    /* then take the session away */
-    RAMN_SecOC_SESSION_Reset(&imgPending);
-    challengeSent    = False;
+    RAMN_SecOC_LINK_Init();      /* then take the session away */
     kfMacFails       = 0;
     kfNoSessionDrops = 0;
     fake_reset();
@@ -1854,9 +1865,9 @@ static void case_secoc_a_forged_response_establishes_nothing(void)
     memset(resp, 0x5A, sizeof resp);
     feed_frame(SESSION_CAN_ID_RESPONSE, resp, FDCAN_DLC_BYTES_16, 101);
 
-    CHECK(imgSession.state != RAMN_SECOC_SESSION_OK, "no session is established");
+    CHECK(RAMN_SecOC_LINK_Ready() == 0, "no session is established");
     CHECK(last_frame(SESSION_CAN_ID_CONFIRM) == NULL, "and nothing is confirmed");
-    CHECK(kfMacFails == 1, "the attempt is counted");
+    CHECK(RAMN_SecOC_LINK_FailedCount() == 1, "the attempt is counted");
 }
 
 static void case_secoc_a_handshake_cannot_tear_down_a_live_session(void)
@@ -1864,13 +1875,14 @@ static void case_secoc_a_handshake_cannot_tear_down_a_live_session(void)
     h_case_begin("an unauthenticated handshake cannot disturb an established session");
     reset_state();                     /* establishes a session */
     uint8_t liveKey[RAMN_SECOC_KEY_BYTES];
-    memcpy(liveKey, imgSession.key, sizeof liveKey);
+    memcpy(liveKey, RAMN_SecOC_LINK_Key(), sizeof liveKey);
 
     /* SESSION_REQ and SESSION_CHALLENGE cannot be authenticated -- agreeing a
        key is what makes authentication possible -- so anyone may send them.
        That is only safe if the live session is untouched until a response
-       actually verifies. */
-    challengeSent = False;
+       actually verifies. Note there is no reset here: adopting a session
+       clears the request rate limit, so the handshake below starts on its
+       own -- which is exactly the situation being tested. */
     uint8_t req[4] = {0, 0, 0, 0};
     feed_frame(SESSION_CAN_ID_REQ, req, FDCAN_DLC_BYTES_4, 400);
 
@@ -1878,8 +1890,8 @@ static void case_secoc_a_handshake_cannot_tear_down_a_live_session(void)
     memset(resp, 0xA5, sizeof resp);
     feed_frame(SESSION_CAN_ID_RESPONSE, resp, FDCAN_DLC_BYTES_16, 401);
 
-    CHECK(imgSession.state == RAMN_SECOC_SESSION_OK, "the session is still up");
-    CHECK(memcmp(imgSession.key, liveKey, sizeof liveKey) == 0, "under the same key");
+    CHECK(RAMN_SecOC_LINK_Ready() == 1, "the session is still up");
+    CHECK(memcmp(RAMN_SecOC_LINK_Key(), liveKey, sizeof liveKey) == 0, "under the same key");
 
     /* And it still works. */
     fake_screen_reset();
@@ -1919,10 +1931,10 @@ static void case_secoc_a_rekey_retires_the_previous_session(void)
     /* Now ECU A reboots and re-handshakes -- the case a RAM-resident freshness
        counter cannot cover on its own, because the counter is forgotten. */
     uint8_t oldKey[RAMN_SECOC_KEY_BYTES];
-    memcpy(oldKey, imgSession.key, sizeof oldKey);
+    memcpy(oldKey, RAMN_SecOC_LINK_Key(), sizeof oldKey);
     no_session();
     establish_session(600);
-    CHECK(memcmp(imgSession.key, oldKey, sizeof oldKey) != 0,
+    CHECK(memcmp(RAMN_SecOC_LINK_Key(), oldKey, sizeof oldKey) != 0,
           "the new session has a different key");
 
     /* Replay the recording, byte for byte. Its authenticators are genuine --
@@ -1942,9 +1954,9 @@ static void case_secoc_the_session_key_is_not_the_root_key(void)
 {
     h_case_begin("the provisioned key does no per-frame work");
     reset_state();
-    CHECK(memcmp(imgSession.key, RAMN_SecOC_KEYS_GetImageKey(), RAMN_SECOC_KEY_BYTES) != 0,
+    CHECK(memcmp(RAMN_SecOC_LINK_Key(), RAMN_SecOC_KEYS_GetImageKey(), RAMN_SECOC_KEY_BYTES) != 0,
           "the session key differs from the provisioned root");
-    CHECK(memcmp(test_session_key, imgSession.key, RAMN_SECOC_KEY_BYTES) == 0,
+    CHECK(memcmp(test_session_key, RAMN_SecOC_LINK_Key(), RAMN_SECOC_KEY_BYTES) == 0,
           "and both ends derived the same one independently");
 }
 

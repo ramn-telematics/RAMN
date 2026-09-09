@@ -175,12 +175,11 @@ void RAMN_SCREENMANAGER_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
 {
 	RAMN_Bool_t handled = False;
 
-	// Route image streaming CAN IDs directly to ScreenImage, whatever screen is
-	// currently showing. The range now runs past the image messages to the
-	// SecOC session handshake (0x307-0x30A): a session has to be able to be
-	// established while the user is on some other screen, or the first
-	// keyframe after boot arrives with nowhere to be verified.
-	if (pHeader->Identifier >= IMG_CAN_ID_START && pHeader->Identifier <= SESSION_CAN_ID_CONFIRM &&
+	// Route image streaming CAN IDs (0x300-0x306) directly to ScreenImage.
+	// The SecOC session handshake is NOT in this range on purpose: a session
+	// between two ECUs is not a screen's business, and it is dispatched from
+	// main.c beside the other ProcessRxCANMessage handlers. See ramn_secoc_link.h.
+	if (pHeader->Identifier >= IMG_CAN_ID_START && pHeader->Identifier <= DELTA_CAN_ID_FRAME_END &&
 	    pHeader->IdType == FDCAN_STANDARD_ID &&
 	    pHeader->RxFrameType == FDCAN_DATA_FRAME)
 	{

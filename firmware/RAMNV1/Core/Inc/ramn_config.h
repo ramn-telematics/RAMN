@@ -432,6 +432,16 @@
 // in flight, so the worst case is wasted frames.
 #define SESSION_REQ_INTERVAL_MS   200U
 #define SESSION_PENDING_TIMEOUT_MS 1000U
+
+// Which half of the handshake this ECU performs. Exactly one, and only the
+// messages that role RECEIVES are compiled -- a verifier that also answered
+// SESSION_CHALLENGE would hand anyone on the bus a transcript-MAC oracle.
+#if defined(ENABLE_SCREEN)
+#define SECOC_LINK_ROLE_VERIFIER   // receives protected traffic, answers challenges
+#endif
+#if defined(ENABLE_TELEMATICS)
+#define SECOC_LINK_ROLE_SENDER     // sends protected traffic, asks for sessions
+#endif
 #endif
 
 #ifdef ENABLE_IMAGE_SECOC

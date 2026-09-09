@@ -21,8 +21,7 @@
 #ifdef ENABLE_IMAGE_SECOC
 #include "ramn_secoc.h"
 #include "ramn_secoc_keys.h"
-#include "ramn_secoc_session.h"
-#include "ramn_trng.h"
+#include "ramn_secoc_link.h"
 #endif
 #include <stdio.h>
 
@@ -324,16 +323,11 @@ static void PrintImageACKLatency(void);
 // frames draw from the same counter, so a recorded delta frame cannot be
 // replayed into the place of a later keyframe.
 // ============================================================================
-// The ESTABLISHED session. Zero-initialised by C, which is exactly
-// RAMN_SECOC_SESSION_NONE: no key, and nothing may be streamed until ECU A has
-// confirmed a handshake.
-static RAMN_SecOC_Session_t imgSession;
-
-// The session being negotiated. Kept apart from the live one for the same
-// reason as on ECU A: a handshake that does not complete must cost nothing.
-static RAMN_SecOC_Session_t imgPending;
-static uint32_t             lastSessionReqTick = 0U;
-static RAMN_Bool_t          sessionReqSent     = False;
+// The session -- key, freshness domain and handshake -- belongs to
+// ramn_secoc_link.c, dispatched from main.c as a peer of this module's own
+// ProcessRxCANMessage. It used to live here, which meant the frame builder and
+// nonce draw existed a second time in ramn_screen_image.c for ECU A's half of
+// the same exchange.
 
 // Image messages from the ESP32 dropped because no session was up. Reported in
 // the periodic SPI stats so a link that never handshakes is visible on UART
@@ -345,6 +339,9 @@ static uint32_t             noSessionDrops = 0U;
 // bytes carrying freshness of its own -- only the frame's opening message
 // (0x300 / 0x304) transmits it.
 static uint32_t imgCurrentFv = 0U;
+
+// Which session imgCurrentFv belongs to; see the note on ECU A's kfSessionGen.
+static uint32_t imgSessionGen = 0U;
 
 // Writes the authenticator into the LAST IMG_SECOC_MAC_BYTES of a frame that
 // is dlcLen bytes on the wire, over everything before it.
@@ -359,10 +356,10 @@ static void SecOCTagFrame(uint32_t canId, uint8_t* data, uint8_t dlcLen, uint32_
 	RAMN_SecOC_Ctx_t ctx;
 	ctx.dataId = (uint16_t)canId;
 	ctx.macLen = IMG_SECOC_MAC_BYTES;
-	// The SESSION key, never the provisioned root. The root is spent once, in
-	// the handshake, and does no per-frame work.
-	ctx.key    = imgSession.key;
-	ctx.fv     = &imgSession.fv;
+	// The SESSION key, never the provisioned root. The root is spent once, on
+	// the handshake in ramn_secoc_link.c, and does no per-frame work.
+	ctx.key    = RAMN_SecOC_LINK_Key();
+	ctx.fv     = RAMN_SecOC_LINK_Freshness();
 
 	uint8_t authLen = (uint8_t)(dlcLen - IMG_SECOC_MAC_BYTES);
 	RAMN_SecOC_ComputeMac(&ctx, fv, data, authLen, &data[authLen]);
@@ -372,129 +369,20 @@ static void SecOCTagFrame(uint32_t canId, uint8_t* data, uint8_t dlcLen, uint32_
 // returns the full value the frame's chunks will be authenticated under.
 static uint32_t SecOCBeginFrame(uint8_t* data, uint8_t off)
 {
-	uint32_t fv = RAMN_SecOC_TxFreshness(&imgSession.fv);
+	uint32_t fv = RAMN_SecOC_TxFreshness(RAMN_SecOC_LINK_Freshness());
 	data[off]      = (uint8_t)((fv >> 8) & 0xFFU);
 	data[off + 1U] = (uint8_t)( fv       & 0xFFU);
 	return fv;
 }
 
-// ---------------------------------------------------------------------------
-// SESSION HANDSHAKE -- ECU D side, the initiator
-//
-//   D -> A  0x307  SESSION_REQ        (unauthenticated: it has to be)
-//   A -> D  0x308  SESSION_CHALLENGE  nonce_A
-//   D -> A  0x309  SESSION_RESPONSE   nonce_D | MAC_root(nonce_A | nonce_D)
-//   A -> D  0x30A  SESSION_CONFIRM             MAC_root(nonce_D | nonce_A)
-// ---------------------------------------------------------------------------
-static void SendSessionFrame(uint32_t canId, const uint8_t* payload, uint32_t dlc)
-{
-	FDCAN_TxHeaderTypeDef h;
-	h.Identifier          = canId;
-	h.IdType              = FDCAN_STANDARD_ID;
-	h.TxFrameType         = FDCAN_DATA_FRAME;
-	h.DataLength          = dlc;
-	h.BitRateSwitch       = FDCAN_BRS_OFF;
-	h.FDFormat            = FDCAN_FD_CAN;
-	h.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-	h.MessageMarker       = 0U;
-	h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-	RAMN_FDCAN_SendMessage(&h, payload);
-}
-
-// 1 when there is a session to stream under. When there is not, ask for one --
-// rate limited, because this runs on every image message the ESP32 offers and
-// those arrive every millisecond while streaming.
-static uint8_t SecOCEnsureSession(void)
-{
-	if (imgSession.state == RAMN_SECOC_SESSION_OK) return 1U;
-
-	uint32_t now = xTaskGetTickCount();
-	if ((sessionReqSent == False) ||
-	    ((now - lastSessionReqTick) >= (uint32_t)SESSION_REQ_INTERVAL_MS))
-	{
-		uint8_t req[4];
-		RAMN_memset(req, 0, sizeof(req));
-		SendSessionFrame(SESSION_CAN_ID_REQ, req, FDCAN_DLC_BYTES_4);
-		lastSessionReqTick = now;
-		sessionReqSent     = True;
-	}
-	noSessionDrops++;
-	return 0U;
-}
-
-// ECU A challenged us. Answer with our own nonce and a MAC over both, proving
-// we hold the provisioned key.
-static void HandleSessionChallenge(const uint8_t* data, uint8_t dlcLen)
-{
-	if (dlcLen < RAMN_SECOC_NONCE_BYTES) return;
-
-	RAMN_SecOC_SESSION_Reset(&imgPending);
-	for (uint8_t i = 0U; i < RAMN_SECOC_NONCE_BYTES; i++) imgPending.nonceA[i] = data[i];
-	for (uint8_t i = 0U; i < RAMN_SECOC_NONCE_BYTES; i += 4U)
-	{
-		uint32_t r = RAMN_RNG_Pop32();
-		imgPending.nonceD[i]      = (uint8_t)( r        & 0xFFU);
-		imgPending.nonceD[i + 1U] = (uint8_t)((r >>  8) & 0xFFU);
-		imgPending.nonceD[i + 2U] = (uint8_t)((r >> 16) & 0xFFU);
-		imgPending.nonceD[i + 3U] = (uint8_t)((r >> 24) & 0xFFU);
-	}
-	imgPending.state = RAMN_SECOC_SESSION_PENDING;
-
-	uint8_t resp[RAMN_SECOC_NONCE_BYTES + RAMN_SECOC_SESSION_MAC_BYTES];
-	for (uint8_t i = 0U; i < RAMN_SECOC_NONCE_BYTES; i++) resp[i] = imgPending.nonceD[i];
-	RAMN_SecOC_SESSION_Mac(RAMN_SecOC_KEYS_GetImageKey(),
-	                       (uint16_t)SESSION_CAN_ID_RESPONSE,
-	                       imgPending.nonceA, imgPending.nonceD,
-	                       &resp[RAMN_SECOC_NONCE_BYTES]);
-	SendSessionFrame(SESSION_CAN_ID_RESPONSE, resp, FDCAN_DLC_BYTES_16);
-}
-
-// ECU A confirmed. Verifying this is what stops an attacker posing as ECU A
-// from leaving us streaming under a key the real ECU A does not hold -- they
-// could not read the pictures either way, but they could deny the link.
-static void HandleSessionConfirm(const uint8_t* data, uint8_t dlcLen)
-{
-	if (dlcLen < RAMN_SECOC_SESSION_MAC_BYTES) return;
-	if (imgPending.state != RAMN_SECOC_SESSION_PENDING) return;
-
-	if (RAMN_SecOC_SESSION_CheckMac(RAMN_SecOC_KEYS_GetImageKey(),
-	                                (uint16_t)SESSION_CAN_ID_CONFIRM,
-	                                imgPending.nonceD, imgPending.nonceA, data) == 0U)
-	{
-		RAMN_SecOC_SESSION_Reset(&imgPending);
-		return;
-	}
-
-	RAMN_SecOC_SESSION_Derive(&imgPending, RAMN_SecOC_KEYS_GetImageKey());
-	RAMN_SecOC_SESSION_Adopt(&imgPending);
-	imgSession     = imgPending;
-	imgCurrentFv   = 0U;
-	sessionReqSent = False;
-	RAMN_SecOC_SESSION_Reset(&imgPending);
-}
-
-// Drops the session so the next image message re-handshakes. Called when ECU A
-// stops acknowledging: the most likely cause is that ECU A rebooted and no
-// longer holds the key we are streaming under, and it cannot tell us so --
-// every message it could send us would itself need a session.
-static void SecOCDropSession(void)
-{
-	RAMN_SecOC_SESSION_Reset(&imgSession);
-	RAMN_SecOC_SESSION_Reset(&imgPending);
-	sessionReqSent = False;
-}
 #endif
 
 void RAMN_TELEMATICS_Init(uint32_t tick)
 {
 #ifdef ENABLE_IMAGE_SECOC
-	// No session at startup, so nothing streams until ECU A has answered a
-	// handshake. Freshness counters live inside the session and start at zero
-	// with it -- they can, because each session has its own key.
-	RAMN_SecOC_SESSION_Reset(&imgSession);
-	RAMN_SecOC_SESSION_Reset(&imgPending);
-	sessionReqSent = False;
-	imgCurrentFv   = 0U;
+	// The session itself is initialised in main.c with the rest of the SecOC
+	// modules; this only clears what belongs to the stream.
+	imgCurrentFv = 0U;
 #endif
 
 	// Initialize TX buffers
@@ -1101,7 +989,17 @@ static void ProcessESP32Response(void)
 		    (msgType == RAMN_MSG_TYPE_IMG_END)   || (msgType == RAMN_MSG_TYPE_IMG_ABORT) ||
 		    (msgType == RAMN_MSG_TYPE_DELTA_FRAME) || (msgType == RAMN_MSG_TYPE_DELTA_FRAME_END))
 		{
-			if (SecOCEnsureSession() == 0U) continue;
+			if (RAMN_SecOC_LINK_EnsureSession(xTaskGetTickCount()) == 0U)
+			{
+				noSessionDrops++;
+				continue;
+			}
+			// A new session restarts its freshness counters, so the frame
+			// freshness cached from the previous one must go with it.
+			{
+				uint32_t gen = RAMN_SecOC_LINK_Generation();
+				if (gen != imgSessionGen) { imgSessionGen = gen; imgCurrentFv = 0U; }
+			}
 		}
 #endif
 
@@ -1401,22 +1299,13 @@ void RAMN_TELEMATICS_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, c
 	}
 
 #ifdef ENABLE_IMAGE_SECOC
-	// The two halves of the handshake that ECU A sends. Handled here rather
-	// than forwarded to the ESP32: the session is between the two STM32s and
-	// the add-on board has no part in it.
-	if ((pHeader->IdType == FDCAN_STANDARD_ID) && (pHeader->RxFrameType == FDCAN_DATA_FRAME))
-	{
-		if (pHeader->Identifier == SESSION_CAN_ID_CHALLENGE)
-		{
-			HandleSessionChallenge(data, DLCtoUINT8(pHeader->DataLength));
-			return;
-		}
-		if (pHeader->Identifier == SESSION_CAN_ID_CONFIRM)
-		{
-			HandleSessionConfirm(data, DLCtoUINT8(pHeader->DataLength));
-			return;
-		}
-	}
+	// The handshake messages are RAMN_SecOC_LINK_ProcessRxCANMessage's, called
+	// from main.c beside this function. They are still swallowed here so they
+	// are not forwarded to the ESP32: the session is between the two STM32s
+	// and the add-on board has no part in it.
+	if ((pHeader->IdType == FDCAN_STANDARD_ID) &&
+	    (pHeader->Identifier >= SESSION_CAN_ID_REQ) &&
+	    (pHeader->Identifier <= SESSION_CAN_ID_CONFIRM)) return;
 #endif
 
 	uint8_t msgBuf[73];  // MsgLen + Start + ID(4) + Len + Flags + Data(64 max) + Checksum
@@ -1723,7 +1612,7 @@ static void UpdateStreamTimeouts(void)
 			// tell us so -- anything it sent would itself need a session -- so
 			// the timeout is the signal. Drop the session and the next image
 			// message re-handshakes.
-			SecOCDropSession();
+			RAMN_SecOC_LINK_Drop();
 #endif
 		}
 	}

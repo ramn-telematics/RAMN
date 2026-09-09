@@ -52,6 +52,7 @@
 #include "ramn_crc.h"
 #ifdef ENABLE_IMAGE_SECOC
 #include "ramn_secoc_keys.h"
+#include "ramn_secoc_link.h"
 #endif
 #if defined(ENABLE_DIAG)
 #include "ramn_diag.h"
@@ -536,6 +537,7 @@ int main(void)
 	// After the EEPROM layer, which is where a provisioned key lives, and
 	// before any image traffic can be sent or verified.
 	RAMN_SecOC_KEYS_Init();
+	RAMN_SecOC_LINK_Init();
 #endif
 
 #if defined(ENABLE_DIAG)
@@ -1596,6 +1598,12 @@ void RAMN_ReceiveCANFunc(void *argument)
 #endif
 #if defined(ENABLE_SCREEN)
 				RAMN_SCREENMANAGER_ProcessRxCANMessage(&CANRxHeader, CANRxData, xTaskGetTickCount());
+#endif
+#ifdef ENABLE_IMAGE_SECOC
+				// The SecOC session between this ECU and its peer. A peer of
+				// the handlers above, not a client of any of them: the
+				// association outlives any one screen or stream.
+				RAMN_SecOC_LINK_ProcessRxCANMessage(&CANRxHeader, CANRxData, xTaskGetTickCount());
 #endif
 			}
 #ifdef RTR_DEMO_ID
