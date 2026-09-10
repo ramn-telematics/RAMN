@@ -189,11 +189,23 @@ void RAMN_SCREENMANAGER_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader
 	}
 
 	// Check for registration code trigger (similar to how UDS/CHIP8 are triggered externally)
+	//
+	// Shape only. Whether the frame is AUTHENTIC is decided inside the regcode
+	// screen, which owns the freshness domain it has to be judged against.
+	// What this gate guarantees is that the handler may read every byte the
+	// layout in ramn_config.h names: with SecOC the frame is CAN FD and carries
+	// the freshness value and authenticator behind the code, so a short or
+	// classic frame is not this message and must not reach a handler that will
+	// index past it.
 	if (!handled && (pHeader->Identifier == REGCODE_CAN_ID) &&
 	    (pHeader->IdType == FDCAN_STANDARD_ID) &&
+#ifdef ENABLE_REGCODE_SECOC
+	    (pHeader->FDFormat == FDCAN_FD_CAN) &&
+#else
 	    (pHeader->FDFormat == FDCAN_CLASSIC_CAN) &&
+#endif
 	    (pHeader->RxFrameType == FDCAN_DATA_FRAME) &&
-	    (pHeader->DataLength >= FDCAN_DLC_BYTES_4))
+	    (DLCtoUINT8(pHeader->DataLength) >= REGCODE_CAN_FRAME_BYTES))
 	{
 		if (data != NULL) {
 			// Call the regcode screen's handler directly

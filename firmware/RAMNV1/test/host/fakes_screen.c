@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "main.h"
+#include "ramn_screen_utils.h"
 #include "fakes_screen.h"
 
 uint8_t  fake_panel[FAKE_PANEL_W * FAKE_PANEL_H * 2];
@@ -38,6 +39,8 @@ void fake_screen_reset(void)
     win_w = FAKE_PANEL_W; win_h = FAKE_PANEL_H;
     win_pos = 0;
     fake_screen_on_write = NULL;
+    fake_large_chars[0] = '\0';
+    fake_large_char_count = 0;
 }
 
 void RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len)
@@ -86,6 +89,24 @@ void RAMN_SPI_Init(SPI_HandleTypeDef* h, void* t) { (void)h; (void)t; }
 void RAMN_SPI_InitScreen(void) {}
 void RAMN_SPI_DrawRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c)
 { (void)x;(void)y;(void)w;(void)h;(void)c; }
+char fake_large_chars[FAKE_LARGE_CHARS_MAX + 1];
+int  fake_large_char_count;
+
+void RAMN_SPI_DrawLargeChar(uint16_t x, uint16_t y, uint16_t f, uint16_t b, uint8_t chr, uint8_t scale)
+{
+    (void)x; (void)y; (void)f; (void)b; (void)scale;
+    if (fake_large_char_count < FAKE_LARGE_CHARS_MAX)
+        fake_large_chars[fake_large_char_count++] = (char)chr;
+    fake_large_chars[fake_large_char_count] = '\0';
+}
+
+void RAMN_SPI_RefreshString(uint16_t x, uint16_t y, uint16_t f, uint16_t b, const char* s)
+{ (void)x; (void)y; (void)f; (void)b; (void)s; }
+
+volatile ColorTheme_t RAMN_SCREENUTILS_COLORTHEME;
+void RAMN_SCREENUTILS_DrawBase(void) {}
+void RAMN_SCREENUTILS_DrawSubconsoleUpdate(void) {}
+
 void RAMN_SPI_DrawString(uint16_t x, uint16_t y, uint16_t f, uint16_t b, const char* s)
 { (void)x;(void)y;(void)f;(void)b;(void)s; }
 

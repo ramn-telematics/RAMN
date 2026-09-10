@@ -401,6 +401,14 @@
 #define SESSION_CAN_ID_RESPONSE   0x309U  // ECU D -> ECU A, nonce_D + MAC
 #define SESSION_CAN_ID_CONFIRM    0x30AU  // ECU A -> ECU D, MAC
 
+// Registration code (one-time passcode) — ECU D → ECU A.
+//
+// Lives here rather than in ramn_screen_regcode.h because it is no longer a
+// screen's private business: ECU D builds and protects this frame, and
+// ramn_screen_regcode.h is compiled only where ENABLE_SCREEN is, which is not
+// ECU D. One definition, both ends.
+#define REGCODE_CAN_ID            0x7A0U  // One-time code (CAN-FD once protected)
+
 // SecOC on the image stream --------------------------------------------------
 //
 // Authenticates every image message so that only the ECU holding the shared
@@ -470,6 +478,58 @@
 // 0x305 delta tile chunk: [X][Y][SIZE][SEQ][LEN][MAC...][RLE...]
 #define DELTA_CAN_HEADER_BYTES   (5U + IMG_SECOC_MAC_BYTES)
 #define DELTA_CAN_CHUNK_PAYLOAD  (64U - DELTA_CAN_HEADER_BYTES)
+
+// SecOC on the registration code ---------------------------------------------
+//
+// The one-time code that 0x7A0 carries is shown full screen on ECU A for ten
+// seconds and is meant to prove that whoever reads it is looking at THIS
+// vehicle right now. Unauthenticated, it proves nothing: anyone on the bus can
+// put six digits of their choosing in front of the driver, and anyone who
+// recorded a genuine code can show it again later. Both of those are the
+// problem SecOC exists for, so the message is protected exactly as the image
+// stream is -- same session, same key, same freshness discipline.
+//
+// It rides on the session ramn_secoc_link.c already negotiates for the image
+// stream, so it cannot be enabled on its own. If the two ever need to be
+// separable, what has to split is the link's ENABLE_IMAGE_SECOC guard, not
+// this flag.
+#ifdef ENABLE_IMAGE_SECOC
+#define ENABLE_REGCODE_SECOC
+#endif
+
+// The authentic payload: the 32-bit code, little-endian, byte for byte what
+// the pre-SecOC message carried in the same place. Only the bytes AFTER it
+// change, so an ESP32 that knows nothing about SecOC keeps sending the frame
+// it always sent and ECU D protects it on the way past.
+#define REGCODE_CAN_PAYLOAD_BYTES  4U
+
+#ifdef ENABLE_REGCODE_SECOC
+// Freshness bits on the wire. Unlike an image chunk, this message has no
+// opening frame to inherit freshness from -- each one stands alone, so each
+// one carries its own. 16 bits is the same width the image stream uses and,
+// on a message sent a handful of times a session, nowhere near its period.
+#define REGCODE_SECOC_FV_TRUNC_BITS 16U
+
+// Truncated authenticator. Six bytes rather than the image stream's four, and
+// the reason is that nothing here is competing for room: 4 code + 2 freshness
+// + 6 authenticator is exactly 12 bytes, the smallest CAN FD length that holds
+// them. Taking four would put two padding bytes on the bus instead, so the
+// authenticator is sized to fill the frame rather than be padded to it. The
+// image stream's four is what its 64-byte chunk arithmetic left over
+// (IMG_CHUNK_SPI_MSG_LEN in ramn_telematics.c); this one has no such budget.
+#define REGCODE_SECOC_MAC_BYTES     6U
+
+// Where the freshness field sits, and how long the frame is on the wire.
+//   [CODE0..3][FV_HI][FV_LO][MAC0..5]
+#define REGCODE_SECOC_FV_OFFSET    REGCODE_CAN_PAYLOAD_BYTES
+#define REGCODE_CAN_FRAME_BYTES    (REGCODE_CAN_PAYLOAD_BYTES + 2U + REGCODE_SECOC_MAC_BYTES)
+#else
+#define REGCODE_SECOC_FV_TRUNC_BITS 0U
+#define REGCODE_SECOC_MAC_BYTES     0U
+// Pre-SecOC layout: four code bytes and four unused. Kept at eight so a
+// build with SecOC off is byte-for-byte the message that shipped before it.
+#define REGCODE_CAN_FRAME_BYTES     8U
+#endif
 
 // Check for bad configurations --------------------------------------
 

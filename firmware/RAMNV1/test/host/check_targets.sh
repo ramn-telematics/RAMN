@@ -15,7 +15,7 @@ cd "$(dirname "$0")"
 
 CORE=../../Core
 INC="-Istubs -I. -I$CORE/Inc -I$CORE/Src"
-MODULES="ramn_screen_image.c ramn_telematics.c"
+MODULES="ramn_screen_image.c ramn_telematics.c ramn_screen_regcode.c"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 status=0
 
@@ -173,7 +173,17 @@ fi
 # module and is dispatched from main.c as its own top-level handler. It no
 # longer pays for SCREENIMAGE_ProcessRxCANMessage's frame on the way in, which
 # is worth measuring: that nesting is what put it over budget before.
-SECOC_CHAINS="SCREENIMAGE_ProcessRxCANMessage,SecOCOpenFrame,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Update,blake2s_compress
+# SCREENREGCODE_ProcessRxCANMessage verifies inline rather than through a
+# helper, and is measured for the same reason the image chain is: the image one
+# already sits within twenty bytes of the budget, so "one more frame" on this
+# task is not free. Note this chain is one level SHORT of the real one --
+# RAMN_SCREENMANAGER_ProcessRxCANMessage calls it, and that module cannot be
+# compiled here (it reaches the DBC, joystick and sensor headers, and from
+# there the HAL). Its frame is small and it declares no buffers; if that ever
+# stops being true, this number stops covering the real depth.
+SECOC_CHAINS="SCREENREGCODE_ProcessRxCANMessage,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Update,blake2s_compress
+SCREENREGCODE_ProcessRxCANMessage,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Final,blake2s_compress
+SCREENIMAGE_ProcessRxCANMessage,SecOCOpenFrame,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Update,blake2s_compress
 SCREENIMAGE_ProcessRxCANMessage,SecOCCheckFrame,RAMN_SecOC_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Final,blake2s_compress
 RAMN_SecOC_LINK_ProcessRxCANMessage,HandleSessionResponse,RAMN_SecOC_SESSION_CheckMac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Update,blake2s_compress
 RAMN_SecOC_LINK_ProcessRxCANMessage,HandleSessionResponse,RAMN_SecOC_SESSION_Mac,RAMN_SecOC_ComputeMac,RAMN_BLAKE2S_Final,blake2s_compress
@@ -181,7 +191,7 @@ RAMN_SecOC_LINK_ProcessRxCANMessage,HandleSessionResponse,RAMN_SecOC_SESSION_Der
 
 echo "stack budgets, SecOC verify chain (CAN RX task: ${PERIODIC_STACK}B total)"
 su_s="$TMP/stack_secoc.su"
-if ! measure_stack_multi TARGET_ECUA "$su_s" ramn_screen_image.c ramn_secoc_link.c ramn_secoc.c ramn_secoc_session.c ramn_blake2s.c; then
+if ! measure_stack_multi TARGET_ECUA "$su_s" ramn_screen_image.c ramn_screen_regcode.c ramn_secoc_link.c ramn_secoc.c ramn_secoc_session.c ramn_blake2s.c; then
     echo "  could not measure stack usage -- skipped"
 else
     while IFS= read -r chain; do

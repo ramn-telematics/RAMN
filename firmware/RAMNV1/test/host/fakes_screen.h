@@ -31,4 +31,12 @@ extern int     fake_panel_oob;    /* writes that ran past the current window */
    interleaving, and it is exactly where the frame-boundary races live. */
 extern void (*fake_screen_on_write)(void);
 
+/* The regcode screen's assertion surface. Its output is not a bitmap but six
+   large characters, so the fake records the characters RAMN_SPI_DrawLargeChar
+   is handed, in order -- which is exactly the code a person standing in front
+   of the panel would read off it. */
+#define FAKE_LARGE_CHARS_MAX 32
+extern char fake_large_chars[FAKE_LARGE_CHARS_MAX + 1];
+extern int  fake_large_char_count;
+
 void fake_screen_reset(void);

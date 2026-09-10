@@ -63,6 +63,28 @@ Buffer A (1024 bytes)    Buffer B (1024 bytes)
 - **DATA**: 0-64 bytes of CAN payload
 - **CHECKSUM**: XOR of all bytes from START through DATA
 
+### One identifier is not relayed verbatim: 0x7A0
+
+A CAN frame the ESP32 sends in this format is put on the vehicle bus exactly as
+described above — with one exception. `REGCODE_CAN_ID` (0x7A0) carries the
+one-time registration code that ECU A shows full screen, and ECU D
+authenticates it on the way past rather than relaying it:
+
+```
+ESP32 -> ECU D  (SPI, unchanged)   [CODE0..3][unused 4]              8 bytes, classic
+ECU D -> ECU A  (CAN)              [CODE0..3][FV_HI][FV_LO][MAC0..5] 12 bytes, CAN FD
+```
+
+The code bytes are untouched, so the ESP32 needs no knowledge of this. What
+changes is on the vehicle bus: the frame is CAN FD and 12 bytes long, and it
+carries a SecOC freshness value and a 6-byte authenticator computed under the
+session key ECU D and ECU A negotiate (`ramn_secoc_link.h`). ECU D **fails
+closed** — with no session the code is dropped, not sent in the clear.
+
+Anything on the bus that consumed the old 8-byte classic frame needs updating;
+anything that produces 0x7A0 over this SPI link does not. See the SecOC section
+of `ramn_config.h` for the layout and why it is sized the way it is.
+
 ### Efficiency
 - Standard CAN (8 bytes): 16 bytes total → **50% efficiency** (vs 13.6% with ASCII)
 - CAN-FD (64 bytes): 72 bytes total → **88.9% efficiency**

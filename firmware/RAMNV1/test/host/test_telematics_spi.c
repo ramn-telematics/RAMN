@@ -54,6 +54,12 @@ static size_t build_idle_response(uint8_t *out)
  * ECU D fails closed: without this, every image message from the ESP32 is
  * dropped and a SESSION_REQ goes out instead, which is the correct behaviour
  * and makes every streaming fixture below assert on an empty bus. */
+/* The session key, derived here from the two nonces rather than read out of
+   ECU D's own session. Reading it back would make every MAC assertion below
+   agree with the implementation by construction; deriving it independently is
+   what makes them say something. */
+static uint8_t ecud_session_key[RAMN_SECOC_KEY_BYTES];
+
 static void establish_session_ecud(void)
 {
     uint8_t nonceA[RAMN_SECOC_NONCE_BYTES];
@@ -80,6 +86,13 @@ static void establish_session_ecud(void)
                            nonceD, nonceA, confirm);
     h.Identifier = SESSION_CAN_ID_CONFIRM;
     RAMN_SecOC_LINK_ProcessRxCANMessage(&h, confirm, 0);
+
+    RAMN_SecOC_Session_t mine;
+    RAMN_SecOC_SESSION_Reset(&mine);
+    memcpy(mine.nonceA, nonceA, RAMN_SECOC_NONCE_BYTES);
+    memcpy(mine.nonceD, nonceD, RAMN_SECOC_NONCE_BYTES);
+    RAMN_SecOC_SESSION_Derive(&mine, RAMN_SecOC_KEYS_GetImageKey());
+    memcpy(ecud_session_key, mine.key, RAMN_SECOC_KEY_BYTES);
 }
 #endif
 
@@ -517,6 +530,196 @@ static void case_secoc_ecud_rekeys_when_ecua_goes_silent(void)
 }
 #endif
 
+#ifdef ENABLE_REGCODE_SECOC
+/* ------------------------------------------------------------------ */
+/* The registration code (0x7A0) on its way out of ECU D                */
+/* ------------------------------------------------------------------ */
+
+/* Verifies a captured 0x7A0 frame the way ECU A does, under an independently
+   derived session key. Returns the freshness value it verified at, or 0 if
+   nothing verified in the plausible range.
+
+   Searching a small range rather than being told the value is deliberate: the
+   test should not have to model ECU D's counter to assert that the frame is
+   authentic, and a search that finds exactly one match says the transmitted
+   truncated value and the value the MAC was computed over are the same number
+   -- which is the property that breaks if either end changes its mind about
+   where the freshness field sits. */
+static uint32_t regcode_verify(const CapturedFrame_t *c)
+{
+    RAMN_SecOC_Ctx_t ctx;
+    RAMN_SecOC_Freshness_t fv;
+    RAMN_SecOC_FreshnessInit(&fv);
+    ctx.dataId = (uint16_t)REGCODE_CAN_ID;
+    ctx.macLen = REGCODE_SECOC_MAC_BYTES;
+    ctx.key    = ecud_session_key;
+    ctx.fv     = &fv;
+
+    uint8_t authLen = (uint8_t)(REGCODE_CAN_FRAME_BYTES - REGCODE_SECOC_MAC_BYTES);
+    uint32_t trunc = ((uint32_t)c->data[REGCODE_SECOC_FV_OFFSET] << 8) |
+                      (uint32_t)c->data[REGCODE_SECOC_FV_OFFSET + 1];
+
+    /* The full value's low 16 bits are what is on the wire, so only the high
+       half is unknown; a handful of periods is far more than any test here
+       advances the counter by. */
+    for (uint32_t hi = 0; hi < 4; hi++) {
+        uint32_t full = (hi << 16) | trunc;
+        if (RAMN_SecOC_CheckMac(&ctx, full, c->data, authLen, &c->data[authLen]))
+            return full;
+    }
+    return 0;
+}
+
+static size_t build_regcode_response(uint8_t *out, uint32_t code)
+{
+    uint8_t body[8] = {
+        (uint8_t)(code), (uint8_t)(code >> 8), (uint8_t)(code >> 16), (uint8_t)(code >> 24),
+        0, 0, 0, 0
+    };
+    return build_can_response(out, REGCODE_CAN_ID, body, 8, 0x00);
+}
+
+static void case_secoc_regcode_is_authenticated_on_its_way_to_ecua(void)
+{
+    h_case_begin("the registration code leaves ECU D authenticated, not relayed");
+
+    RAMN_SecOC_LINK_Init();
+    RAMN_TELEMATICS_Init(0);
+
+    uint8_t msg[24];
+    size_t  n = build_regcode_response(msg, 123456);
+    feed(msg, n);
+
+    CapturedFrame_t *c = tx_with_id(REGCODE_CAN_ID);
+    if (!CHECK_OK(c != NULL, "the code reaches the bus")) return;
+
+    /* The code itself is untouched: an ESP32 that knows nothing about SecOC
+       keeps sending the frame it always sent. */
+    CHECK(c->data[0] == 0x40 && c->data[1] == 0xE2 && c->data[2] == 0x01 && c->data[3] == 0x00,
+          "the six-digit code survives in bytes 0..3, little-endian");
+    CHECK(c->len == REGCODE_CAN_FRAME_BYTES, "the frame grew to carry freshness and a MAC");
+    CHECK(c->header.FDFormat == FDCAN_FD_CAN, "which needs CAN FD");
+    CHECK(c->header.IdType == FDCAN_STANDARD_ID, "still a standard identifier");
+    CHECK(regcode_verify(c) != 0, "and the authenticator verifies under the session key");
+}
+
+static void case_secoc_regcode_fails_closed(void)
+{
+    h_case_begin("with no session, no registration code goes on the bus at all");
+
+    /* The failure mode that matters. Sending it unprotected "just this once"
+       would mean a receiver has to accept unauthenticated codes, and a
+       receiver that accepts one accepts every one. */
+    RAMN_SecOC_LINK_Init();
+    RAMN_TELEMATICS_Init(0);
+    regNoSessionDrops = 0;
+
+    uint8_t msg[24];
+    size_t  n = build_regcode_response(msg, 424242);
+
+    fake_reset();
+    memset(&spiStats, 0, sizeof(spiStats));
+    memset(spiRxBufferA, 0, SPI_RX_BUFFER_SIZE);
+    memcpy(spiRxBufferA, msg, n);
+    processRxBuffer = spiRxBufferA;
+    ProcessESP32Response();
+
+    CHECK(tx_with_id(REGCODE_CAN_ID) == NULL, "nothing is relayed");
+    CHECK(tx_with_id(SESSION_CAN_ID_REQ) != NULL, "a SESSION_REQ goes out instead");
+    CHECK(regNoSessionDrops > 0, "and the drop is counted, not silent");
+}
+
+static void case_secoc_regcode_never_repeats_a_freshness_value(void)
+{
+    h_case_begin("the same code sent twice goes out as two different frames");
+
+    /* Without this a recorded frame is a working one: the code is a constant
+       for as long as it is valid, so identical plaintext is the normal case,
+       and only the freshness value makes the two frames differ. */
+    RAMN_SecOC_LINK_Init();
+    RAMN_TELEMATICS_Init(0);
+
+    uint8_t msg[24];
+    size_t  n = build_regcode_response(msg, 999999);
+
+    feed(msg, n);
+    CapturedFrame_t *first = tx_with_id(REGCODE_CAN_ID);
+    if (!CHECK_OK(first != NULL, "the first code reaches the bus")) return;
+    uint8_t saved[64];
+    memcpy(saved, first->data, REGCODE_CAN_FRAME_BYTES);
+    uint32_t fv1 = regcode_verify(first);
+
+    feed(msg, n);
+    CapturedFrame_t *second = tx_with_id(REGCODE_CAN_ID);
+    if (!CHECK_OK(second != NULL, "and so does the second")) return;
+    uint32_t fv2 = regcode_verify(second);
+
+    CHECK(memcmp(saved, second->data, REGCODE_CAN_PAYLOAD_BYTES) == 0,
+          "the code bytes are identical, as they must be");
+    CHECK(memcmp(saved, second->data, REGCODE_CAN_FRAME_BYTES) != 0,
+          "but the frames are not");
+    CHECK(fv1 != 0 && fv2 != 0, "both verify");
+    CHECK(fv2 > fv1, "on a freshness value that only moves forward");
+}
+
+static void case_secoc_regcode_freshness_is_not_the_image_streams(void)
+{
+    h_case_begin("image traffic does not consume the registration code's freshness");
+
+    /* The two share a session and nothing else. If they shared a counter, the
+       code's replay protection would depend on the health of a video stream:
+       image frames the receiver never accepts walk the two ends of a shared
+       domain apart, and far enough apart the next code is refused for a reason
+       that has nothing to do with it. */
+    RAMN_SecOC_LINK_Init();
+    RAMN_TELEMATICS_Init(0);
+
+    uint8_t msg[24];
+    size_t  n = build_regcode_response(msg, 111111);
+
+    feed(msg, n);
+    CapturedFrame_t *first = tx_with_id(REGCODE_CAN_ID);
+    if (!CHECK_OK(first != NULL, "a first code goes out")) return;
+    uint32_t fv1 = regcode_verify(first);
+
+    /* A keyframe in between, which advances the image stream's counter.
+       The repeat-transaction guard is module state that outlives one case, and
+       an earlier case sends this same IMG_START -- clear it, or the frame is
+       correctly dropped as a duplicate and this measures nothing. */
+    uint8_t img[32];
+    size_t  imgLen = build_img_start(img, 60, 60, 25, 4);
+    lastImageRespFingerprint = 0;
+    feed(img, imgLen);
+    if (!CHECK_OK(tx_with_id(IMG_CAN_ID_START) != NULL, "and a keyframe after it")) return;
+
+    feed(msg, n);
+    CapturedFrame_t *second = tx_with_id(REGCODE_CAN_ID);
+    if (!CHECK_OK(second != NULL, "then a second code")) return;
+    uint32_t fv2 = regcode_verify(second);
+
+    CHECK(fv1 != 0 && fv2 != 0, "both codes verify");
+    CHECK(fv2 == fv1 + 1,
+          "the code's counter stepped by one, not by the keyframe as well");
+}
+
+static void case_secoc_regcode_refuses_a_frame_too_short_to_hold_a_code(void)
+{
+    h_case_begin("a truncated registration code is refused, not padded and signed");
+
+    /* Signing whatever happened to be in the frame buffer would turn four
+       bytes of nothing into an authentic-looking code. */
+    RAMN_SecOC_LINK_Init();
+    RAMN_TELEMATICS_Init(0);
+
+    uint8_t body[2] = {0x11, 0x22};
+    uint8_t msg[24];
+    size_t  n = build_can_response(msg, REGCODE_CAN_ID, body, 2, 0x00);
+    feed(msg, n);
+
+    CHECK(tx_with_id(REGCODE_CAN_ID) == NULL, "nothing goes on the bus");
+}
+#endif /* ENABLE_REGCODE_SECOC */
+
 int main(void)
 {
     printf("STM32 telematics SPI host tests\n");
@@ -540,6 +743,13 @@ int main(void)
     case_secoc_ecud_asks_for_a_session_at_bring_up();
     case_secoc_ecud_refuses_a_forged_confirm();
     case_secoc_ecud_rekeys_when_ecua_goes_silent();
+#endif
+#ifdef ENABLE_REGCODE_SECOC
+    case_secoc_regcode_is_authenticated_on_its_way_to_ecua();
+    case_secoc_regcode_fails_closed();
+    case_secoc_regcode_never_repeats_a_freshness_value();
+    case_secoc_regcode_freshness_is_not_the_image_streams();
+    case_secoc_regcode_refuses_a_frame_too_short_to_hold_a_code();
 #endif
 #endif
 
