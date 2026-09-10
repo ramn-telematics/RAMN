@@ -25,11 +25,25 @@
 
 #include "ramn_screen_utils.h"
 
-// CAN ID for registration code message
-#define REGCODE_CAN_ID 0x7A0
+// REGCODE_CAN_ID and the wire layout live in ramn_config.h: ECU D builds this
+// frame and never compiles a screen module.
 
 // Flag set when a new registration code is received and screen should be displayed
 extern volatile RAMN_Bool_t RAMN_SCREENREGCODE_DisplayRequested;
+
+#ifdef ENABLE_REGCODE_SECOC
+// ECU A has no UART and no report channel of its own for this message -- the
+// image stream borrows its 0x303 ACK, and inventing a second ACK ID for a
+// message sent a few times a session would put more traffic on the bus than it
+// is worth. So these two are what a debugger, or a UDS read, can look at.
+//
+// They answer different questions and must not be added together. The first
+// says the link never came up; the second says someone is putting frames on
+// the bus that do not verify. A quiet bus and one that is being injected into
+// look identical without them.
+extern volatile uint16_t RAMN_SCREENREGCODE_NoSessionDrops;
+extern volatile uint16_t RAMN_SCREENREGCODE_AuthFailures;
+#endif
 
 extern RAMNScreen_t ScreenRegCode;
 

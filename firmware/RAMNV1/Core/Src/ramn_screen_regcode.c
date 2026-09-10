@@ -18,6 +18,11 @@
 
 #ifdef ENABLE_SCREEN
 
+#ifdef ENABLE_REGCODE_SECOC
+#include "ramn_secoc.h"
+#include "ramn_secoc_link.h"
+#endif
+
 // Flag to indicate screen should be displayed
 volatile RAMN_Bool_t RAMN_SCREENREGCODE_DisplayRequested = False;
 
@@ -31,6 +36,32 @@ static uint32_t registrationCode = 0;
 static uint32_t screenActivatedTick = 0;
 static RAMN_Bool_t screenActive = False;
 static uint32_t lastTimeoutTick = 0;  // Track when last timeout occurred for cooldown
+
+#ifdef ENABLE_REGCODE_SECOC
+// ============================================================================
+// SecOC -- RECEIVER SIDE
+//
+// What this enforces is that the six digits on the panel came from ECU D, and
+// from ECU D just now. Neither half is optional: without the first, anyone on
+// the bus can display a code of their choosing; without the second, anyone who
+// recorded a genuine one can show it again tomorrow, and a one-time code that
+// can be shown twice is not one.
+//
+// The key and the session belong to ramn_secoc_link.c, dispatched from main.c.
+// This module owns only the freshness domain for THIS message -- see the note
+// beside ECU D's regFv in ramn_telematics.c for why it is not the image
+// stream's.
+// ============================================================================
+volatile uint16_t RAMN_SCREENREGCODE_NoSessionDrops = 0U;
+volatile uint16_t RAMN_SCREENREGCODE_AuthFailures   = 0U;
+
+// Deliberately NOT reset by SCREENREGCODE_Deinit, which purges everything else
+// this module holds. The counter is a high-water mark, and forgetting it is
+// exactly what a replay needs: leave the screen, and the code that was just
+// shown becomes acceptable again.
+static RAMN_SecOC_Freshness_t regFv;
+static uint32_t               regSessionGen = 0U;
+#endif
 
 // Private function to format 6-digit code with leading zeros
 static void formatRegCode(uint32_t code, char* buffer)
@@ -144,8 +175,76 @@ static RAMN_Bool_t SCREENREGCODE_UpdateInput(JoystickEventType event)
 
 static void SCREENREGCODE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHeader, const uint8_t* data, uint32_t tick)
 {
-	// Note: Validation is done in screen manager before this is called
-	// We only get here if CAN ID matches and frame is valid
+	// Note: CAN ID, frame format and length are validated in the screen manager
+	// before this is called. Authenticity is NOT -- that is this function's job,
+	// and it is done here rather than there because the freshness domain and the
+	// session generation that goes with it belong to this module.
+
+#ifdef ENABLE_REGCODE_SECOC
+	// FAIL CLOSED. No session, no code on the panel. Falling back to displaying
+	// an unverified code would mean an attacker only has to keep the handshake
+	// from completing to get whatever six digits they like in front of the
+	// driver -- and denying the handshake is the easy half.
+	if (RAMN_SecOC_LINK_Ready() == 0U)
+	{
+		if (RAMN_SCREENREGCODE_NoSessionDrops < 0xFFFFU) RAMN_SCREENREGCODE_NoSessionDrops++;
+		return;
+	}
+
+	// A rekey restarts the counters at zero, so a high-water mark from the
+	// previous session would reject every message of this one. Safe to forget
+	// precisely because the key changed with it.
+	{
+		uint32_t gen = RAMN_SecOC_LINK_Generation();
+		if (gen != regSessionGen)
+		{
+			regSessionGen = gen;
+			RAMN_SecOC_FreshnessInit(&regFv);
+		}
+	}
+
+	// Verification runs BEFORE the screen-state gates below, not after, and the
+	// order is the point. The freshness counter has to follow every authentic
+	// message, not only the ones acted on: a genuine code that arrives while
+	// the screen is still busy is dropped either way, but if its freshness were
+	// never recorded, that same frame stays acceptable and can be replayed the
+	// moment the cooldown expires.
+	//
+	// Reconstruct, verify UNDER the reconstructed value, and only then advance.
+	// Advancing first would let anyone walk the counter forward with garbage
+	// and lock ECU D out for the rest of the session.
+	uint32_t trunc = ((uint32_t)data[REGCODE_SECOC_FV_OFFSET] << 8) |
+	                  (uint32_t)data[REGCODE_SECOC_FV_OFFSET + 1U];
+	uint32_t full;
+
+	// Stale or beyond the window: cheap to reject, and rejecting it here is
+	// what keeps a flood of replayed frames from costing a BLAKE2s each on the
+	// CAN RX task.
+	if (RAMN_SecOC_RxFreshness(&regFv, trunc, REGCODE_SECOC_FV_TRUNC_BITS, &full) == 0U)
+	{
+		if (RAMN_SCREENREGCODE_AuthFailures < 0xFFFFU) RAMN_SCREENREGCODE_AuthFailures++;
+		return;
+	}
+
+	{
+		RAMN_SecOC_Ctx_t ctx;
+		ctx.dataId = (uint16_t)REGCODE_CAN_ID;
+		ctx.macLen = REGCODE_SECOC_MAC_BYTES;
+		// The SESSION key, never the provisioned root. The root is spent once,
+		// on the handshake in ramn_secoc_link.c.
+		ctx.key    = RAMN_SecOC_LINK_Key();
+		ctx.fv     = &regFv;
+
+		uint8_t authLen = (uint8_t)(REGCODE_CAN_FRAME_BYTES - REGCODE_SECOC_MAC_BYTES);
+		if (RAMN_SecOC_CheckMac(&ctx, full, data, authLen, &data[authLen]) == 0U)
+		{
+			if (RAMN_SCREENREGCODE_AuthFailures < 0xFFFFU) RAMN_SCREENREGCODE_AuthFailures++;
+			return;
+		}
+	}
+
+	RAMN_SecOC_RxAccept(&regFv, full);
+#endif /* ENABLE_REGCODE_SECOC */
 
 	// Ignore messages if screen is already active (prevents timer resets)
 	if (screenActive)
@@ -165,10 +264,9 @@ static void SCREENREGCODE_ProcessRxCANMessage(const FDCAN_RxHeaderTypeDef* pHead
 	                   ((uint32_t)data[2] << 16) |
 	                   ((uint32_t)data[3] << 24);
 
-	// Bytes 4-7 are reserved for future signing algorithm
-	// uint32_t signature = (uint32_t)data[4] | ((uint32_t)data[5] << 8) |
-	//                      ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24);
-	// TODO: Add signature validation here when signing algorithm is implemented
+	// Bytes past the code carry the SecOC freshness value and authenticator
+	// (see ramn_config.h). With ENABLE_REGCODE_SECOC off they are unused, and
+	// the frame is the eight-byte one that shipped before authentication.
 
 	// Activate screen and set timeout timer
 	screenActive = True;

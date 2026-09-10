@@ -81,6 +81,27 @@ void conformance_cases(void)
               (v->extended ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID), v->name);
         CHECK(c->header.TxFrameType ==
               (v->remote ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME), v->name);
+#ifdef ENABLE_REGCODE_SECOC
+        /* The one identifier ECU D does not relay verbatim.
+         *
+         * The vectors describe the SPI link, and on the SPI link this is still
+         * a plain eight-byte frame -- which is why the vector is right and is
+         * left alone. What changed is what ECU D does with it: 0x7A0 is the
+         * registration code, and ECU D authenticates it on the way to ECU A's
+         * screen (ramn_config.h). So the payload the ESP32 sent survives at
+         * bytes 0..3, and the rest of the frame is the freshness value and
+         * authenticator that were not there before.
+         *
+         * ramn-protocol does not describe that transformation yet. When it
+         * does, this exception is what should go away -- the vector will carry
+         * the protected frame and the generic path below will check it. */
+        if (!v->remote && v->can_id == REGCODE_CAN_ID) {
+            CHECK(c->len == REGCODE_CAN_FRAME_BYTES, v->name);
+            CHECK(c->header.FDFormat == FDCAN_FD_CAN, v->name);
+            CHECK(memcmp(c->data, v->data, REGCODE_CAN_PAYLOAD_BYTES) == 0, v->name);
+            continue;
+        }
+#endif
         if (!v->remote && v->dlc > 0) {
             CHECK(c->len == v->dlc, v->name);
             CHECK(memcmp(c->data, v->data, v->dlc) == 0, v->name);

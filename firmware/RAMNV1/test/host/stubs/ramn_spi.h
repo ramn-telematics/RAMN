@@ -11,3 +11,5 @@ void RAMN_SPI_DrawRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint
 void RAMN_SPI_DrawString(uint16_t x, uint16_t y, uint16_t fg, uint16_t bg, const char* src);
 void RAMN_SPI_OpenImageWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 void RAMN_SPI_WriteImageChunk(const uint8_t* data, uint16_t len);
+void RAMN_SPI_DrawLargeChar(uint16_t x, uint16_t y, uint16_t fg, uint16_t bg, uint8_t chr, uint8_t scale);
+void RAMN_SPI_RefreshString(uint16_t x, uint16_t y, uint16_t fg, uint16_t bg, const char* src);

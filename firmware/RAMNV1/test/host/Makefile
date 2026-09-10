@@ -25,8 +25,13 @@ SRCS_A   := test_screen_image.c fakes_screen.c fakes.c harness.c $(SECOC)
 # not defined here -- doing so shadows the project's own definition.
 CFLAGS_A := $(CFLAGS) -Wno-unused-but-set-variable
 
-.PHONY: all clean ecud ecua targets
-all: ecud ecua targets
+# ECU A's registration-code screen: a third binary for the same reason as the
+# second one -- it compiles ramn_screen_regcode.c white-box.
+BIN_R    := run_tests_regcode
+SRCS_R   := test_screen_regcode.c fakes_screen.c fakes.c harness.c $(SECOC)
+
+.PHONY: all clean ecud ecua regcode targets
+all: ecud ecua regcode targets
 
 # Catches what a host suite structurally cannot: a module that compiles and
 # passes every test here, then fails to LINK for a target that lacks the
@@ -40,6 +45,9 @@ ecud: $(BIN)
 ecua: $(BIN_A)
 	./$(BIN_A)
 
+regcode: $(BIN_R)
+	./$(BIN_R)
+
 # This suite exercises ECU D's half of the link, but ramn_config.h's default
 # target is ECU A, so the SENDER role is not selected by the config here. Ask
 # for it explicitly rather than switching the whole build to TARGET_ECUD, which
@@ -50,8 +58,11 @@ $(BIN): $(SRCS) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_telem
 $(BIN_A): $(SRCS_A) $(wildcard stubs/*.h) ramn_test_vectors.h $(CORE)/Src/ramn_screen_image.c
 	$(CC) $(CFLAGS_A) -o $@ $(SRCS_A)
 
+$(BIN_R): $(SRCS_R) $(wildcard stubs/*.h) $(CORE)/Src/ramn_screen_regcode.c
+	$(CC) $(CFLAGS_A) -o $@ $(SRCS_R)
+
 clean:
-	rm -f $(BIN) $(BIN_A)
+	rm -f $(BIN) $(BIN_A) $(BIN_R)
 
 # Run this same suite against an older revision of the module under test, to
 # check whether a failure is a regression or was always broken:

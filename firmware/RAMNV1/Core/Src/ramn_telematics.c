@@ -377,12 +377,80 @@ static uint32_t SecOCBeginFrame(uint8_t* data, uint8_t off)
 
 #endif
 
+#ifdef ENABLE_REGCODE_SECOC
+// ============================================================================
+// SecOC -- REGISTRATION CODE (0x7A0)
+//
+// Its OWN freshness domain, not the image stream's. The two are unrelated
+// traffic that happens to share a session, and coupling them would make the
+// one-time code's replay protection depend on the health of a video stream:
+// the receiver's counter only advances on messages it accepts, so a burst of
+// image frames lost on the bus walks the shared domain's two ends apart, and
+// far enough apart (RAMN_SECOC_FV_WINDOW) the next registration code is
+// refused for something that has nothing to do with it. A domain of its own
+// costs eight bytes of RAM and takes that failure mode away.
+//
+// It is reset -- not carried -- whenever the session generation moves, for
+// exactly the reason RAMN_SecOC_LINK_Freshness is: the key changed with it, so
+// a value from the previous session is not stale, it is meaningless.
+// ============================================================================
+static RAMN_SecOC_Freshness_t regFv;
+static uint32_t               regSessionGen = 0U;
+
+// Registration codes from the ESP32 dropped because no session was up.
+// Counted apart from noSessionDrops: image traffic stops being drawn, a
+// dropped one-time code means someone is standing in front of the vehicle
+// waiting for six digits that will never appear.
+static uint32_t regNoSessionDrops = 0U;
+
+// Turns the four code bytes the ESP32 sent into the protected 12-byte frame,
+// in place. Returns 0 when there is no session, in which case NOTHING is put
+// on the bus -- fail closed, as the image stream does. Sending the code
+// unprotected "just this once" would be the whole attack: a receiver that
+// accepts an unauthenticated 0x7A0 when it cannot verify one accepts every
+// unauthenticated 0x7A0.
+static uint8_t RegCodeSecOCProtect(uint8_t* data)
+{
+	if (RAMN_SecOC_LINK_EnsureSession(xTaskGetTickCount()) == 0U) return 0U;
+
+	uint32_t gen = RAMN_SecOC_LINK_Generation();
+	if (gen != regSessionGen)
+	{
+		regSessionGen = gen;
+		RAMN_SecOC_FreshnessInit(&regFv);
+	}
+
+	uint32_t fv = RAMN_SecOC_TxFreshness(&regFv);
+	data[REGCODE_SECOC_FV_OFFSET]      = (uint8_t)((fv >> 8) & 0xFFU);
+	data[REGCODE_SECOC_FV_OFFSET + 1U] = (uint8_t)( fv       & 0xFFU);
+
+	RAMN_SecOC_Ctx_t ctx;
+	ctx.dataId = (uint16_t)REGCODE_CAN_ID;
+	ctx.macLen = REGCODE_SECOC_MAC_BYTES;
+	// The SESSION key, never the provisioned root -- see SecOCTagFrame.
+	ctx.key    = RAMN_SecOC_LINK_Key();
+	ctx.fv     = &regFv;
+
+	// The authenticated region is everything before the authenticator, so the
+	// transmitted freshness bytes are inside it. A receiver therefore cannot be
+	// steered by a tampered freshness field: changing it changes the MAC input,
+	// and changing the full value it reconstructs changes it again.
+	uint8_t authLen = (uint8_t)(REGCODE_CAN_FRAME_BYTES - REGCODE_SECOC_MAC_BYTES);
+	RAMN_SecOC_ComputeMac(&ctx, fv, data, authLen, &data[authLen]);
+	return 1U;
+}
+#endif /* ENABLE_REGCODE_SECOC */
+
 void RAMN_TELEMATICS_Init(uint32_t tick)
 {
 #ifdef ENABLE_IMAGE_SECOC
 	// The session itself is initialised in main.c with the rest of the SecOC
 	// modules; this only clears what belongs to the stream.
 	imgCurrentFv = 0U;
+#endif
+#ifdef ENABLE_REGCODE_SECOC
+	RAMN_SecOC_FreshnessInit(&regFv);
+	regSessionGen = 0U;
 #endif
 
 	// Initialize TX buffers
@@ -958,6 +1026,30 @@ static void ProcessESP32Response(void)
 			uint8_t maxPay = (msgLen >= 8U) ? (msgLen - 8U) : 0U;
 			if (payLen > maxPay) payLen = maxPay;
 			for (uint8_t k = 0U; k < payLen; k++) data[k] = msg[8U + k];
+
+#ifdef ENABLE_REGCODE_SECOC
+			// The one CAN ID this bridge does not relay verbatim. The ESP32
+			// sends the registration code as an ordinary 8-byte frame and
+			// knows nothing about SecOC; ECU D is the one holding the session
+			// key, so it is the one that has to protect it. The code bytes are
+			// already in place at 0..3 -- rest of the frame gets rebuilt.
+			//
+			// Only a standard data frame qualifies. An extended or remote
+			// frame that happened to carry 0x7A0 is not this message, and
+			// authenticating it would say it was.
+			if ((canId == REGCODE_CAN_ID) &&
+			    (h.IdType == FDCAN_STANDARD_ID) && (h.TxFrameType == FDCAN_DATA_FRAME))
+			{
+				// Short frames are refused rather than zero-padded: a code the
+				// ESP32 only half sent is not a code, and signing four bytes
+				// of whatever `data` held would make it look like one.
+				if (payLen < REGCODE_CAN_PAYLOAD_BYTES) { spiStats.spiRxInvalidCnt++; continue; }
+				if (RegCodeSecOCProtect(data) == 0U) { regNoSessionDrops++; continue; }
+				h.DataLength = FDCAN_DLC_BYTES_12;
+				h.FDFormat   = FDCAN_FD_CAN;
+				payLen       = REGCODE_CAN_FRAME_BYTES;
+			}
+#endif
 
 			RAMN_Result_t fwdResult = RAMN_FDCAN_SendMessage(&h, data);
 			if (fwdResult == RAMN_OK) spiStats.spiRxCANQueuedCnt++;
@@ -1548,7 +1640,7 @@ static void PrintSPIStats(void)
 
 	// Print compact stats on single line to reduce UART load
 	len = snprintf(buffer, bufferSize,
-		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu SecOC[Sess:%u NoSess:%lu Bad:%u] BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
+		"SPI: TX[Req:%lu Sent:%lu Err:%lu] RX[Poll:%lu OK:%lu Empty:%lu NoResp:%lu Rpt:%lu Skip:%lu WD:%lu St:%s Q:%lu QFail:%lu] CANTxQ:%u%%  StreamState:%u ECUAack:%lu miss:%lu SecOC[Sess:%u NoSess:%lu Bad:%u RegNoSess:%lu] BUS[TEC:%u REC:%u LEC:%u DLEC:%u BO:%u EP:%u RxOvr:%lu]\r\n",
 		statsSnapshot.spiTxRequestCnt,
 		statsSnapshot.spiTxSentCnt,
 		statsSnapshot.spiTxErrorCnt,
@@ -1575,6 +1667,14 @@ static void PrintSPIStats(void)
 		(unsigned)RAMN_SecOC_LINK_FailedCount(),
 #else
 		0U, 0UL, 0U,
+#endif
+#ifdef ENABLE_REGCODE_SECOC
+		// Registration codes dropped for want of a session. Its own number
+		// because its consequence is its own: a driver watching a screen that
+		// stays blank, not a stream that stutters.
+		regNoSessionDrops,
+#else
+		0UL,
 #endif
 		tec, rec, lec, dlec, busoff, errpass,
 		RAMN_FDCAN_Status.CANRxOverrunCnt);
